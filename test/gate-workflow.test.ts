@@ -6,10 +6,12 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
-import { loadWorkflow, stepsOf } from './helpers/workflow.ts';
+import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { workflow } = loadWorkflow('.github/workflows/gate.yml');
 const FORK_ONLY_ON_PR = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository";
@@ -29,6 +31,55 @@ describe('the gate', () => {
     const steps = stepsOf(workflow, 'gate');
     assert.ok(steps.some((s) => s.run === 'npm run gate'));
     assert.ok(steps.some((s) => s.uses?.startsWith('actions/setup-go@')));
+  });
+
+  // The listener is built with the Dockerfile's golang tag, and Dependabot
+  // moves that tag alone. A second copy of the release in the gate would let
+  // `go vet` and `go test` run on one release while the image ships another.
+  describe('runs Go on the release the listener\'s image builds with', () => {
+    const steps = stepsOf(workflow, 'gate');
+    const setupGo = steps.find((s) => s.uses?.startsWith('actions/setup-go@'));
+    const ref = /^\$\{\{\s*steps\.([\w-]+)\.outputs\.([\w-]+)\s*\}\}$/.exec(String(setupGo?.with?.['go-version'] ?? ''));
+
+    test('setup-go takes its release from an earlier step\'s output, not a literal', () => {
+      assert.ok(ref, `go-version is ${JSON.stringify(setupGo?.with?.['go-version'])}`);
+      assert.equal(setupGo?.with?.['go-version-file'], undefined);
+      const reader = steps.findIndex((s) => s.id === ref[1]);
+      assert.ok(reader >= 0 && reader < steps.indexOf(setupGo!), `step ${ref[1]} runs before setup-go`);
+    });
+
+    test('that step reads the release from cmd/listener/Dockerfile\'s golang FROM line', () => {
+      assert.ok(ref);
+      const dockerfile = readFileSync(resolve(REPO_ROOT, 'cmd/listener/Dockerfile'), 'utf-8');
+      const tag = /^FROM\s+\S*golang:(\d+\.\d+(?:\.\d+)?)-/m.exec(dockerfile)?.[1];
+      assert.ok(tag, 'the Dockerfile builds FROM a golang:<release>-<variant> image');
+
+      const dir = mkdtempSync(join(tmpdir(), 'gate-go-'));
+      try {
+        const output = join(dir, 'output');
+        execFileSync('bash', ['-eo', 'pipefail', '-c', stepById(steps, ref[1] ?? '').run ?? ''], {
+          cwd: REPO_ROOT,
+          env: { PATH: process.env.PATH, GITHUB_OUTPUT: output },
+        });
+        const outputs = Object.fromEntries(
+          readFileSync(output, 'utf-8').trim().split('\n').map((line) => line.split('=', 2) as [string, string]),
+        );
+        assert.equal(outputs[ref[2] ?? ''], tag);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    test('the comment above setup-go says the release comes from the Dockerfile', () => {
+      const { raw } = loadWorkflow('.github/workflows/gate.yml');
+      const lines = raw.split('\n');
+      const at = lines.findIndex((l) => /uses: actions\/setup-go@/.test(l));
+      let i = at - 1;
+      while (i >= 0 && /^\s*#/.test(lines[i] ?? '')) i--;
+      const comment = lines.slice(i + 1, at).join(' ');
+      assert.match(comment, /cmd\/listener\/Dockerfile/);
+      assert.match(comment, /Dependabot/);
+    });
   });
 
   // ECS runs the image as its nonroot user and calls the health check inside
