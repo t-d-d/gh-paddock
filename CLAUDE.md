@@ -35,7 +35,7 @@ gh-paddock runs self-hosted GitHub Actions runners for private repos on AWS Farg
 - Run the `pre-push` skill before every push. It ends by raising the pull request.
 - The pull request body follows the `pr-description` skill.
 - Nothing deploys except a green merge to main. Never deploy by hand.
-- The owner merges. Do not merge your own pull request.
+- Governor's PR review merges a pull request that passes the checklist in `.github/dispatch.json`. One that changes a path on that file's human-only list waits for the owner. Do not merge your own pull request.
 
 ## Issues
 
