@@ -1,0 +1,72 @@
+# The offline gate: the same `npm run gate` a contributor runs, and a build
+# of the listener's image. It holds no secret and reaches no AWS account, so
+# it is safe to run on every push and on a fork's pull request.
+#
+# A branch pushed here is gated by its push run, so its pull request run
+# skips the jobs rather than gate the same commit twice. A fork's pull
+# request has no push run here, so its pull request run is what gates it.
+#
+# This repo is public, so these jobs run on GitHub's free runners, never on
+# the runners it deploys (docs/constraints/public-repo.md).
+name: gate
+
+on:
+  # main is gated by deploy.yml, which calls this before it applies.
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: gate
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      # The release the listener's image builds with (cmd/listener/Dockerfile).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26'
+      - run: npm ci --ignore-scripts
+      - run: npm run gate
+
+  # The image the deploy would build, built and thrown away: a broken
+  # Dockerfile fails here, on the branch, rather than in the deploy after
+  # merge. Native arm64, as the listener runs.
+  image:
+    name: image
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the listener's image
+        run: docker build --file cmd/listener/Dockerfile --tag paddock-listener:gate .
+      # As ECS runs it: the image's own user, the health check inside it.
+      - name: Start the listener, and check it turns healthy
+        run: |
+          if docker run --rm paddock-listener:gate -healthcheck 2>"$RUNNER_TEMP/before.err"; then
+            echo "::error::the health check passed before the listener ran"
+            exit 1
+          fi
+          grep -q "no heartbeat" "$RUNNER_TEMP/before.err"
+          docker run --detach --name listener paddock-listener:gate
+          for _ in $(seq 1 20); do
+            if docker exec listener /listener -healthcheck; then
+              docker stop listener >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs listener
+          echo "::error::the listener did not turn healthy in 20s"
+          exit 1
