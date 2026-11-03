@@ -29,7 +29,6 @@ const triggers = (w: Record<string, any>): string[] =>
 describe('the gate', () => {
   test('runs on every branch push, and when another workflow calls it, never on a pull request of its own', () => {
     assert.deepEqual(workflow.on?.push?.['branches-ignore'], ['main']);
-    assert.ok('workflow_call' in (workflow.on ?? {}));
     assert.deepEqual(triggers(workflow).sort(), ['push', 'workflow_call']);
   });
 
@@ -54,10 +53,10 @@ describe('the gate', () => {
   test('a fork\'s pull request is gated by a pull_request run that calls the gate, and only a fork\'s', () => {
     const callers = workflows.flatMap(({ file, workflow: w }) =>
       (Object.entries(w.jobs ?? {}) as [string, { uses?: string; if?: string }][])
-        .filter(([, job]) => job.uses === './.github/workflows/gate.yml')
+        .filter(([, job]) => /(^\.|\/gh-paddock)\/\.github\/workflows\/gate\.ya?ml(@.*)?$/.test(job.uses ?? ''))
         .map(([id, job]) => ({ file, w, id, job })),
     );
-    const forks = callers.filter(({ w }) => triggers(w).includes('pull_request'));
+    const forks = callers.filter(({ w }) => triggers(w).some((t) => t.startsWith('pull_request')));
     assert.equal(forks.length, 1, `callers on pull_request: ${forks.map((c) => `${c.file} ${c.id}`).join(', ')}`);
     const fork = forks[0]!;
     assert.deepEqual(triggers(fork.w), ['pull_request'], `${fork.file} runs on pull_request alone, never pull_request_target`);
