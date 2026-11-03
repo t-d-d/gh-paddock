@@ -2,9 +2,11 @@
 # of the listener's image. It holds no secret and reaches no AWS account, so
 # it is safe to run on every push and on a fork's pull request.
 #
-# A branch pushed here is gated by its push run, so its pull request run
-# skips the jobs rather than gate the same commit twice. A fork's pull
-# request has no push run here, so its pull request run is what gates it.
+# A branch pushed here is gated by its push run, and its pull request runs
+# nothing named `gate` or `image`: a skipped job reports success, so a
+# skipped pull_request run would read as a green gate while the push run's
+# was still running. A fork's pull request has no push run here, so
+# fork-gate.yml calls this for it, under its own job name.
 #
 # This repo is public, so these jobs run on GitHub's free runners, never on
 # the runners it deploys (docs/constraints/public-repo.md).
@@ -14,7 +16,7 @@ on:
   # main is gated by deploy.yml, which calls this before it applies.
   push:
     branches-ignore: [main]
-  pull_request:
+  # deploy.yml, on main, and fork-gate.yml, on a fork's pull request.
   workflow_call:
 
 permissions:
@@ -23,7 +25,6 @@ permissions:
 jobs:
   gate:
     name: gate
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -55,7 +56,6 @@ jobs:
   # merge. Native arm64, as the listener runs.
   image:
     name: image
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:

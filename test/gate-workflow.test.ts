@@ -2,6 +2,10 @@
  * The gate (CLAUDE.md, The gate): every push and every fork's pull request
  * runs `npm run gate` and builds the listener's image, and no workflow here
  * runs on the runners this repo deploys (docs/constraints/public-repo.md).
+ *
+ * A branch pushed here is gated by its push run. Its pull request must carry
+ * no other `gate` or `image` check: a skipped job reports success, so a
+ * skipped `gate` would read as green while the push run's is still running.
  */
 
 import { test, describe } from 'node:test';
@@ -14,17 +18,50 @@ import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
-const FORK_ONLY_ON_PR = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository";
+const FORK_ONLY = 'github.event.pull_request.head.repo.full_name != github.repository';
+const GATE_CHECKS = ['gate', 'image'];
+
+const workflowFiles = readdirSync(resolve(REPO_ROOT, '.github/workflows')).filter((f) => /\.ya?ml$/.test(f));
+const workflows = workflowFiles.map((file) => ({ file, ...loadWorkflow(`.github/workflows/${file}`) }));
+const triggers = (w: Record<string, any>): string[] =>
+  typeof w.on === 'string' ? [w.on] : Array.isArray(w.on) ? w.on : Object.keys(w.on ?? {});
 
 describe('the gate', () => {
-  test('runs on every branch push, every pull request, and when the deploy calls it', () => {
+  test('runs on every branch push, and when another workflow calls it, never on a pull request of its own', () => {
     assert.deepEqual(workflow.on?.push?.['branches-ignore'], ['main']);
-    assert.ok('pull_request' in (workflow.on ?? {}));
-    assert.ok('workflow_call' in (workflow.on ?? {}));
+    assert.deepEqual(triggers(workflow).sort(), ['push', 'workflow_call']);
   });
 
-  test('gates a fork\'s pull request, and skips a branch\'s own, which its push run gates', () => {
-    for (const job of ['gate', 'image']) assert.equal(workflow.jobs?.[job]?.if, FORK_ONLY_ON_PR, job);
+  test('its jobs run their steps whenever it runs: neither carries an `if` that could skip it', () => {
+    for (const job of GATE_CHECKS) assert.equal(workflow.jobs?.[job]?.if, undefined, job);
+  });
+
+  // A skipped job finishes at once and reports success, and a required check
+  // passes on it. A pull_request run's `gate` beside the push run's would let
+  // a reader of the head's checks merge before the push run's gate finished.
+  test('no workflow a pull request runs has a job whose check is named `gate` or `image`', () => {
+    for (const { file, workflow: w } of workflows) {
+      if (!triggers(w).some((t) => t.startsWith('pull_request'))) continue;
+      for (const [id, job] of Object.entries(w.jobs ?? {}) as [string, { name?: string }][]) {
+        assert.ok(!GATE_CHECKS.includes(job.name ?? id), `${file} job ${id} reports a check named ${job.name ?? id}`);
+      }
+    }
+  });
+
+  // The fork's run calls the gate, so its checks are `<job> / gate` and
+  // `<job> / image`, and the steps live in one place.
+  test('a fork\'s pull request is gated by a pull_request run that calls the gate, and only a fork\'s', () => {
+    const callers = workflows.flatMap(({ file, workflow: w }) =>
+      (Object.entries(w.jobs ?? {}) as [string, { uses?: string; if?: string }][])
+        .filter(([, job]) => /(^\.|\/gh-paddock)\/\.github\/workflows\/gate\.ya?ml(@.*)?$/.test(job.uses ?? ''))
+        .map(([id, job]) => ({ file, w, id, job })),
+    );
+    const forks = callers.filter(({ w }) => triggers(w).some((t) => t.startsWith('pull_request')));
+    assert.equal(forks.length, 1, `callers on pull_request: ${forks.map((c) => `${c.file} ${c.id}`).join(', ')}`);
+    const fork = forks[0]!;
+    assert.deepEqual(triggers(fork.w), ['pull_request'], `${fork.file} runs on pull_request alone, never pull_request_target`);
+    assert.equal(fork.job.if, FORK_ONLY);
+    assert.deepEqual(fork.w.permissions, { contents: 'read' });
   });
 
   test('runs the same `npm run gate` a contributor runs, with Go installed', () => {
@@ -125,13 +162,10 @@ describe('the gate', () => {
 });
 
 describe('fitness: this repo\'s workflows run on GitHub\'s runners, never the ones it deploys (public-repo.md)', () => {
-  const dir = resolve(REPO_ROOT, '.github/workflows');
-  const files = readdirSync(dir).filter((f) => /\.ya?ml$/.test(f));
-
   test('every job names a GitHub-hosted Ubuntu runner, or calls another workflow', () => {
-    assert.ok(files.length > 0);
-    for (const file of files) {
-      const jobs = loadWorkflow(`.github/workflows/${file}`).workflow.jobs ?? {};
+    assert.ok(workflows.length > 0);
+    for (const { file, workflow: w } of workflows) {
+      const jobs = w.jobs ?? {};
       for (const [name, job] of Object.entries(jobs) as [string, { 'runs-on'?: unknown; uses?: string }][]) {
         if (job.uses) continue;
         assert.match(String(job['runs-on']), /^ubuntu-(latest|\d{2}\.\d{2}(-arm)?)$/, `${file} ${name} runs on ${JSON.stringify(job['runs-on'])}`);
