@@ -95,7 +95,7 @@ Run the `unslop` skill over the result.
 1. Could a reader who has not opened the diff say in one sentence what
    this adds to the system and what it costs?
 2. Is the first sentence of *Drift* the thing most likely to make the
-   owner stop the merge?
+   review or the owner stop the merge?
 3. Does every acceptance criterion appear in the table, and does every
    row that is not green at merge say who checks it or which issue owns it?
 
