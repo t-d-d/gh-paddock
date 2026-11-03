@@ -12,10 +12,11 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
-import { loadWorkflow, stepsOf } from './helpers/workflow.ts';
+import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { workflow } = loadWorkflow('.github/workflows/pages.yml');
 const PAGES_DIR = 'docs/pages';
@@ -43,9 +44,18 @@ describe('the Pages workflow', () => {
   test('publishes from main alone: a run by hand on another branch publishes nothing', () => {
     assert.equal(workflow.jobs?.publish?.environment?.name, 'github-pages');
     const steps = stepsOf(workflow, 'publish');
-    const guard = steps.find((s) => s.id === 'main');
-    assert.ok(guard?.run?.includes('refs/heads/main'), 'a step that stops a run off main');
-    assert.equal(steps.indexOf(guard!), 0, 'the guard runs first');
+    const guard = stepById(steps, 'main');
+    assert.equal(steps.indexOf(guard), 0, 'the guard runs first');
+    // Run the guard as Actions runs it, on main and off it.
+    const exits = (ref: string) =>
+      spawnSync('bash', ['-eo', 'pipefail', '-c', guard.run ?? ''], {
+        env: { PATH: process.env.PATH, GITHUB_REF: ref },
+        stdio: 'pipe',
+      }).status;
+    assert.equal(exits('refs/heads/main'), 0, 'a run on main goes on');
+    for (const ref of ['refs/heads/feature', 'refs/heads/main-old', 'refs/tags/main', 'refs/pull/1/merge']) {
+      assert.notEqual(exits(ref), 0, `a run on ${ref} stops`);
+    }
   });
 
   test('uploads docs/pages and nothing else, and deploys it', () => {
@@ -64,7 +74,16 @@ describe('the Pages workflow', () => {
     assert.equal(workflow.concurrency?.['cancel-in-progress'], false);
   });
 
-  test('fitness: the publish runs on GitHub\'s runners, never on the runners this repo deploys (public-repo.md)', () => {
+  // GitHub keeps one pending run per group and cancels the older. A run by
+  // hand on another branch, sharing main's group, would cancel main's
+  // pending publish and then stop at the guard, leaving main's page unsent.
+  test('queues each ref apart, so a run off main never takes a pending main run\'s place', () => {
+    assert.match(String(workflow.concurrency?.group), /\$\{\{\s*github\.ref\s*\}\}/);
+  });
+});
+
+describe('fitness: the Pages workflow runs on GitHub\'s runners, never on the runners this repo deploys (public-repo.md)', () => {
+  test('every job that runs steps runs on a GitHub-hosted ubuntu runner', () => {
     for (const [id, job] of Object.entries(workflow.jobs ?? {}) as [string, { uses?: string; 'runs-on'?: string }][]) {
       if (job.uses) continue;
       assert.match(String(job['runs-on']), /^ubuntu-/, `${id} runs on ${job['runs-on']}`);
@@ -97,7 +116,6 @@ describe('the runner lane page', () => {
   });
 
   test('the site root leads to the page', () => {
-    assert.ok(readdirSync(resolve(REPO_ROOT, PAGES_DIR)).includes('index.html'));
     assert.match(read(`${PAGES_DIR}/index.html`), new RegExp(`href="${PAGE}"`));
   });
 });

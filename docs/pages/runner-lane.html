@@ -67,7 +67,7 @@ code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   font: inherit; font-size: 0.9rem; color: var(--ink); background: transparent;
   border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; cursor: pointer;
 }
-.tabs button[aria-selected="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); }
 .tabs button:focus-visible, .controls button:focus-visible { outline: 2px solid var(--job); outline-offset: 2px; }
 .lane { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 1.6fr); gap: 12px; align-items: stretch; }
 .col { border: 1px dashed var(--line); border-radius: 10px; padding: 10px; min-height: 230px; }
@@ -84,7 +84,9 @@ code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .dot { width: 56px; height: 56px; border-radius: 50%; border: 3px solid var(--accent); display: grid; place-items: center; font-size: 0.7rem; color: var(--accent); }
 .dot.polling { animation: pulse 1.6s ease-in-out infinite; }
 .dot.down { border-color: var(--bad); color: var(--bad); border-style: dashed; }
-.dot.starting { border-color: var(--warn); color: var(--warn); animation: spin 1.2s linear infinite; border-top-color: transparent; }
+.dot.starting { border-color: var(--warn); color: var(--warn); position: relative; }
+/* The ring spins, not the dot, so its label stays upright. */
+.dot.starting::before { content: ""; position: absolute; inset: -3px; border-radius: 50%; border: 3px solid transparent; border-top-color: var(--panel); animation: spin 1.2s linear infinite; }
 .listener small { color: var(--muted); font-size: 0.8rem; }
 .pools { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .pool { border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 180px; }
@@ -159,7 +161,7 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
     <h2 id="lane-title">Watch the lane</h2>
     <p>Pick a scene. Each plays itself; pause it to read, or step through by hand.</p>
     <div class="player">
-      <div class="tabs" role="tablist" aria-label="Scenes" id="tabs"></div>
+      <div class="tabs" role="group" aria-label="Scenes" id="tabs"></div>
       <div class="lane">
         <div class="col">
           <div class="label">GitHub: the queue</div>
@@ -189,7 +191,7 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       <p class="caption" id="caption" aria-live="polite"></p>
       <div class="alarm" id="alarm" role="status"></div>
       <div class="controls">
-        <button type="button" id="prev" aria-label="Previous step">Back</button>
+        <button type="button" id="prev" aria-label="Back one step">Back</button>
         <button type="button" id="play">Pause</button>
         <button type="button" id="next" aria-label="Next step">Next</button>
         <div class="progress" id="progress" aria-hidden="true"></div>
@@ -408,8 +410,11 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
     alarm.className = 'alarm' + (s.alarm ? ' on' : '');
     $('progress').innerHTML = sc.steps.map(function (_, i) { return '<span' + (i <= step ? ' class="on"' : '') + '></span>'; }).join('');
     $('count').textContent = 'Step ' + (step + 1) + ' of ' + sc.steps.length;
-    Array.prototype.forEach.call($('tabs').children, function (b, i) { b.setAttribute('aria-selected', String(i === scene)); });
+    Array.prototype.forEach.call($('tabs').children, function (b, i) { b.setAttribute('aria-pressed', String(i === scene)); });
     $('play').textContent = playing ? 'Pause' : 'Play';
+    // While it plays itself, a screen reader would read a new caption every
+    // few seconds; it reads them only when the reader pauses or steps.
+    $('caption').setAttribute('aria-live', playing ? 'off' : 'polite');
   }
 
   function advance() {
@@ -425,7 +430,6 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
   SCENES.forEach(function (sc, i) {
     var b = document.createElement('button');
     b.type = 'button';
-    b.setAttribute('role', 'tab');
     b.textContent = sc.name;
     b.addEventListener('click', function () { scene = i; step = 0; render(); schedule(); });
     $('tabs').appendChild(b);

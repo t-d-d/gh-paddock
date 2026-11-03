@@ -23,9 +23,11 @@ permissions:
 
 # One publish at a time, and a publish in progress is never cancelled. A
 # newer push carries the older commit's page, so a pending run it replaces
-# loses nothing.
+# loses nothing. Each ref queues apart: GitHub keeps one pending run per
+# group, so a run by hand on another branch in main's group would cancel
+# main's pending publish and then stop at the guard below.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
