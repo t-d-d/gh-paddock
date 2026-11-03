@@ -11,6 +11,8 @@ One listener task holds a message session on GitHub's scale-set API for each sca
 
 Jobs are split into pools by the credentials they hold, and a task only runs jobs from its own pool. Public repos keep GitHub's runners: their standard minutes are free, and a fork's pull request must not reach these.
 
+The [runner lane page](https://t-d-d.github.io/gh-paddock/runner-lane.html) shows the v1 design step by step: a push, warm reuse, remove-then-terminate, a listener interrupted, a failed start and a Spot reclaim.
+
 The name comes from the paddock where racehorses are kept warm before a race.
 
 ## Status
@@ -30,6 +32,7 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 | `scripts/` | The deploy's probe and stack guard, and the public-repo scan |
 | `test/` | Tests of the stacks, the workflows and the scripts |
 | `docs/constraints/` | The rules in force |
+| `docs/pages/` | The runner lane page, published on GitHub Pages |
 
 `npm run gate` runs every check offline: the public-repo scan, lint, types and the Node tests, then `gofmt`, `go vet` and the Go tests.
 

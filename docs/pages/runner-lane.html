@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gh-paddock runner lane</title>
+<meta name="description" content="How gh-paddock runs a private repo's GitHub Actions jobs on single-use Fargate runners: the v1 design, step by step.">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f7f6f2;
+  --panel: #ffffff;
+  --ink: #1d2126;
+  --muted: #5d6670;
+  --line: #d9d6cc;
+  --accent: #2f6f4f;
+  --accent-soft: #e2efe7;
+  --job: #3b5ba9;
+  --job-soft: #e3e9f7;
+  --warn: #9a5b00;
+  --warn-soft: #fbeed6;
+  --bad: #a3322b;
+  --bad-soft: #f8e1df;
+  --idle: #6b7280;
+  --later: #8a7f6a;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171a;
+    --panel: #1c2024;
+    --ink: #e7e9ea;
+    --muted: #9aa3ab;
+    --line: #333a40;
+    --accent: #6cc196;
+    --accent-soft: #1f3a2d;
+    --job: #8fa9ec;
+    --job-soft: #232d47;
+    --warn: #f0b45a;
+    --warn-soft: #3d2f17;
+    --bad: #f08a80;
+    --bad-soft: #42211e;
+    --idle: #9aa3ab;
+    --later: #b3a88f;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 8px; }
+h2 { font-size: 1.3rem; margin: 48px 0 12px; }
+h3 { font-size: 1.05rem; margin: 0 0 6px; }
+p { margin: 0 0 12px; }
+a { color: var(--accent); }
+code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.lede { color: var(--muted); font-size: 1.1rem; max-width: 46em; }
+
+/* The lane */
+.player { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 16px; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.tabs button, .controls button {
+  font: inherit; font-size: 0.9rem; color: var(--ink); background: transparent;
+  border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; cursor: pointer;
+}
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+.tabs button:focus-visible, .controls button:focus-visible { outline: 2px solid var(--job); outline-offset: 2px; }
+.lane { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 1.6fr); gap: 12px; align-items: stretch; }
+.col { border: 1px dashed var(--line); border-radius: 10px; padding: 10px; min-height: 230px; }
+.col > .label { font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+.queue { display: flex; flex-direction: column; gap: 6px; }
+.job {
+  display: inline-block; font-size: 0.82rem; padding: 3px 8px; border-radius: 6px;
+  background: var(--job-soft); color: var(--job); border: 1px solid currentColor;
+  animation: arrive 0.45s ease-out;
+}
+.job.done { background: var(--accent-soft); color: var(--accent); }
+.job.failed { background: var(--bad-soft); color: var(--bad); }
+.listener { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; height: calc(100% - 26px); text-align: center; }
+.dot { width: 56px; height: 56px; border-radius: 50%; border: 3px solid var(--accent); display: grid; place-items: center; font-size: 0.7rem; color: var(--accent); }
+.dot.polling { animation: pulse 1.6s ease-in-out infinite; }
+.dot.down { border-color: var(--bad); color: var(--bad); border-style: dashed; }
+.dot.starting { border-color: var(--warn); color: var(--warn); position: relative; }
+/* The ring spins, not the dot, so its label stays upright. */
+.dot.starting::before { content: ""; position: absolute; inset: -3px; border-radius: 50%; border: 3px solid transparent; border-top-color: var(--panel); animation: spin 1.2s linear infinite; }
+.listener small { color: var(--muted); font-size: 0.8rem; }
+.pools { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.pool { border: 1px solid var(--line); border-radius: 8px; padding: 8px; min-height: 180px; }
+.pool header { display: flex; justify-content: space-between; gap: 6px; flex-wrap: wrap; font-size: 0.8rem; margin-bottom: 6px; }
+.pool header b { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; }
+.tag { font-size: 0.7rem; padding: 1px 6px; border-radius: 999px; border: 1px solid currentColor; }
+.tag.spot { color: var(--warn); }
+.tag.od { color: var(--accent); }
+.tasks { display: flex; flex-direction: column; gap: 6px; }
+.task {
+  border-radius: 6px; padding: 5px 7px; font-size: 0.78rem; border: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 2px; animation: arrive 0.45s ease-out;
+}
+.task .state { font-size: 0.7rem; color: var(--muted); }
+.task.busy { border-color: var(--job); background: var(--job-soft); }
+.task.busy .state::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--job); margin-right: 5px; animation: pulse 1s ease-in-out infinite; }
+.task.idle { border-style: dashed; }
+.task.starting { border-color: var(--warn); background: var(--warn-soft); }
+.task.removing { border-color: var(--warn); }
+.task.stopped { opacity: 0.45; text-decoration: line-through; }
+.task.failed, .task.reclaim { border-color: var(--bad); background: var(--bad-soft); }
+.caption { margin-top: 14px; min-height: 3.2em; font-size: 1rem; }
+.alarm { display: none; margin-top: 6px; padding: 6px 10px; border-radius: 6px; background: var(--bad-soft); color: var(--bad); font-size: 0.9rem; }
+.alarm.on { display: block; animation: arrive 0.45s ease-out; }
+.controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.progress { flex: 1 1 120px; display: flex; gap: 4px; }
+.progress span { flex: 1; height: 4px; border-radius: 2px; background: var(--line); }
+.progress span.on { background: var(--accent); }
+.controls .count { font-size: 0.8rem; color: var(--muted); }
+
+/* Static sections */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.card p { color: var(--muted); font-size: 0.95rem; margin: 0; }
+.card.later { border-style: dashed; }
+.card.later h3 { color: var(--later); }
+.badge { font-size: 0.7rem; letter-spacing: 0.05em; text-transform: uppercase; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--later); color: var(--later); margin-left: 6px; vertical-align: 2px; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.table-wrap { overflow-x: auto; }
+footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
+
+@keyframes arrive { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before { animation: none !important; }
+}
+
+@media (max-width: 720px) {
+  h1 { font-size: 1.6rem; }
+  .lane { grid-template-columns: 1fr; }
+  .col { min-height: 0; }
+  .listener { flex-direction: row; justify-content: flex-start; height: auto; text-align: left; }
+  .dot { width: 44px; height: 44px; flex: none; }
+  .queue { flex-direction: row; flex-wrap: wrap; }
+  .pool { min-height: 120px; }
+}
+@media (max-width: 340px) {
+  .pools { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main>
+  <h1>The runner lane</h1>
+  <p class="lede">gh-paddock runs a private repo's Linux test and dev jobs on Fargate tasks in an AWS account of their own, billed per second. One listener reads GitHub's runner scale-set API and starts a single-use runner for each job. This page walks through the v1 design, one event at a time.</p>
+
+  <section aria-labelledby="lane-title">
+    <h2 id="lane-title">Watch the lane</h2>
+    <p>Pick a scene. Each plays itself; pause it to read, or step through by hand.</p>
+    <div class="player">
+      <div class="tabs" role="group" aria-label="Scenes" id="tabs"></div>
+      <div class="lane">
+        <div class="col">
+          <div class="label">GitHub: the queue</div>
+          <div class="queue" id="queue"></div>
+        </div>
+        <div class="col">
+          <div class="label">Listener</div>
+          <div class="listener">
+            <div class="dot" id="dot">poll</div>
+            <small id="listener-note"></small>
+          </div>
+        </div>
+        <div class="col">
+          <div class="label">Fargate: one pool per scale set</div>
+          <div class="pools">
+            <div class="pool">
+              <header><b>example-test</b><span class="tag spot">Spot</span></header>
+              <div class="tasks" id="pool-test"></div>
+            </div>
+            <div class="pool">
+              <header><b>example-dev</b><span class="tag od">on-demand</span></header>
+              <div class="tasks" id="pool-dev"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="caption" id="caption" aria-live="polite"></p>
+      <div class="alarm" id="alarm" role="status"></div>
+      <div class="controls">
+        <button type="button" id="prev" aria-label="Back one step">Back</button>
+        <button type="button" id="play">Pause</button>
+        <button type="button" id="next" aria-label="Next step">Next</button>
+        <div class="progress" id="progress" aria-hidden="true"></div>
+        <span class="count" id="count"></span>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="parts-title">
+    <h2 id="parts-title">The parts</h2>
+    <div class="cards">
+      <div class="card">
+        <h3>Scale sets named by role</h3>
+        <p>Each served repo gets one scale set per pool, named for its role: <code>&lt;repo&gt;-test</code> for CI, <code>&lt;repo&gt;-dev</code> for the dev deploy and its E2E gate. Each pool belongs to one repo, and its runner group is open to that repo alone and closed to public repos. Which repos are served is configuration in the CI account, never a file in this repo.</p>
+      </div>
+      <div class="card">
+        <h3>Single-use runners</h3>
+        <p>Every runner registers with a just-in-time config, takes one job and deregisters. A task never runs jobs from two repos or two pools, so one repo's code and credentials never share a task with another's.</p>
+      </div>
+      <div class="card">
+        <h3>Warm reuse within a pool</h3>
+        <p>A task whose runner finished starts a fresh runner and waits 30 seconds for the next job from the same pool. A dev deploy and the E2E gate after it chain on one warm task.</p>
+      </div>
+      <div class="card">
+        <h3>Remove, then terminate</h3>
+        <p>The listener removes an idle runner through the API before it stops the task. GitHub refuses the removal while the runner holds a job, so a job handed over at that moment is kept and finishes.</p>
+      </div>
+      <div class="card">
+        <h3>GitHub is the queue</h3>
+        <p>No webhook and no queue of our own. Jobs wait in GitHub while no listener runs, and a new listener reads GitHub and ECS and carries on.</p>
+      </div>
+      <div class="card">
+        <h3>Only the listener holds the key</h3>
+        <p>The GitHub App's key stays with the listener, which alone starts and stops tasks. A runner task reads only its own config.</p>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="pools-title">
+    <h2 id="pools-title">The pools in v1</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Pool</th><th>Runs</th><th>Capacity</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td><code>&lt;repo&gt;-test</code></td><td>CI jobs</td><td>Fargate Spot</td><td>A red run is cheap to repeat. A task holds Spot's two-minute warning back from its runner, and a job Spot still kills is re-run once.</td></tr>
+          <tr><td><code>&lt;repo&gt;-dev</code></td><td>The dev deploy and its E2E gate</td><td>Fargate on-demand</td><td>A deploy must not be cut off half way.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:12px">Every task defaults to 2 vCPU and 8 GB, as GitHub's runners for private repos do, and carries its repo and pool as cost allocation tags. Each pool has a maximum; jobs past it wait in GitHub. From one month of a real repo's job timings, v1 is estimated to cut that repo's monthly CI spend by about half, after paying for gh-paddock itself.</p>
+  </section>
+
+  <section aria-labelledby="later-title">
+    <h2 id="later-title">Later, not in v1</h2>
+    <div class="cards">
+      <div class="card later">
+        <h3>The prod stage <span class="badge">later</span></h3>
+        <p>Prod keeps GitHub's runners in v1. Later: an on-demand pool with a fresh task for every job.</p>
+      </div>
+      <div class="card later">
+        <h3>Runners started in advance <span class="badge">later</span></h3>
+        <p>One runner kept started per pool, and dependencies baked into the runner image, if the speed checkpoint calls for them.</p>
+      </div>
+      <div class="card later">
+        <h3>EC2 pools <span class="badge">later</span></h3>
+        <p>EC2 capacity of any kind, ECS Managed Instances included.</p>
+      </div>
+      <div class="card later">
+        <h3>Staying on GitHub</h3>
+        <p>Jobs that need a Docker daemon, KVM or the Android SDK, macOS jobs, and public repos keep GitHub's runners.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>The repo, its README and how to deploy your own: <a href="https://github.com/t-d-d/gh-paddock">github.com/t-d-d/gh-paddock</a>. The design is the <a href="https://github.com/t-d-d/gh-paddock/issues/1">v1 PRD</a>.</p>
+  </footer>
+</main>
+
+<script>
+(function () {
+  // A task: [id, state, label]. State is one of starting, busy, idle,
+  // removing, stopped, failed, reclaim.
+  var t = function (id, state, label) { return { id: id, state: state, label: label || '' }; };
+  var STATES = {
+    starting: 'starting', busy: 'running a job', idle: 'idle, waiting 30 s',
+    removing: 'removing its runner', stopped: 'stopped', failed: 'never registered',
+    reclaim: 'Spot reclaim'
+  };
+
+  var SCENES = [
+    { name: 'A push', steps: [
+      { caption: 'A push queues three CI jobs on the repo\'s test scale set. GitHub holds them: there is no queue of our own.',
+        queue: ['lint', 'unit', 'build'], listener: 'polling', note: 'polls each scale set' },
+      { caption: 'The listener\'s poll says three jobs are assigned and no runner is idle, so it starts three runner tasks, each with a just-in-time config.',
+        queue: ['lint', 'unit', 'build'], listener: 'polling', note: '3 jobs, 0 idle: start 3',
+        test: [t('a', 'starting'), t('b', 'starting'), t('c', 'starting')] },
+      { caption: 'Each runner registers and takes one job. A single-use runner never takes a second.',
+        queue: [], listener: 'polling', note: '3 busy',
+        test: [t('a', 'busy', 'lint'), t('b', 'busy', 'unit'), t('c', 'busy', 'build')] },
+      { caption: 'Jobs finish and their runners deregister. Each task starts a fresh runner and waits 30 seconds for another job from its pool.',
+        queue: [], done: ['lint', 'unit', 'build'], listener: 'polling', note: '3 idle',
+        test: [t('a', 'idle'), t('b', 'idle'), t('c', 'idle')] }
+    ] },
+    { name: 'Warm reuse', steps: [
+      { caption: 'CI passed, so the dev deploy queues on the dev scale set. Its pool runs on on-demand capacity.',
+        queue: ['deploy dev'], listener: 'polling', note: '1 job, 0 idle: start 1',
+        dev: [t('d', 'starting')] },
+      { caption: 'The dev task takes the deploy.',
+        queue: [], listener: 'polling', note: '1 busy',
+        dev: [t('d', 'busy', 'deploy dev')] },
+      { caption: 'The deploy finishes. The task starts a new runner and waits warm.',
+        queue: [], done: ['deploy dev'], listener: 'polling', note: '1 idle',
+        dev: [t('d', 'idle')] },
+      { caption: 'The E2E gate queues inside the 30 seconds, and the warm task takes it at once, with no new task to start.',
+        queue: [], done: ['deploy dev'], listener: 'polling', note: '1 busy, nothing to start',
+        dev: [t('d', 'busy', 'e2e gate')] },
+      { caption: 'Warm reuse never crosses pools: a test job never lands on the dev task, and no task serves two repos.',
+        queue: [], done: ['deploy dev', 'e2e gate'], listener: 'polling', note: '1 idle',
+        dev: [t('d', 'idle')] }
+    ] },
+    { name: 'Remove, then terminate', steps: [
+      { caption: 'Thirty seconds pass with no job. The listener asks GitHub to remove the idle runner.',
+        queue: [], listener: 'polling', note: 'remove runner a',
+        test: [t('a', 'removing'), t('b', 'idle')] },
+      { caption: 'GitHub removes it. Only now does the listener stop the task: no task stops while its runner is registered.',
+        queue: [], listener: 'polling', note: 'removed: stop task a',
+        test: [t('a', 'stopped'), t('b', 'idle')] },
+      { caption: 'The race: a job arrives for runner b just as the listener tries to remove it.',
+        queue: ['retry flaky'], listener: 'polling', note: 'remove runner b',
+        test: [t('b', 'removing')] },
+      { caption: 'GitHub refuses the removal, since the runner holds a job. The listener leaves the task running, and the job keeps its runner.',
+        queue: [], listener: 'polling', note: 'refused: leave task b',
+        test: [t('b', 'busy', 'retry flaky')] },
+      { caption: 'The job finishes. After its next idle 30 seconds the removal succeeds and the task stops.',
+        queue: [], done: ['retry flaky'], listener: 'polling', note: 'removed: stop task b',
+        test: [t('b', 'stopped')] }
+    ] },
+    { name: 'Listener interrupted', steps: [
+      { caption: 'Two runners are busy when the listener\'s task is interrupted.',
+        queue: [], listener: 'down', note: 'interrupted',
+        test: [t('a', 'busy', 'unit')], dev: [t('d', 'busy', 'deploy dev')] },
+      { caption: 'New jobs wait in GitHub. Busy runners carry on, since they talk to GitHub, not to the listener.',
+        queue: ['lint', 'build'], listener: 'down', note: 'no listener',
+        test: [t('a', 'busy', 'unit')], dev: [t('d', 'busy', 'deploy dev')] },
+      { caption: 'ECS starts a new listener. It reads GitHub and ECS to learn which runners and tasks exist.',
+        queue: ['lint', 'build'], listener: 'starting', note: 'reads GitHub and ECS',
+        test: [t('a', 'busy', 'unit')], dev: [t('d', 'busy', 'deploy dev')] },
+      { caption: 'It carries on where the last one stopped, and starts tasks for the jobs that waited. Nothing is lost.',
+        queue: [], listener: 'polling', note: '2 jobs: start 2',
+        test: [t('a', 'busy', 'unit'), t('e', 'busy', 'lint'), t('f', 'busy', 'build')], dev: [t('d', 'busy', 'deploy dev')] }
+    ] },
+    { name: 'A failed start', steps: [
+      { caption: 'A job queues, and the listener starts a task for it.',
+        queue: ['unit'], listener: 'polling', note: '1 job: start 1',
+        test: [t('a', 'starting')] },
+      { caption: 'The task never registers its runner.',
+        queue: ['unit'], listener: 'polling', note: 'no runner from task a',
+        test: [t('a', 'failed')] },
+      { caption: 'The listener stops it and starts a replacement. The job waits in GitHub meanwhile.',
+        queue: ['unit'], listener: 'polling', note: 'replace task a',
+        test: [t('a', 'stopped'), t('g', 'starting')] },
+      { caption: 'The replacement registers and takes the job.',
+        queue: [], listener: 'polling', note: '1 busy',
+        test: [t('g', 'busy', 'unit')] },
+      { caption: 'Had it failed too, and a third in a row, an alarm would email the operator, who can clear the repo\'s runner-label variables to send jobs back to GitHub\'s runners.',
+        queue: [], listener: 'polling', note: '3 failures in a row alarm',
+        alarm: 'Alarm: three failed starts in a row', test: [t('g', 'busy', 'unit')] }
+    ] },
+    { name: 'Spot reclaim', steps: [
+      { caption: 'Two test tasks run on Spot. Spot reclaims both and gives two minutes\' warning.',
+        queue: [], listener: 'polling', note: '2 busy',
+        test: [t('a', 'reclaim', 'lint, 1 min left'), t('b', 'reclaim', 'e2e, 9 min left')] },
+      { caption: 'Each task holds the signal back from its runner, so the job with under two minutes left finishes.',
+        queue: [], done: ['lint'], listener: 'polling', note: '',
+        test: [t('a', 'stopped'), t('b', 'reclaim', 'e2e, 7 min left')] },
+      { caption: 'The longer job dies with its task. Once its workflow run completes, the listener re-runs that job once.',
+        queue: ['e2e (re-run)'], failed: ['e2e'], listener: 'polling', note: 're-run once',
+        test: [t('b', 'stopped')] },
+      { caption: 'The re-run starts on a fresh task. The dev pool runs on on-demand capacity, so a deploy is never cut off this way.',
+        queue: [], failed: ['e2e'], listener: 'polling', note: '1 busy',
+        test: [t('h', 'busy', 'e2e (re-run)')], dev: [] }
+    ] }
+  ];
+
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var STEP_MS = 3600;
+  var scene = 0, step = 0, playing = !reduce, timer = null;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+
+  function jobs(list, cls) {
+    return (list || []).map(function (j) { return '<span class="job ' + cls + '">' + esc(j) + '</span>'; }).join('');
+  }
+  function tasks(list) {
+    return (list || []).map(function (k) {
+      return '<div class="task ' + k.state + '"><span>task ' + esc(k.id) + (k.label ? ': ' + esc(k.label) : '') +
+        '</span><span class="state">' + STATES[k.state] + '</span></div>';
+    }).join('');
+  }
+
+  function render() {
+    var sc = SCENES[scene], s = sc.steps[step];
+    $('queue').innerHTML = jobs(s.queue, '') + jobs(s.done, 'done') + jobs(s.failed, 'failed') ||
+      '<span class="state" style="color:var(--muted);font-size:0.8rem">no jobs waiting</span>';
+    var dot = $('dot');
+    dot.className = 'dot ' + s.listener;
+    dot.textContent = { polling: 'poll', down: 'down', starting: 'start' }[s.listener];
+    $('listener-note').textContent = s.note || '';
+    $('pool-test').innerHTML = tasks(s.test);
+    $('pool-dev').innerHTML = tasks(s.dev);
+    $('caption').textContent = s.caption;
+    var alarm = $('alarm');
+    alarm.textContent = s.alarm || '';
+    alarm.className = 'alarm' + (s.alarm ? ' on' : '');
+    $('progress').innerHTML = sc.steps.map(function (_, i) { return '<span' + (i <= step ? ' class="on"' : '') + '></span>'; }).join('');
+    $('count').textContent = 'Step ' + (step + 1) + ' of ' + sc.steps.length;
+    Array.prototype.forEach.call($('tabs').children, function (b, i) { b.setAttribute('aria-pressed', String(i === scene)); });
+    $('play').textContent = playing ? 'Pause' : 'Play';
+    // While it plays itself, a screen reader would read a new caption every
+    // few seconds; it reads them only when the reader pauses or steps.
+    $('caption').setAttribute('aria-live', playing ? 'off' : 'polite');
+  }
+
+  function advance() {
+    if (step < SCENES[scene].steps.length - 1) step++;
+    else { scene = (scene + 1) % SCENES.length; step = 0; }
+    render();
+  }
+  function schedule() {
+    clearInterval(timer);
+    if (playing) timer = setInterval(advance, STEP_MS);
+  }
+
+  SCENES.forEach(function (sc, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = sc.name;
+    b.addEventListener('click', function () { scene = i; step = 0; render(); schedule(); });
+    $('tabs').appendChild(b);
+  });
+  $('next').addEventListener('click', function () { advance(); schedule(); });
+  $('prev').addEventListener('click', function () {
+    if (step > 0) step--;
+    else { scene = (scene + SCENES.length - 1) % SCENES.length; step = SCENES[scene].steps.length - 1; }
+    render(); schedule();
+  });
+  $('play').addEventListener('click', function () { playing = !playing; render(); schedule(); });
+
+  render();
+  schedule();
+})();
+</script>
+</body>
+</html>

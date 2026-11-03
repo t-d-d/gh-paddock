@@ -22,7 +22,8 @@ name: gate
 
 on:
   pull_request:
-  # main is gated by deploy.yml, which calls this before it applies.
+  # main is gated by deploy.yml, which calls this before it applies, and by
+  # pages.yml, which calls it before it publishes.
   workflow_call:
 
 permissions:

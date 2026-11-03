@@ -1,0 +1,63 @@
+# Publishes docs/pages/, the runner lane page, on GitHub Pages.
+#
+# Only main publishes, after a green gate: a push to main, or a run by hand
+# on main. The gate holds the public-repo scan, so a page that names a served
+# repo or holds an id never goes out. The site is the page and nothing else:
+# the artifact this uploads is docs/pages/ alone, which is public already.
+#
+# Pages has to be on for the repo, with GitHub Actions as its source
+# (Settings, Pages), before the publish job can deploy. Until then the gate
+# still runs and the publish job fails at its deploy step.
+#
+# This repo is public, so these jobs run on GitHub's runners, never on the
+# runners it deploys (docs/constraints/public-repo.md).
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time, and a publish in progress is never cancelled. A
+# newer push carries the older commit's page, so a pending run it replaces
+# loses nothing. Each ref queues apart: GitHub keeps one pending run per
+# group, so a run by hand on another branch in main's group would cancel
+# main's pending publish and then stop at the guard below.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    uses: ./.github/workflows/gate.yml
+
+  publish:
+    needs: [gate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read    # checkout
+      pages: write      # deploy to Pages
+      id-token: write   # the deploy proves where it ran with an OIDC token
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}runner-lane.html
+    steps:
+      # A run by hand can name any branch; only main's page is published.
+      - name: Stop unless this run is on main
+        id: main
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "::error::only main publishes the page; this run is on ${GITHUB_REF}"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/pages
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
