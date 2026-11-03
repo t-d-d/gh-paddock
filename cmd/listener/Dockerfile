@@ -3,7 +3,7 @@
 # and the build reads only the Go module. The deploy's image tag hashes the
 # files this copies, and test/deploy-workflow.test.ts holds the two lists
 # together. No ADD: the hash would not see what it fetched.
-FROM public.ecr.aws/docker/library/golang:1.26-bookworm AS build
+FROM public.ecr.aws/docker/library/golang:1.27-bookworm AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd/ cmd/
