@@ -32,10 +32,21 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
-      # The release the listener's image builds with (cmd/listener/Dockerfile).
+      - name: Read the listener's Go release
+        id: go
+        run: |
+          version=$(sed -nE 's/^FROM[[:space:]]+(--[^[:space:]]+[[:space:]]+)*[^[:space:]]*golang:([0-9]+\.[0-9]+(\.[0-9]+)?)([-@[:space:]].*)?$/\2/p' cmd/listener/Dockerfile | head -n 1)
+          if [ -z "$version" ]; then
+            echo "::error::cmd/listener/Dockerfile has no FROM golang:<release> line"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The Go release comes from the golang tag in cmd/listener/Dockerfile,
+      # read by the step above, so the gate tests with the release the image
+      # builds with. Dependabot bumps only that tag, and this follows it.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.26'
+          go-version: ${{ steps.go.outputs.version }}
       - run: npm ci --ignore-scripts
       - run: npm run gate
 
