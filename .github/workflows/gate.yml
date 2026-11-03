@@ -9,8 +9,10 @@
 # with no pull request gets no gate run; a session raises its pull request
 # straight after its push.
 #
-# A pull request run checks out the merge of its head into main, not the
-# head itself, so nothing the gate runs may depend on the head's history.
+# A pull request run checks out the merge of its head into its base branch,
+# not the head itself, so nothing the gate runs may depend on the head's
+# history. A pull request that conflicts with its base gets no run at all
+# until the conflict is resolved, so its `gate` check stays pending.
 #
 # pull_request, never pull_request_target: a fork's run gets a read-only
 # token and no secrets. This repo is public, so these jobs run on GitHub's
@@ -56,7 +58,7 @@ jobs:
       - run: npm run gate
 
   # The image the deploy would build, built and thrown away: a broken
-  # Dockerfile fails here, on the branch, rather than in the deploy after
+  # Dockerfile fails here, on the pull request, rather than in the deploy after
   # merge. Native arm64, as the listener runs.
   image:
     name: image

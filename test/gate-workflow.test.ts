@@ -11,8 +11,10 @@
  * pull request has no push run here at all. main is gated by deploy.yml,
  * which calls this before it applies.
  *
- * A pull request run checks out the merge of its head into main, not the
- * head, so nothing the gate runs may depend on the head's own history.
+ * A pull request run checks out the merge of its head into its base branch,
+ * not the head, so nothing the gate runs may depend on the head's own
+ * history. A pull request that conflicts with its base gets no run until
+ * the conflict is resolved.
  */
 
 import { test, describe } from 'node:test';
@@ -38,6 +40,15 @@ describe('the gate', () => {
     // No branch or path filter: every pull request gets its gate.
     assert.equal(workflow.on?.pull_request ?? null, null);
     assert.deepEqual(workflow.permissions, { contents: 'read' });
+  });
+
+  // pull_request_target runs a fork's code with this repo's write token and
+  // secrets. gate.yml's own triggers are pinned above; this holds every
+  // other workflow, including one that would call the gate.
+  test('no workflow runs on pull_request_target', () => {
+    for (const { file, workflow: w } of workflows) {
+      assert.ok(!triggers(w).includes('pull_request_target'), `${file} runs on pull_request_target`);
+    }
   });
 
   test('its jobs run their steps whenever it runs: neither carries an `if` that could skip it', () => {
