@@ -1,11 +1,20 @@
 /**
- * The gate (CLAUDE.md, The gate): every push and every fork's pull request
- * runs `npm run gate` and builds the listener's image, and no workflow here
- * runs on the runners this repo deploys (docs/constraints/public-repo.md).
+ * The gate (CLAUDE.md, The gate): every pull request, from a branch here or
+ * from a fork, runs `npm run gate` and builds the listener's image, and no
+ * workflow here runs on the runners this repo deploys
+ * (docs/constraints/public-repo.md).
  *
- * A branch pushed here is gated by its push run. Its pull request must carry
- * no other `gate` or `image` check: a skipped job reports success, so a
- * skipped `gate` would read as green while the push run's is still running.
+ * gate.yml runs on pull_request, not on a branch push. Each commit on a pull
+ * request then gets one run, and its checks are `gate` and `image` whether
+ * the branch is here or on a fork, so a required `gate` check meets both. A
+ * branch push would add a second run beside the pull request's, and a fork's
+ * pull request has no push run here at all. main is gated by deploy.yml,
+ * which calls this before it applies.
+ *
+ * A pull request run checks out the merge of its head into its base branch,
+ * not the head, so nothing the gate runs may depend on the head's own
+ * history. A pull request that conflicts with its base gets no run until
+ * the conflict is resolved.
  */
 
 import { test, describe } from 'node:test';
@@ -18,7 +27,6 @@ import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
-const FORK_ONLY = 'github.event.pull_request.head.repo.full_name != github.repository';
 const GATE_CHECKS = ['gate', 'image'];
 
 const workflowFiles = readdirSync(resolve(REPO_ROOT, '.github/workflows')).filter((f) => /\.ya?ml$/.test(f));
@@ -27,9 +35,20 @@ const triggers = (w: Record<string, any>): string[] =>
   typeof w.on === 'string' ? [w.on] : Array.isArray(w.on) ? w.on : Object.keys(w.on ?? {});
 
 describe('the gate', () => {
-  test('runs on every branch push, and when another workflow calls it, never on a pull request of its own', () => {
-    assert.deepEqual(workflow.on?.push?.['branches-ignore'], ['main']);
-    assert.deepEqual(triggers(workflow).sort(), ['push', 'workflow_call']);
+  test('runs on every pull request, and when another workflow calls it, never on a branch push', () => {
+    assert.deepEqual(triggers(workflow).sort(), ['pull_request', 'workflow_call']);
+    // No branch or path filter: every pull request gets its gate.
+    assert.equal(workflow.on?.pull_request ?? null, null);
+    assert.deepEqual(workflow.permissions, { contents: 'read' });
+  });
+
+  // pull_request_target runs a fork's code with this repo's write token and
+  // secrets. gate.yml's own triggers are pinned above; this holds every
+  // other workflow, including one that would call the gate.
+  test('no workflow runs on pull_request_target', () => {
+    for (const { file, workflow: w } of workflows) {
+      assert.ok(!triggers(w).includes('pull_request_target'), `${file} runs on pull_request_target`);
+    }
   });
 
   test('its jobs run their steps whenever it runs: neither carries an `if` that could skip it', () => {
@@ -37,31 +56,16 @@ describe('the gate', () => {
   });
 
   // A skipped job finishes at once and reports success, and a required check
-  // passes on it. A pull_request run's `gate` beside the push run's would let
-  // a reader of the head's checks merge before the push run's gate finished.
-  test('no workflow a pull request runs has a job whose check is named `gate` or `image`', () => {
+  // passes on it. A second `gate` or `image` on a pull request, from another
+  // workflow, could be skipped and read as green before gate.yml's finished.
+  test('no other workflow a pull request runs has a job whose check is named `gate` or `image`', () => {
     for (const { file, workflow: w } of workflows) {
+      if (file === 'gate.yml') continue;
       if (!triggers(w).some((t) => t.startsWith('pull_request'))) continue;
       for (const [id, job] of Object.entries(w.jobs ?? {}) as [string, { name?: string }][]) {
         assert.ok(!GATE_CHECKS.includes(job.name ?? id), `${file} job ${id} reports a check named ${job.name ?? id}`);
       }
     }
-  });
-
-  // The fork's run calls the gate, so its checks are `<job> / gate` and
-  // `<job> / image`, and the steps live in one place.
-  test('a fork\'s pull request is gated by a pull_request run that calls the gate, and only a fork\'s', () => {
-    const callers = workflows.flatMap(({ file, workflow: w }) =>
-      (Object.entries(w.jobs ?? {}) as [string, { uses?: string; if?: string }][])
-        .filter(([, job]) => /(^\.|\/gh-paddock)\/\.github\/workflows\/gate\.ya?ml(@.*)?$/.test(job.uses ?? ''))
-        .map(([id, job]) => ({ file, w, id, job })),
-    );
-    const forks = callers.filter(({ w }) => triggers(w).some((t) => t.startsWith('pull_request')));
-    assert.equal(forks.length, 1, `callers on pull_request: ${forks.map((c) => `${c.file} ${c.id}`).join(', ')}`);
-    const fork = forks[0]!;
-    assert.deepEqual(triggers(fork.w), ['pull_request'], `${fork.file} runs on pull_request alone, never pull_request_target`);
-    assert.equal(fork.job.if, FORK_ONLY);
-    assert.deepEqual(fork.w.permissions, { contents: 'read' });
   });
 
   test('runs the same `npm run gate` a contributor runs, with Go installed', () => {

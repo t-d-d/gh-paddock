@@ -1,22 +1,28 @@
 # The offline gate: the same `npm run gate` a contributor runs, and a build
 # of the listener's image. It holds no secret and reaches no AWS account, so
-# it is safe to run on every push and on a fork's pull request.
+# it is safe to run on any pull request, a fork's included.
 #
-# A branch pushed here is gated by its push run, and its pull request runs
-# nothing named `gate` or `image`: a skipped job reports success, so a
-# skipped pull_request run would read as a green gate while the push run's
-# was still running. A fork's pull request has no push run here, so
-# fork-gate.yml calls this for it, under its own job name.
+# It runs on pull_request, not on a branch push. Each commit on a pull
+# request gets one run, and its checks are `gate` and `image` whether the
+# branch is here or on a fork, so a required `gate` check meets both. A
+# push trigger would add a second run beside the pull request's. A branch
+# with no pull request gets no gate run; a session raises its pull request
+# straight after its push.
 #
-# This repo is public, so these jobs run on GitHub's free runners, never on
-# the runners it deploys (docs/constraints/public-repo.md).
+# A pull request run checks out the merge of its head into its base branch,
+# not the head itself, so nothing the gate runs may depend on the head's
+# history. A pull request that conflicts with its base gets no run at all
+# until the conflict is resolved, so its `gate` check stays pending.
+#
+# pull_request, never pull_request_target: a fork's run gets a read-only
+# token and no secrets. This repo is public, so these jobs run on GitHub's
+# free runners, never on the runners it deploys
+# (docs/constraints/public-repo.md).
 name: gate
 
 on:
+  pull_request:
   # main is gated by deploy.yml, which calls this before it applies.
-  push:
-    branches-ignore: [main]
-  # deploy.yml, on main, and fork-gate.yml, on a fork's pull request.
   workflow_call:
 
 permissions:
@@ -52,7 +58,7 @@ jobs:
       - run: npm run gate
 
   # The image the deploy would build, built and thrown away: a broken
-  # Dockerfile fails here, on the branch, rather than in the deploy after
+  # Dockerfile fails here, on the pull request, rather than in the deploy after
   # merge. Native arm64, as the listener runs.
   image:
     name: image
