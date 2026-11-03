@@ -6,13 +6,26 @@
 # old. A security update is not held. The deploy job runs these actions with
 # an administrator role, and a week gives a compromised release time to be
 # found and pulled. Each action keeps its own pull request, so there are no
-# groups. Copied from gh-governor.
+# groups. Copied from gh-governor, with the listener's base images and Go
+# module added on the same terms.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directories:
       - /
       - /.github/actions/*
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: docker
+    directory: /cmd/listener
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+  - package-ecosystem: gomod
+    directory: /
     schedule:
       interval: weekly
     cooldown:

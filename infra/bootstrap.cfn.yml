@@ -44,7 +44,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: paddock-github-deploy
-      Description: Assumed by GitHub Actions on a push to main, to deploy gh-paddock
+      Description: Assumed by GitHub Actions on main, to deploy gh-paddock
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:
         Version: '2012-10-17'

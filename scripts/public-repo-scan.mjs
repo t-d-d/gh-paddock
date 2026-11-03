@@ -13,14 +13,14 @@
  *                    digits; a fake in a test is shorter);
  *   - issue-number:  an issue or pull request reference of four or more
  *                    digits, which would point at another repo's numbers;
- *   - name:          the name of the private service these runners were
- *                    first built for, in any case. A doc (the README, or
- *                    Markdown under docs/) may name the service bare;
- *   - repo:          that service's repo, `owner/name`, in every file.
+ *   - name:          a served private repo's name, in any case. A doc (the
+ *                    README, or Markdown under docs/) may name its service
+ *                    bare;
+ *   - repo:          that repo's `owner/name` path, in every file.
  *
  * Which repos the runners serve is deploy-time configuration, never a file
- * here. No file is exempt, this one included, so the name is built from
- * parts below. `npm run scan` prints each finding and exits 1 on any.
+ * here, so the scan knows only the name below. No file is exempt, this one
+ * included, so the name is built from parts. `npm run scan` prints each finding and exits 1 on any.
  */
 
 import { execFileSync } from 'node:child_process';

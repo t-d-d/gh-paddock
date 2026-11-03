@@ -58,15 +58,20 @@ func TestCheckFailsABeatFromTheFuture(t *testing.T) {
 	}
 }
 
+// Run beats at once and then on every tick, so the beat keeps moving.
 func TestRunBeatsUntilCancelled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "heartbeat")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- Run(ctx, path, 5*time.Millisecond, time.Now) }()
+	seen := map[string]bool{}
 	deadline := time.Now().Add(2 * time.Second)
-	for Check(path, time.Minute, time.Now()) != nil {
+	for len(seen) < 3 {
 		if time.Now().After(deadline) {
-			t.Fatal("Run wrote no beat")
+			t.Fatalf("Run wrote %d distinct beats in 2s, want 3", len(seen))
+		}
+		if raw, err := os.ReadFile(path); err == nil {
+			seen[string(raw)] = true
 		}
 		time.Sleep(time.Millisecond)
 	}

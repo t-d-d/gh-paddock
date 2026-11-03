@@ -61,5 +61,5 @@ these runners serve is the owner's business, not the repo's.
 - Do not run this repo's workflows on its own runners: a fork's pull
   request would run code in the CI account.
 
-Judgment: that a log line or an error message names an ARN or a registry no check sees; the scan reads files, not what the code prints.
+Judgment: no check sees three things. A log line or error message that names an ARN or a registry: the scan reads files, not what the code prints. A served repo other than the one name the scan knows: the list is private, so the scan cannot hold it. A runner group's setting for public repos: it lives in GitHub. Commit trailers and posts carry the session's URL on purpose, as gh-governor routes by it; this rule covers files.
 History: Set with the repo's scaffold, November 2026, under PRD #1. Adapted from gh-governor's.

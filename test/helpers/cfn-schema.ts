@@ -22,26 +22,26 @@ export type Substitutions = Record<string, string>;
  * so every template test needs this just to load the document.
  *
  * - `!Ref X` / `!GetAtt X` / `!GetAtt [A, B]` collapse to a `${X}` / `${A.B}`
- *   placeholder — enough for the parse to succeed; the resolved value never
+ *   placeholder, enough for the parse to succeed; the resolved value never
  *   affects a measured size or a matched glob.
  * - `!Sub` (scalar and single-element sequence form) applies `substitutions`.
  *   The map form (`!Sub [tpl, {vars}]`) throws loud rather than silently
- *   leaving its custom `${Key}`s unresolved — no template uses it today, and a
+ *   leaving its custom `${Key}`s unresolved, no template uses it today, and a
  *   future one that does must register its keys here deliberately.
- * - `!Join` concatenates its list under the given delimiter. Elements — and the
- *   delimiter — that are themselves unresolved intrinsics have already become
+ * - `!Join` concatenates its list under the given delimiter. Elements, and the
+ *   delimiter, that are themselves unresolved intrinsics have already become
  *   their `${X}` placeholders by the time they reach here and join like any
  *   other string, so the result stays faithful about the literal parts and
  *   honest about the rest. Only a list that is not a list (an intrinsic
  *   standing in for the whole operand) collapses to `${Join}`.
  * - `!Split` / `!Select` resolve for real when their operands are literals
  *   (`!Select [2, !Split ['/', 'https://host/path']]` → `'host'`), and collapse
- *   to a placeholder when an operand is itself an unresolved intrinsic — which
+ *   to a placeholder when an operand is itself an unresolved intrinsic, which
  *   is the common case, since they mostly destructure `!GetAtt` outputs.
  * - `!If [Cond, a, b]` collapses to a `${If:Cond}` placeholder rather than
  *   silently picking a branch. Which branch applies is stage-dependent (our
  *   conditions gate prod-only resources), so resolving one here would let two
- *   tests read the same template as different shapes — the drift this module
+ *   tests read the same template as different shapes, the drift this module
  *   exists to prevent. A test that needs a branch must resolve it deliberately.
  */
 export function makeCfnSchema(substitutions: Substitutions = {}): yaml.Schema {
@@ -56,7 +56,7 @@ export function makeCfnSchema(substitutions: Substitutions = {}): yaml.Schema {
   const constructSub = (data: unknown[]): string => {
     if (data.length > 1) {
       throw new Error(
-        '!Sub with a substitution map is not supported by the shared CFN test schema — ' +
+        '!Sub with a substitution map is not supported by the shared CFN test schema. ' +
           'add the map’s keys to the substitutions passed to makeCfnSchema()/loadTemplate() ' +
           '(test/helpers/cfn.ts).',
       );
@@ -64,7 +64,7 @@ export function makeCfnSchema(substitutions: Substitutions = {}): yaml.Schema {
     return applySubstitutions(data[0] as string);
   };
 
-  /** `!Split [delimiter, source]` — a real split when both operands are literal. */
+  /** `!Split [delimiter, source]`: a real split when both operands are literal. */
   const constructSplit = (data: unknown[]): string[] => {
     const [delimiter, source] = data as [unknown, unknown];
     return typeof delimiter === 'string' && typeof source === 'string'
@@ -72,7 +72,7 @@ export function makeCfnSchema(substitutions: Substitutions = {}): yaml.Schema {
       : ['${Split}'];
   };
 
-  /** `!Select [index, list]` — the element when the list is already resolved. */
+  /** `!Select [index, list]`: the element when the list is already resolved. */
   const constructSelect = (data: unknown[]): unknown => {
     const [index, list] = data as [unknown, unknown];
     const position = Number(index);
@@ -108,7 +108,7 @@ export function makeCfnSchema(substitutions: Substitutions = {}): yaml.Schema {
       construct: (d: unknown[]) => `\${If:${String((d as unknown[])[0])}}`,
     }),
     // Condition functions, as they appear in a `Conditions:` block. Like
-    // `!If` above these resolve to a placeholder rather than a real boolean —
+    // `!If` above these resolve to a placeholder rather than a real boolean:
     // the tests read resource *shape*, and a condition's truth depends on
     // stack parameters that only exist at deploy time. Modelled so that a
     // template using them parses at all (js-yaml rejects an unknown tag
@@ -176,11 +176,9 @@ export type TemplateOutput = {
 };
 
 /**
- * A template parameter. `Default` is the value an apply that passes no
- * override gets — and `aws cloudformation deploy` RESETS any parameter it is
- * not given, so a parameter's default is what a careless apply actually
- * deploys. That makes it worth asserting on, rather than re-parsing the raw
- * YAML with a regex per test.
+ * A template parameter. `Default` is what a create gets for a parameter it
+ * is not given. On an update, `aws cloudformation deploy` keeps the stack's
+ * previous value instead, which the deploy's rollback relies on.
  */
 export type TemplateParameter = {
   Type?: string;

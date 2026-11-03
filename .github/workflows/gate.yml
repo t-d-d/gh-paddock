@@ -32,9 +32,10 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
+      # The release the listener's image builds with (cmd/listener/Dockerfile).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: '1.26'
       - run: npm ci --ignore-scripts
       - run: npm run gate
 
@@ -50,9 +51,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the listener's image
         run: docker build --file cmd/listener/Dockerfile --tag paddock-listener:gate .
-      - name: Run its health check, which fails with no heartbeat yet
+      # As ECS runs it: the image's own user, the health check inside it.
+      - name: Start the listener, and check it turns healthy
         run: |
-          if docker run --rm paddock-listener:gate -healthcheck; then
-            echo "::error::the health check passed with no heartbeat"
+          if docker run --rm paddock-listener:gate -healthcheck 2>"$RUNNER_TEMP/before.err"; then
+            echo "::error::the health check passed before the listener ran"
             exit 1
           fi
+          grep -q "no heartbeat" "$RUNNER_TEMP/before.err"
+          docker run --detach --name listener paddock-listener:gate
+          for _ in $(seq 1 20); do
+            if docker exec listener /listener -healthcheck; then
+              docker stop listener >/dev/null
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs listener
+          echo "::error::the listener did not turn healthy in 20s"
+          exit 1

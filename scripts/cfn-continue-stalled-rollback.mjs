@@ -5,9 +5,8 @@
 // The deploy applies the stack from CI so it never needs admin credentials
 // on somebody's machine. A stack in UPDATE_ROLLBACK_FAILED breaks that: it
 // cannot be updated, so every later deploy fails, and clearing it is a
-// `continue-update-rollback`. The deploy role holds
-// `cloudformation:ContinueUpdateRollback` on the stack, and this is what
-// calls it.
+// `continue-update-rollback`, which the deploy role may call. This is what
+// calls it. Copied from gh-governor.
 //
 // Run before the deploy step:
 //
@@ -16,7 +15,7 @@
 // It is a no-op on a healthy stack and on an absent one, so it sits in front
 // of every apply rather than being something an operator has to remember.
 //
-// What it will NOT do is clear a ROLLBACK_COMPLETE or a ROLLBACK_FAILED — a
+// What it will NOT do is clear a ROLLBACK_COMPLETE or a ROLLBACK_FAILED, a
 // failed FIRST create, in the two spellings it leaves behind. Only a delete
 // clears either (ContinueUpdateRollback takes UPDATE_ROLLBACK_FAILED and no
 // other state), and a deploy that deletes a stack is one nobody asked for.
@@ -33,8 +32,8 @@ import { isCliEntry } from './lib/cli-entry.mjs';
  * means the stack does not exist yet.
  *
  * Three states stop an apply, in two ways: one this script can clear itself,
- * and two only a delete clears. Everything else — UPDATE_ROLLBACK_COMPLETE
- * included, which reads like a failure and is a working state — proceeds and
+ * and two only a delete clears. Everything else, UPDATE_ROLLBACK_COMPLETE
+ * included, which reads like a failure and is a working state, proceeds and
  * lets `aws cloudformation deploy` be the judge; it reports the rest better
  * than a second copy of CloudFormation's state machine would.
  *
@@ -44,8 +43,8 @@ import { isCliEntry } from './lib/cli-entry.mjs';
 export function recoveryAction(stackStatus) {
   if (stackStatus === 'UPDATE_ROLLBACK_FAILED') return 'continue';
   // Both spellings of a failed FIRST create: the rollback finished, or it
-  // failed too. `ContinueUpdateRollback` answers for neither — the API takes
-  // UPDATE_ROLLBACK_FAILED and nothing else — so both are the delete-only case.
+  // failed too. `ContinueUpdateRollback` answers for neither: the API takes
+  // UPDATE_ROLLBACK_FAILED and nothing else, so both are the delete-only case.
   if (stackStatus === 'ROLLBACK_COMPLETE' || stackStatus === 'ROLLBACK_FAILED') return 'refuse';
   return 'proceed';
 }
@@ -59,7 +58,7 @@ export function recoveryAction(stackStatus) {
  * The exit code says only that the call failed, so an AccessDenied, a throttle
  * or an unreachable endpoint looks exactly like a first apply. Taken for
  * absence, a stack genuinely stuck in UPDATE_ROLLBACK_FAILED is never
- * continued — the one job this script has — and the operator is told it does
+ * continued, the one job this script has, and the operator is told it does
  * not exist, which sends them to delete it with admin credentials: the
  * wrong path entirely. CloudFormation spells the real absence `... does not exist`, so
  * that, rather than the exit status, is what tells the two apart.
@@ -78,7 +77,7 @@ export function describedStatus(described) {
  *
  * Exported so the waiter's NAME is pinned by a test. It is a subcommand, not
  * an argument: `aws` rejects a name it does not know before it contacts AWS at
- * all, so a wrong one fails every recovery — and only ever on the day one was
+ * all, so a wrong one fails every recovery, and only ever on the day one was
  * needed, which is the day nobody is reading this file. The list the CLI
  * accepts is `aws cloudformation wait help`.
  *
@@ -117,7 +116,7 @@ function main(stackName) {
     '--query', 'Stacks[0].StackStatus',
     '--output', 'text',
   ]);
-  // A stack that does not exist is not an error here — it is a first apply.
+  // A stack that does not exist is not an error here. It is a first apply.
   // A read that failed for any OTHER reason is: see `describedStatus`.
   const read = describedStatus(described);
   if (read.kind === 'unreadable') {
@@ -134,7 +133,7 @@ function main(stackName) {
   const action = recoveryAction(status);
 
   if (action === 'proceed') {
-    console.log(`${stackName}: ${status ?? 'does not exist yet'} — nothing to recover.`);
+    console.log(`${stackName}: ${status ?? 'does not exist yet'}: nothing to recover.`);
     return;
   }
 
@@ -146,7 +145,7 @@ function main(stackName) {
     process.exit(1);
   }
 
-  console.log(`${stackName}: ${status} — continuing the rollback so the apply can proceed.`);
+  console.log(`${stackName}: ${status}. Continuing the rollback so the apply can proceed.`);
   const [continueCommand, waitCommand] = rollbackCommands(stackName);
   const continued = aws(continueCommand);
   if (continued.status !== 0) {
@@ -155,7 +154,7 @@ function main(stackName) {
   }
 
   // Without the wait the deploy below would race the rollback and fail with an
-  // error about the stack being busy — which reads like a different fault.
+  // error about the stack being busy, which reads like a different fault.
   const waited = aws(waitCommand);
   if (waited.status !== 0) {
     console.error(
@@ -164,7 +163,7 @@ function main(stackName) {
     );
     process.exit(1);
   }
-  console.log(`${stackName}: rollback complete — the stack can be updated again.`);
+  console.log(`${stackName}: rollback complete, and the stack can be updated again.`);
 }
 
 // Importable for the unit test; only the direct invocation touches AWS.

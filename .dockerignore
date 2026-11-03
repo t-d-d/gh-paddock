@@ -1,5 +1,5 @@
-# The listener's image builds from the Go module alone
-# (cmd/listener/Dockerfile); nothing else belongs in the build context.
+# The listener's image copies only the Go module (cmd/listener/Dockerfile).
+# These are the large or private folders kept out of the build context.
 .git
 .github
 .claude

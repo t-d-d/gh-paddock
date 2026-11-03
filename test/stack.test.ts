@@ -43,6 +43,10 @@ describe('the listener service', () => {
     assert.ok(!Object.values(env).includes('${ImageUri}'), 'the image URI carries the account id');
   });
 
+  test('reaches GitHub and AWS through a public IP in the default VPC, with no NAT to pay for', () => {
+    assert.equal(service.Properties?.NetworkConfiguration?.AwsvpcConfiguration?.AssignPublicIp, 'ENABLED');
+  });
+
   test('takes no inbound traffic', () => {
     for (const [, group] of resourcesOfType(tpl, 'AWS::EC2::SecurityGroup')) {
       assert.equal(group.Properties?.SecurityGroupIngress, undefined);
@@ -56,13 +60,36 @@ describe('the listener service', () => {
 });
 
 describe('the stack\'s grants', () => {
-  test('no role is allowed every action', () => {
-    const statements: Statement[] = resourcesOfType(tpl, 'AWS::IAM::Role').flatMap(([, role]) => [
-      ...(role.Properties?.Policies ?? []).flatMap((p) => p.PolicyDocument?.Statement ?? []),
+  const roles = resourcesOfType(tpl, 'AWS::IAM::Role');
+
+  // The listener will hold the most power here: starting tasks and reading
+  // the App key. Every grant it gains is written in this template, scoped.
+  test('the listener\'s own role is granted nothing yet, and the execution role only ECS\'s task-execution policy', () => {
+    const byId = Object.fromEntries(roles);
+    assert.deepEqual(byId.ListenerTaskRole?.Properties?.ManagedPolicyArns ?? [], []);
+    assert.deepEqual(byId.ListenerTaskRole?.Properties?.Policies ?? [], []);
+    assert.deepEqual(byId.ListenerExecutionRole?.Properties?.ManagedPolicyArns, [
+      'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy',
     ]);
-    for (const s of statements) {
-      assert.ok(![s.Action].flat().includes('*'), `a statement allows every action: ${JSON.stringify(s)}`);
+  });
+
+  test('no role holds an administrator policy or a statement allowing every action', () => {
+    assert.ok(roles.length > 0);
+    for (const [id, role] of roles) {
+      for (const arn of role.Properties?.ManagedPolicyArns ?? []) {
+        assert.doesNotMatch(String(arn), /AdministratorAccess|PowerUserAccess/, id);
+      }
+      const statements: Statement[] = (role.Properties?.Policies ?? []).flatMap((p) => p.PolicyDocument?.Statement ?? []);
+      for (const s of statements) assert.ok(![s.Action].flat().includes('*'), `${id} allows every action`);
     }
+  });
+});
+
+describe('fitness: the alert address never passes through GitHub (public-repo.md)', () => {
+  test('the stack reads it from Parameter Store, and the alerts topic mails it', () => {
+    assert.equal(tpl.Parameters?.AlertEmail?.Type, 'AWS::SSM::Parameter::Value<String>');
+    assert.equal(tpl.Parameters?.AlertEmail?.Default, '/paddock/alert-email');
+    assert.deepEqual(tpl.Resources.AlertsTopic?.Properties?.Subscription, [{ Protocol: 'email', Endpoint: '${AlertEmail}' }]);
   });
 });
 
@@ -76,11 +103,13 @@ describe('the listener-down alarm', () => {
     assert.equal(down?.Properties?.ComparisonOperator, 'LessThanThreshold');
     assert.equal(down?.Properties?.Threshold, 1);
     assert.equal(down?.Properties?.TreatMissingData, 'breaching');
+    assert.deepEqual(down?.Properties?.Dimensions, [
+      { Name: 'ClusterName', Value: '${Cluster}' },
+      { Name: 'ServiceName', Value: '${ListenerService.Name}' },
+    ]);
   });
 
-  test('pages the operator through the alerts topic, whose address never passes through GitHub', () => {
+  test('pages the operator through the alerts topic', () => {
     assert.deepEqual(down?.Properties?.AlarmActions, ['${AlertsTopic}']);
-    assert.equal(tpl.Parameters?.AlertEmail?.Type, 'AWS::SSM::Parameter::Value<String>');
-    assert.equal(tpl.Parameters?.AlertEmail?.Default, '/paddock/alert-email');
   });
 });

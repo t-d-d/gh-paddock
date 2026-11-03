@@ -96,27 +96,63 @@ async function stackImage() {
   return image;
 }
 
-async function main() {
-  const expected = process.env.EXPECTED_IMAGE_URI || (await stackImage());
-  const timeoutMs = Number(process.env.PROBE_TIMEOUT_SECONDS || 600) * 1000;
-  const deadline = Date.now() + timeoutMs;
-  const ecs = new ECSClient({});
+/**
+ * Poll until the listener passes, fails, or the time runs out, and return
+ * the exit code: 0 keeps the image, 1 rolls it back. A read that fails says
+ * nothing about the image, so the probe waits through it rather than
+ * failing a good image on a throttled call.
+ *
+ * @param {{
+ *   observe: () => Promise<Observed>,
+ *   expected: string,
+ *   timeoutMs: number,
+ *   now?: () => number,
+ *   sleep?: (ms: number) => Promise<unknown>,
+ *   log?: (line: string) => void,
+ * }} io
+ * @returns {Promise<0 | 1>}
+ */
+export async function probe({
+  observe,
+  expected,
+  timeoutMs,
+  now = Date.now,
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
+  log = console.log,
+}) {
+  const deadline = now() + timeoutMs;
   let last = '';
   for (;;) {
-    const { verdict, reason } = judge(await observe(ecs), expected);
-    if (reason !== last) console.log(`probe: ${reason}`);
+    /** @type {Judgment} */
+    let judgment;
+    try {
+      judgment = judge(await observe(), expected);
+    } catch (err) {
+      judgment = { verdict: 'wait', reason: `could not read the service: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const { verdict, reason } = judgment;
+    if (reason !== last) log(`probe: ${reason}`);
     last = reason;
     if (verdict === 'pass') return 0;
     if (verdict === 'fail') {
-      console.error(`::error::probe failed: ${reason}`);
+      log(`::error::probe failed: ${reason}`);
       return 1;
     }
-    if (Date.now() > deadline) {
-      console.error(`::error::probe timed out after ${timeoutMs / 1000}s: ${reason}`);
+    if (now() > deadline) {
+      log(`::error::probe timed out after ${timeoutMs / 1000}s: ${reason}`);
       return 1;
     }
-    await new Promise((r) => setTimeout(r, 15_000));
+    await sleep(15_000);
   }
+}
+
+async function main() {
+  const ecs = new ECSClient({});
+  return probe({
+    observe: () => observe(ecs),
+    expected: process.env.EXPECTED_IMAGE_URI || (await stackImage()),
+    timeoutMs: Number(process.env.PROBE_TIMEOUT_SECONDS || 600) * 1000,
+  });
 }
 
 if (isCliEntry(import.meta.url, process.argv[1])) {

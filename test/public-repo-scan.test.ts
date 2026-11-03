@@ -36,6 +36,8 @@ describe('the public-repo scan', () => {
 
   test('refuses a claude.ai environment or session id, but not a short fake', () => {
     assert.deepEqual(kinds('README.md', sessionId), ['claude-id']);
+    assert.deepEqual(kinds('README.md', sessionId.replace('session_', 'env_')), ['claude-id']);
+    assert.deepEqual(kinds('README.md', sessionId.replace('session_', 'cse_')), ['claude-id']);
     assert.deepEqual(kinds('test/x.ts', 'session_01OWNER'), []);
   });
 

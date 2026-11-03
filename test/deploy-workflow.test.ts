@@ -15,7 +15,7 @@ const { workflow, codeOnly } = loadWorkflow('.github/workflows/deploy.yml');
 const steps = stepsOf(workflow, 'deploy');
 const indexOf = (id: string) => steps.indexOf(stepById(steps, id));
 
-describe('when the deploy runs', () => {
+describe('fitness: only main deploys, one deploy at a time, after a green gate (deploy.md)', () => {
   test('on a push to main and by hand, never on a pull request', () => {
     assert.deepEqual(workflow.on?.push?.branches, ['main']);
     assert.ok('workflow_dispatch' in (workflow.on ?? {}));
@@ -28,16 +28,23 @@ describe('when the deploy runs', () => {
     assert.equal(workflow.jobs?.deploy?.if, "${{ needs.role.outputs.set == 'true' }}");
   });
 
-  test('one at a time, and a queued deploy never cancels a running one', () => {
-    assert.deepEqual(workflow.concurrency, { group: 'deploy', 'cancel-in-progress': false });
+  // GitHub keeps one pending run per concurrency group and cancels the older
+  // one when another queues. A newer push carries the older commit, so that
+  // loss is harmless; a probe-only run must not take a push's place.
+  test('one at a time: a running deploy is never cancelled, and a probe-only run queues apart', () => {
+    assert.deepEqual(workflow.concurrency, {
+      group: "${{ inputs.probe_only && 'deploy-probe' || 'deploy' }}",
+      'cancel-in-progress': false,
+    });
   });
 
-  test('inside the deploy role\'s one-hour session, with room for a rollback', () => {
-    assert.ok(workflow.jobs?.deploy?.['timeout-minutes'] <= 55);
+  test('inside the deploy role\'s one-hour session, with room for an apply, a rollback and two probes', () => {
+    const minutes = workflow.jobs?.deploy?.['timeout-minutes'];
+    assert.ok(minutes <= 55 && minutes >= 45, `timeout-minutes is ${minutes}`);
   });
 });
 
-describe('the order of the deploy', () => {
+describe('fitness: the deploy applies the bootstrap stack, then the main stack, then probes (deploy.md)', () => {
   test('applies the bootstrap stack before the main stack', () => {
     assert.ok(indexOf('bootstrap') < indexOf('apply'));
     assert.match(stepById(steps, 'bootstrap').run ?? '', /--stack-name paddock-bootstrap/);
@@ -51,21 +58,36 @@ describe('the order of the deploy', () => {
     assert.ok(steps.indexOf(guards[1]!) < indexOf('apply'));
   });
 
-  test('reads the image the stack runs before applying, and probes after', () => {
+  test('reads the image the stack runs before applying, applies the image it built, and probes for that image', () => {
     assert.ok(indexOf('previous') < indexOf('apply'));
     assert.ok(indexOf('apply') < indexOf('probe'));
+    assert.match(stepById(steps, 'previous').run ?? '', /--stack-name paddock\b/);
+    assert.equal(stepById(steps, 'apply').env?.IMAGE_URI, '${{ steps.image.outputs.image_uri }}');
+    assert.match(stepById(steps, 'apply').run ?? '', /"ImageUri=\$\{IMAGE_URI\}"/);
     assert.equal(stepById(steps, 'probe').env?.EXPECTED_IMAGE_URI, '${{ steps.image.outputs.image_uri }}');
   });
 
+  // ECS creates its service-linked role on an account's first cluster, and
+  // a cluster with capacity providers can fail to attach them while it does.
+  // The failed first create leaves a stack only a delete clears.
+  test('makes sure ECS\'s service-linked role exists before the first apply can need it', () => {
+    const run = stepById(steps, 'ecs-role').run ?? '';
+    assert.match(run, /aws iam get-role --role-name AWSServiceRoleForECS/);
+    assert.match(run, /aws iam create-service-linked-role --aws-service-name ecs\.amazonaws\.com/);
+    assert.equal(stepById(steps, 'ecs-role').if, '${{ !inputs.probe_only }}');
+    assert.ok(indexOf('ecs-role') < indexOf('apply'));
+  });
+
   test('a probe-only run applies nothing', () => {
-    for (const id of ['bootstrap', 'plan', 'image', 'previous', 'apply']) {
-      assert.equal(stepById(steps, id).if, '${{ !inputs.probe_only }}', `${id} runs on a probe-only run`);
+    const guards = steps.filter((s) => /cfn-continue-stalled-rollback\.mjs/.test(s.run ?? ''));
+    for (const step of [...['bootstrap', 'plan', 'image', 'network', 'ecs-role', 'previous', 'apply'].map((id) => stepById(steps, id)), ...guards]) {
+      assert.equal(step.if, '${{ !inputs.probe_only }}', `${step.id ?? step.name} runs on a probe-only run`);
     }
     assert.equal(stepById(steps, 'probe').if, undefined);
   });
 });
 
-describe('a red probe', () => {
+describe('fitness: a red probe rolls the stack back to the image it ran before, and a failed rollback pages (deploy.md)', () => {
   const rollback = stepById(steps, 'rollback');
   const reprobe = stepById(steps, 'reprobe');
   const page = stepById(steps, 'page');
@@ -79,6 +101,7 @@ describe('a red probe', () => {
 
   test('re-applies the same template with the image before, changing nothing else', () => {
     const run = rollback.run ?? '';
+    assert.match(run, /--stack-name paddock\b/);
     assert.match(run, /--template-file infra\/paddock\.cfn\.yml/);
     assert.deepEqual([...run.matchAll(/"(\w+)=/g)].map((m) => m[1]), ['ImageUri']);
     assert.equal(rollback.env?.PREVIOUS_IMAGE_URI, '${{ steps.previous.outputs.image_uri }}');
@@ -90,19 +113,25 @@ describe('a red probe', () => {
     assert.match(reprobe.run ?? '', /node scripts\/probe\.mjs/);
   });
 
-  test('pages the operator when the rollback does not bring the listener back', () => {
-    assert.equal(page.if, "${{ failure() && (steps.rollback.outcome == 'failure' || steps.reprobe.outcome == 'failure') }}");
-    assert.match(page.run ?? '', /--logical-resource-id AlertsTopic/);
+  // A job that reaches its timeout is cancelled, not failed, and the
+  // listener's state is then unknown.
+  test('pages the operator when the rollback does not bring the listener back, or runs out of time', () => {
+    assert.equal(
+      page.if,
+      "${{ (failure() || cancelled()) && (steps.rollback.outcome == 'failure' || steps.rollback.outcome == 'cancelled' || steps.reprobe.outcome == 'failure' || steps.reprobe.outcome == 'cancelled') }}",
+    );
+    assert.match(page.run ?? '', /--stack-name paddock --logical-resource-id AlertsTopic/);
     assert.match(page.run ?? '', /aws sns publish/);
   });
 });
 
-describe('the image tag', () => {
+describe('fitness: the image tag hashes exactly what the image is built from (deploy.md)', () => {
   // The tag hashes what the image is built from, so an unchanged listener
   // reuses its image and a changed one cannot. A file the Dockerfile copies
   // but the hash leaves out would ship under an old tag.
   test('hashes exactly the files the listener\'s Dockerfile copies, and the Dockerfile', () => {
     const dockerfile = readFileSync(resolve(REPO_ROOT, 'cmd/listener/Dockerfile'), 'utf-8');
+    assert.doesNotMatch(dockerfile, /^ADD /m, 'an ADD would bring in a file the hash cannot see');
     const copied = [...dockerfile.matchAll(/^COPY (?!--from)(.+?) \S+$/gm)]
       .flatMap((m) => m[1]!.trim().split(/\s+/))
       .map((p) => p.replace(/\/$/, ''));

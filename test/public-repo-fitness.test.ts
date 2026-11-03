@@ -12,9 +12,12 @@ import { loadWorkflow, stepsOf, type WorkflowStep } from './helpers/workflow.ts'
 describe('fitness: no tracked file holds an id or names the served service outside a doc (public-repo.md)', () => {
   test('the scan reads every tracked file, with none exempted', () => {
     const files = trackedFiles();
-    assert.ok(files.includes('scripts/public-repo-scan.mjs'));
-    assert.ok(files.includes('test/public-repo-scan.test.ts'));
-    assert.ok(files.includes('LICENSE'));
+    for (const path of ['scripts/public-repo-scan.mjs', 'test/public-repo-scan.test.ts', 'LICENSE', 'docs/constraints/public-repo.md', '.claude/skills/unslop/SKILL.md']) {
+      assert.ok(files.includes(path), path);
+    }
+    const read: string[] = [];
+    scanRepo({ read: (path) => { read.push(path); return ''; } });
+    assert.deepEqual(read, files);
   });
 
   test('no tracked file has a finding', () => {
@@ -64,6 +67,13 @@ describe('fitness: the image build uploads no build record and the deploy writes
   const deploy = loadWorkflow('.github/workflows/deploy.yml');
   const actionSteps: WorkflowStep[] = action.workflow.runs?.steps ?? [];
   const off = (value: unknown) => String(value).toLowerCase() === 'false';
+
+  // A pushed tag is never moved, so an unchanged listener keeps the image
+  // its probe passed (deploy.md).
+  test('creates the registry with immutable tags', () => {
+    const create = actionSteps.map((s) => s.run ?? '').join('\n');
+    assert.match(create, /aws ecr create-repository[\s\S]*--image-tag-mutability IMMUTABLE/);
+  });
 
   test('every build step turns off the build record and the summary', () => {
     const builds = actionSteps.filter((s) => s.uses?.startsWith('docker/build-push-action@'));

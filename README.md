@@ -35,7 +35,14 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 
 ## Deploying your own
 
-The deploy needs an AWS account that holds gh-paddock alone. Apply `infra/bootstrap.cfn.yml` once as an administrator, put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`, set the repository variable `AWS_REGION`, and write the alert address to the Parameter Store parameter `/paddock/alert-email`. From then on every green merge to main deploys. The operator guide comes with v1.
+The deploy needs an AWS account that holds gh-paddock alone, with a default VPC in the region it uses and no OIDC provider for GitHub yet. Once, as an administrator:
+
+1. Apply `infra/bootstrap.cfn.yml` as the stack `paddock-bootstrap`, with `GitHubOwner`, `GitHubOwnerId`, `GitHubRepo` and `GitHubRepoId` set to your fork's names and numeric ids.
+2. Put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`, and set the repository variable `AWS_REGION`.
+3. Write the alert address to the Parameter Store parameter `/paddock/alert-email`, as a String, not a SecureString.
+4. Save the GitHub App's `{"appId", "privateKey"}` into the secret `paddock/github-app`. The skeleton does not read it yet.
+
+From then on every green merge to main deploys. The operator guide comes with v1.
 
 ## Licence
 

@@ -2,7 +2,7 @@
 
 gh-paddock runs self-hosted GitHub Actions runners for private repos on AWS Fargate. One listener task polls GitHub's runner scale-set API and starts single-use runner tasks to match. It deploys to its own AWS account, the CI account.
 
-- The listener and the runner entrypoint are Go (`cmd/`, `internal/`). The repo's checks, the deploy's scripts and the tests of the stacks and workflows are Node (`scripts/`, `test/`).
+- The listener is Go (`cmd/`, `internal/`). The repo's checks, the deploy's scripts and the tests of the stacks and workflows are Node (`scripts/`, `test/`).
 - PRDs are issues labelled `type: prd`. There is no PRD file. A PRD's "Non-goals" list is binding: do not build one.
 - [docs/constraints/](docs/constraints/README.md) holds the rules in force. Decisions and their reasons live in issues.
 

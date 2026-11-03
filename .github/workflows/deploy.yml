@@ -1,8 +1,9 @@
 # gh-paddock's deploy, modelled on gh-governor's.
 #
 # Builds the listener's image and applies infra/paddock.cfn.yml: the stack
-# that runs the listener on Fargate Spot. A green gate on a push to main
-# deploys; nothing else does.
+# that runs the listener on Fargate Spot. Only main deploys, after a green
+# gate: a push to main, or a run by hand on main. The deploy role's trust
+# pins refs/heads/main, so a run on any other branch cannot assume it.
 #
 # The deploy job does nothing until the AWS_DEPLOY_ROLE_ARN secret is set,
 # so a fork's first merges run the gate alone. Its settings are repository
@@ -55,9 +56,12 @@ on:
 permissions:
   contents: read
 
-# Two applies at once would race on the stack and on the image tag; queue.
+# Two applies at once would race on the stack and on the image tag, so they
+# queue. GitHub keeps one pending run per group and cancels the older when
+# another queues; a newer push carries the older commit, so that loses
+# nothing. A probe-only run queues apart, so it never takes a push's place.
 concurrency:
-  group: deploy
+  group: ${{ inputs.probe_only && 'deploy-probe' || 'deploy' }}
   cancel-in-progress: false
 
 jobs:
@@ -191,6 +195,16 @@ jobs:
           echo "vpc_id=${VPC_ID}" >> "$GITHUB_OUTPUT"
           echo "subnet_ids=${SUBNET_IDS}" >> "$GITHUB_OUTPUT"
 
+      # ECS creates this role on an account's first cluster, and a cluster
+      # with capacity providers can fail to attach them while it does. That
+      # failed first create leaves a stack only a delete clears.
+      - name: Make sure ECS's service-linked role exists
+        id: ecs-role
+        if: ${{ !inputs.probe_only }}
+        run: |
+          aws iam get-role --role-name AWSServiceRoleForECS >/dev/null 2>&1 \
+            || aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com >/dev/null
+
       # A stack in UPDATE_ROLLBACK_FAILED cannot be updated, and clearing it
       # would otherwise need admin credentials on a laptop.
       - name: Continue a stalled rollback, if the stack is in one
@@ -276,9 +290,12 @@ jobs:
 
       # The deploy's red run reaches whoever watches Actions; the listener
       # down reaches the operator, through the topic every alarm publishes to.
+      # A job that reaches its timeout is cancelled rather than failed, and
+      # the listener's state is then unknown, so a cancelled rollback or
+      # re-probe pages too.
       - name: Page the operator, since the rollback did not bring the listener back
         id: page
-        if: ${{ failure() && (steps.rollback.outcome == 'failure' || steps.reprobe.outcome == 'failure') }}
+        if: ${{ (failure() || cancelled()) && (steps.rollback.outcome == 'failure' || steps.rollback.outcome == 'cancelled' || steps.reprobe.outcome == 'failure' || steps.reprobe.outcome == 'cancelled') }}
         run: |
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "::error::the rollback did not bring the listener back. Paging the operator."
