@@ -1,0 +1,10 @@
+# The listener's image builds from the Go module alone
+# (cmd/listener/Dockerfile); nothing else belongs in the build context.
+.git
+.github
+.claude
+node_modules
+test
+docs
+scripts
+infra
