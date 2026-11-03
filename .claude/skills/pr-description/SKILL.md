@@ -7,11 +7,14 @@ description: "Write or rewrite a pull request title and body that a reviewer can
 
 ## Who reads it
 
-The owner, who merges, and anyone reading this public repo afterwards.
-Neither reads the diff first. They want to know whether the change is
-going the right way: is it more complicated than it needs to be, and has
-it drifted from what the issue, the PRD or a decision record said. Nothing
-already decided there is argued again here.
+Governor's PR review, which merges on a pass; the owner, who merges what
+the review leaves to a person; and anyone reading this public repo
+afterwards. None of them reads the diff first. The review reads only this
+body, the tickets it closes and the list of changed files, and holds them
+to the checklist in `.github/dispatch.json`. They want to know whether the
+change is going the right way: is it more complicated than it needs to be,
+and has it drifted from what the issue, the PRD or a decision record said.
+Nothing already decided there is argued again here.
 
 The body is also the record the next session reads to learn what the
 system now is.
@@ -92,7 +95,7 @@ Run the `unslop` skill over the result.
 1. Could a reader who has not opened the diff say in one sentence what
    this adds to the system and what it costs?
 2. Is the first sentence of *Drift* the thing most likely to make the
-   owner stop the merge?
+   review or the owner stop the merge?
 3. Does every acceptance criterion appear in the table, and does every
    row that is not green at merge say who checks it or which issue owns it?
 

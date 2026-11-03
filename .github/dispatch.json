@@ -1,5 +1,25 @@
 {
   "environment": "askme",
   "labels": { "ready": ["mode: afk"], "claim": "claimed", "claimRemoves": [], "exclude": ["type: prd", "mode: human"] },
-  "features": { "pickup": true, "summons": true, "prMessages": true, "subscribeMessages": true, "unblocked": true, "conflicts": true, "signOff": true }
+  "features": { "pickup": true, "summons": true, "prMessages": true, "subscribeMessages": true, "unblocked": true, "conflicts": true, "prReview": true, "signOff": true },
+  "review": {
+    "checklist": "Review the pull request from its description and the tickets it closes. The description follows the repo's template: Outcome, Adds / removes, Drift, Verification and Left for later. Answer each test in order.\n\n1. Every ticket it closes is open and claimed, and the PR is the only open one closing it.\n2. Its Outcome says what the change does, and that is what the tickets it closes asked for.\n3. Its Adds / removes says what the change costs, and the cost is nothing a person should decide. A new paid service, a wider permission, more or larger runner tasks than the tickets ask for, or a dropped safety check fails.\n4. Where it departs from a ticket it closes, its Drift section says so, and it does less, never more.\n5. Its Verification table has a row for every acceptance criterion of every ticket it closes, and each row names the test or check that answers it, or the open issue that owns it.\n6. It leaves no loose end: anything it found and did not do is an issue its Left for later section names.\n7. It changes no path on the human-only list.\n\nAnswer pass, or fail with the number of the first test that failed and one sentence saying what the PR would need to meet it.",
+    "humanOnly": [
+      { "glob": "CLAUDE.md", "reason": "the instructions every session follows, at the root or in any folder" },
+      { "glob": ".claude/**", "reason": "the skills, hooks and settings every session runs" },
+      { "glob": ".github/workflows/**", "reason": "the workflows: the gate, which this review waits on, and the deploy, which runs with an administrator role in the CI account" },
+      { "glob": ".github/actions/**", "reason": "the image action the deploy calls" },
+      { "glob": ".github/dependabot.yml", "reason": "which updates Dependabot raises, and the week it holds each release back" },
+      { "glob": ".github/dispatch.json", "reason": "this file: what governor may do here, and the lists this review checks against" },
+      { "glob": "/package.json", "reason": "the gate's steps, which CI runs as npm run gate" },
+      { "glob": "infra/**", "reason": "the stacks: the CI account's roles, permissions, network and what they cost" },
+      { "glob": "docs/constraints/**", "reason": "the rules in force: a change to what one means needs an issue the owner agrees to" },
+      { "glob": "scripts/public-repo-scan.mjs", "reason": "the scan that keeps ids and served repos out of this public repo (docs/constraints/public-repo.md)" },
+      { "glob": "scripts/probe.mjs", "reason": "the probe that decides whether a deploy rolls back (docs/constraints/deploy.md)" },
+      { "glob": "scripts/cfn-continue-stalled-rollback.mjs", "reason": "the guard in front of every stack apply (docs/constraints/deploy.md)" }
+    ],
+    "tickets": { "forbid": [{ "labels": ["type: prd", "mode: human"] }] },
+    "dependabot": ["/go.mod", "/go.sum", "cmd/listener/Dockerfile"],
+    "merge": true
+  }
 }
