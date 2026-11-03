@@ -67,8 +67,8 @@ chose to test.
 `Green at` is one of:
 
 - `merge`: a gate test answers it.
-- `deploy`: the deploy's read-back (scripts/conformance.mjs) or the task's
-  probe answers it.
+- `deploy`: the deploy's probe of the listener (scripts/probe.mjs)
+  answers it.
 - `by hand`: only the owner can check it, such as a session a real ticket
   starts, or an alarm email arriving. Say exactly what to do.
 - an issue number: nothing answers it yet, and that issue owns it. The
