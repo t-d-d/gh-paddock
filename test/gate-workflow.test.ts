@@ -7,13 +7,13 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
-const { workflow } = loadWorkflow('.github/workflows/gate.yml');
+const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
 const FORK_ONLY_ON_PR = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository";
 
 describe('the gate', () => {
@@ -48,30 +48,61 @@ describe('the gate', () => {
       assert.ok(reader >= 0 && reader < steps.indexOf(setupGo!), `step ${ref[1]} runs before setup-go`);
     });
 
-    test('that step reads the release from cmd/listener/Dockerfile\'s golang FROM line', () => {
+    // Runs the reader step, as Actions runs it, against `dockerfile` placed at
+    // cmd/listener/Dockerfile in a scratch directory, and returns the release
+    // it outputs. Throws when the step exits non-zero.
+    const readRelease = (dockerfile: string): string | undefined => {
       assert.ok(ref);
-      const dockerfile = readFileSync(resolve(REPO_ROOT, 'cmd/listener/Dockerfile'), 'utf-8');
-      const tag = /^FROM\s+\S*golang:(\d+\.\d+(?:\.\d+)?)-/m.exec(dockerfile)?.[1];
-      assert.ok(tag, 'the Dockerfile builds FROM a golang:<release>-<variant> image');
-
       const dir = mkdtempSync(join(tmpdir(), 'gate-go-'));
       try {
+        mkdirSync(join(dir, 'cmd/listener'), { recursive: true });
+        writeFileSync(join(dir, 'cmd/listener/Dockerfile'), dockerfile);
         const output = join(dir, 'output');
         execFileSync('bash', ['-eo', 'pipefail', '-c', stepById(steps, ref[1] ?? '').run ?? ''], {
-          cwd: REPO_ROOT,
+          cwd: dir,
           env: { PATH: process.env.PATH, GITHUB_OUTPUT: output },
+          stdio: 'pipe',
         });
         const outputs = Object.fromEntries(
-          readFileSync(output, 'utf-8').trim().split('\n').map((line) => line.split('=', 2) as [string, string]),
+          readFileSync(output, 'utf-8').trim().split('\n').map((line) => {
+            const at = line.indexOf('=');
+            return [line.slice(0, at), line.slice(at + 1)];
+          }),
         );
-        assert.equal(outputs[ref[2] ?? ''], tag);
+        return outputs[ref[2] ?? ''];
       } finally {
         rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    test('that step reads the release from cmd/listener/Dockerfile\'s golang FROM line', () => {
+      const dockerfile = readFileSync(resolve(REPO_ROOT, 'cmd/listener/Dockerfile'), 'utf-8');
+      const tag = /^FROM\s.*golang:(\d+\.\d+(?:\.\d+)?)/m.exec(dockerfile)?.[1];
+      assert.ok(tag, 'the Dockerfile builds FROM a golang:<release> image');
+      assert.equal(readRelease(dockerfile), tag);
+    });
+
+    test('that step reads the release whatever the FROM line carries around the tag', () => {
+      const cases: [string, string][] = [
+        ['FROM public.ecr.aws/docker/library/golang:1.27-bookworm AS build', '1.27'],
+        ['FROM golang:1.27.3-alpine AS build', '1.27.3'],
+        ['FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build', '1.27'],
+        ['FROM golang:1.27-bookworm@sha256:0123abcd AS build', '1.27'],
+        ['FROM golang:1.27 AS build', '1.27'],
+        ['FROM golang:1.27', '1.27'],
+      ];
+      for (const [from, release] of cases) {
+        assert.equal(readRelease(`# a comment\n${from}\nRUN true\nFROM scratch\n`), release, from);
+      }
+    });
+
+    test('that step fails the gate when no FROM line names a golang release', () => {
+      for (const dockerfile of ['FROM scratch\n', 'FROM golang:latest\n', 'FROM golang:1.27rc1-bookworm\n']) {
+        assert.throws(() => readRelease(dockerfile), JSON.stringify(dockerfile));
       }
     });
 
     test('the comment above setup-go says the release comes from the Dockerfile', () => {
-      const { raw } = loadWorkflow('.github/workflows/gate.yml');
       const lines = raw.split('\n');
       const at = lines.findIndex((l) => /uses: actions\/setup-go@/.test(l));
       let i = at - 1;

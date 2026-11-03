@@ -35,9 +35,9 @@ jobs:
       - name: Read the listener's Go release
         id: go
         run: |
-          version=$(sed -nE 's/^FROM[[:space:]]+[^[:space:]]*golang:([0-9]+\.[0-9]+(\.[0-9]+)?)-.*/\1/p' cmd/listener/Dockerfile | head -n 1)
+          version=$(sed -nE 's/^FROM[[:space:]]+(--[^[:space:]]+[[:space:]]+)*[^[:space:]]*golang:([0-9]+\.[0-9]+(\.[0-9]+)?)([-@[:space:]].*)?$/\2/p' cmd/listener/Dockerfile | head -n 1)
           if [ -z "$version" ]; then
-            echo "::error::cmd/listener/Dockerfile has no FROM golang:<release>-<variant> line"
+            echo "::error::cmd/listener/Dockerfile has no FROM golang:<release> line"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
