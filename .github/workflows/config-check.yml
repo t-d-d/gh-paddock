@@ -1,0 +1,35 @@
+# Checks .github/governor.json on each pull request that changes it, with
+# the code governor runs, so a file governor would refuse fails here and
+# does not stop governor serving the repo once it merges. It also fails an
+# issue template that names a ready label, and warns where CLAUDE.md lacks
+# governor's session rules block, so it runs when either changes.
+#
+# The check runs here, on this repo's own token, with read access alone and
+# no secret. It is pinned to a commit of gh-governor, which publishes no
+# tags. A called workflow cannot learn which commit it runs from, so the
+# commit is passed again as `commit`. To move to a newer check, change the
+# commit after `@`, in `commit:`, in heartbeat.yml and in governor.json's
+# `$schema` together (test/governor-config.test.ts).
+#
+# This repo is public, so the job runs on GitHub's runners, never on the
+# runners it deploys (docs/constraints/public-repo.md).
+name: config check
+
+on:
+  pull_request:
+    paths:
+      - .github/governor.json
+      - .github/ISSUE_TEMPLATE/**
+      - ISSUE_TEMPLATE.md
+      - .github/ISSUE_TEMPLATE.md
+      - docs/ISSUE_TEMPLATE.md
+      - CLAUDE.md
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    uses: t-d-d/gh-governor/.github/workflows/config-check.yml@c6cf0d8fa15b77e3ef86802c805fe82c7d698d8d
+    with:
+      commit: c6cf0d8fa15b77e3ef86802c805fe82c7d698d8d

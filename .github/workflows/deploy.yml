@@ -71,6 +71,14 @@ concurrency:
   group: ${{ inputs.probe_only && 'deploy-probe' || 'deploy' }}
   cancel-in-progress: false
 
+# What governor reads of a deploy (.github/governor.json, deployMessages).
+# The deploy job's name ends "at <commit> · deployed: paddock", so governor
+# tells the session of each pull request a green deploy shipped, and of each
+# one a red run on main failed to ship. `all` picks every pull request merged
+# since the deploy before. The value is public: a step prints its env.
+env:
+  TICKET_LABEL_PATHS: all
+
 jobs:
   gate:
     uses: ./.github/workflows/gate.yml
@@ -153,7 +161,9 @@ jobs:
     needs: [gate, role, runner-image]
     # A probe-only run skips the runner's image and still probes.
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.role.outputs.set == 'true' && (inputs.probe_only || needs.runner-image.result == 'success') }}
-    name: "${{ inputs.probe_only && 'Probe only: probe the listener' || 'Build the image, apply the stacks, probe the listener' }}"
+    # A probe-only run deploys nothing, so its name carries no marker. A
+    # rollback is a step of this job, and the job then ends red.
+    name: "${{ inputs.probe_only && 'Probe only: probe the listener' || format('Build the image, apply the stacks, probe the listener at {0} · deployed: paddock', github.sha) }}"
     # Native arm64: the listener runs on arm64.
     runs-on: ubuntu-24.04-arm
     # Room for a rollback's apply and second probe after the first, inside
