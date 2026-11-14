@@ -37,8 +37,9 @@
 # topic: jobs on these runners then queue with nothing to start them. A
 # probe-only run applies nothing, so it rolls nothing back.
 #
-# No secret is written here. The operator saves the GitHub App's key into
-# the bootstrap stack's secret once, before the first deploy.
+# No secret is written here. The operator writes the GitHub App's key to the
+# Parameter Store parameter /paddock/github-app once, as a SecureString,
+# before the first deploy (docs/constraints/public-repo.md).
 
 name: Deploy
 
