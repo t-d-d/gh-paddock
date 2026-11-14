@@ -6,7 +6,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTemplate } from './helpers/cfn.ts';
+import { readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { loadTemplate, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
 
 const tpl = loadTemplate('infra/bootstrap.cfn.yml');
 
@@ -37,17 +39,27 @@ describe('the bootstrap stack', () => {
 // /paddock/github-app. CloudFormation writes only a String parameter, which
 // would store the key unencrypted and put its value in a public template.
 describe('fitness: no stack creates the App key or a Secrets Manager secret (public-repo.md)', () => {
-  for (const file of ['infra/bootstrap.cfn.yml', 'infra/paddock.cfn.yml']) {
-    const resources = Object.entries(loadTemplate(file).Resources);
+  const files = readdirSync(resolve(REPO_ROOT, 'infra'))
+    .filter((name) => name.endsWith('.cfn.yml'))
+    .map((name) => `infra/${name}`);
+
+  test('every stack in infra/ is read', () => {
+    assert.ok(files.includes('infra/bootstrap.cfn.yml') && files.includes('infra/paddock.cfn.yml'), files.join(', '));
+  });
+
+  for (const file of files) {
+    const stack = loadTemplate(file);
 
     test(`${file} defines no Secrets Manager secret`, () => {
-      const secrets = resources.filter(([, r]) => String(r?.Type).startsWith('AWS::SecretsManager::'));
+      const secrets = Object.entries(stack.Resources).filter(([, r]) => String(r.Type).startsWith('AWS::SecretsManager::'));
       assert.deepEqual(secrets.map(([name]) => name), []);
     });
 
+    // By its logical id, name or description, since a stack could give the
+    // parameter any name.
     test(`${file} defines no parameter for the App key`, () => {
-      const parameters = resources.filter(
-        ([, r]) => r?.Type === 'AWS::SSM::Parameter' && JSON.stringify(r?.Properties?.Name ?? '').includes('github-app'),
+      const parameters = resourcesOfType(stack, 'AWS::SSM::Parameter').filter((entry) =>
+        /github.?app|app.?key/i.test(JSON.stringify(entry)),
       );
       assert.deepEqual(parameters.map(([name]) => name), []);
     });
