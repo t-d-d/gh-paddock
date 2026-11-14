@@ -6,7 +6,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadTemplate, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
 
@@ -64,4 +64,14 @@ describe('fitness: no stack creates the App key or a Secrets Manager secret (pub
       assert.deepEqual(parameters.map(([name]) => name), []);
     });
   }
+
+  // A comment that sends the operator to a secret the stack no longer has
+  // would have them look for the key in the wrong place.
+  test('no stack or workflow says the App key is in a secret', () => {
+    const workflows = readdirSync(resolve(REPO_ROOT, '.github/workflows')).map((name) => `.github/workflows/${name}`);
+    for (const file of [...files, ...workflows]) {
+      const text = readFileSync(resolve(REPO_ROOT, file), 'utf-8').replace(/\s*\n\s*#?\s*/g, ' ');
+      assert.doesNotMatch(text, /Secrets Manager|bootstrap stack's secret/i, file);
+    }
+  });
 });

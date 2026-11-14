@@ -45,7 +45,8 @@
 # probe-only run applies nothing, so it rolls nothing back.
 #
 # No secret is written here. The operator writes the GitHub App's key to the
-# parameter /paddock/github-app once, before the first deploy.
+# Parameter Store parameter /paddock/github-app once, as a SecureString,
+# before the first deploy (docs/constraints/public-repo.md).
 
 name: Deploy
 
