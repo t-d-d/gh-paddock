@@ -153,3 +153,31 @@ describe('the deploy\'s settings', () => {
     assert.deepEqual(variables, ['AWS_REGION']);
   });
 });
+
+// Governor learns of a deploy from the deploy workflow alone
+// (.github/governor.json turns deployMessages on). The job whose success
+// means the change is live ends its name with the marker and names the
+// commit it shipped, and the file says which merged pull requests hear of it.
+describe('what governor reads of a deploy', () => {
+  const name: string = workflow.jobs?.deploy?.name ?? '';
+
+  test('the deploy job\'s name ends with the commit and the target, on a push or a run by hand', () => {
+    assert.match(name, /\|\| format\('[^']* at \{0\} \u00b7 deployed: paddock', github\.sha\) \}\}$/);
+  });
+
+  test('a probe-only run deploys nothing, so its name carries no marker', () => {
+    const probeOnly = /inputs\.probe_only && '([^']*)'/.exec(name);
+    assert.ok(probeOnly, name);
+    assert.doesNotMatch(probeOnly[1]!, /deployed:/);
+  });
+
+  test('no other job is marked: a rollback is a step of the deploy job, which then ends red', () => {
+    for (const [id, job] of Object.entries(workflow.jobs ?? {}) as [string, { name?: string }][]) {
+      if (id !== 'deploy') assert.doesNotMatch(job.name ?? id, /deployed:/, id);
+    }
+  });
+
+  test('every pull request a deploy shipped hears of it', () => {
+    assert.deepEqual(workflow.env, { TICKET_LABEL_PATHS: 'all' });
+  });
+});
