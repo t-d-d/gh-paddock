@@ -38,12 +38,21 @@ export function unpinned(text: string): string[] {
     if (ref.startsWith('./')) continue;
     const at = ref.lastIndexOf('@');
     const commit = at < 0 ? '' : ref.slice(at + 1);
-    if (!/^[0-9a-f]{40}$/.test(commit) || !/^#\s*v\d/.test(comment ?? '')) bad.push(line.trim());
+    const pinned = /^[0-9a-f]{40}$/.test(commit);
+    if (pinned && GOVERNOR_WORKFLOW.test(ref)) continue;
+    if (!pinned || !/^#\s*v\d/.test(comment ?? '')) bad.push(line.trim());
   }
   return bad;
 }
 
 const PINNED = /@[0-9a-f]{40}$/;
+
+/**
+ * One of governor's reusable workflows. Governor publishes no tags, so there
+ * is no tag to name beside the commit: the commit alone pins it, and
+ * test/governor-config.test.ts holds that it matches the `commit` input.
+ */
+const GOVERNOR_WORKFLOW = /^t-d-d\/gh-governor\/\.github\/workflows\/[\w.-]+\.ya?ml@/;
 
 /**
  * The `uses:` values in a parsed workflow or action, at a job, a job's step or
@@ -96,6 +105,17 @@ describe('third-party actions are named by their commit', () => {
     assert.deepEqual(unpinned(`        uses: 'actions/checkout@${sha}' # v6.3.0`), []);
     assert.deepEqual(unpinned('        uses: ./.github/actions/image'), []);
     assert.deepEqual(unpinned('#   uses: t-d-d/gh-paddock/.github/workflows/gate.yml@<commit>'), []);
+  });
+
+  test('one of governor\'s workflows passes on its commit alone, and on nothing less', () => {
+    const sha = 'e1253824e5c10ff9df46874f81ed3ec929e19cfd';
+    const call = 'uses: t-d-d/gh-governor/.github/workflows/config-check.yml';
+    assert.deepEqual(unpinned(`    ${call}@${sha}`), []);
+    assert.deepEqual(unpinned(`    ${call}@main`), [`${call}@main`]);
+    assert.deepEqual(unpinned(`    ${call}@e1253824`), [`${call}@e1253824`]);
+    // Another repo's workflow, or an action of governor's, still needs its tag.
+    assert.deepEqual(unpinned(`    uses: acme/factory/.github/workflows/ci.yml@${sha}`), [`uses: acme/factory/.github/workflows/ci.yml@${sha}`]);
+    assert.deepEqual(unpinned(`    - uses: t-d-d/gh-governor/actions/check@${sha}`), [`- uses: t-d-d/gh-governor/actions/check@${sha}`]);
   });
 
   test('every workflow and action in .github names each outside action by its commit', () => {
