@@ -344,7 +344,7 @@ func TestAFinishedTaskIsReplacedOnlyForAnotherJob(t *testing.T) {
 	}
 }
 
-func TestAPollWithNoMessageScalesNothing(t *testing.T) {
+func TestAPollWithNoMessageBeforeAnyStatisticsScalesNothing(t *testing.T) {
 	f := newFakeAWS()
 	s, _ := newScaler(f, spotTest)
 	if err := s.Scale(context.Background(), nil); err != nil {
@@ -352,6 +352,31 @@ func TestAPollWithNoMessageScalesNothing(t *testing.T) {
 	}
 	if len(f.runs) != 0 {
 		t.Fatal("a 202 started a task")
+	}
+}
+
+// An empty poll means GitHub's counts have not changed, so the last ones
+// still hold. Scaling on them replaces a task that died before it took its
+// job, which no new message would otherwise prompt.
+func TestAnEmptyPollReplacesATaskThatDiedOnTheLastCounts(t *testing.T) {
+	f := newFakeAWS()
+	s, _ := newScaler(f, spotTest)
+	ctx := context.Background()
+	if err := s.Scale(ctx, assigned(1)); err != nil {
+		t.Fatal(err)
+	}
+	f.stopAll()
+	if err := s.Scale(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.runs) != 2 {
+		t.Fatalf("started %d tasks; the dead one was not replaced", len(f.runs))
+	}
+	if err := s.Scale(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.runs) != 2 {
+		t.Fatal("an empty poll started a task the pool already has")
 	}
 }
 

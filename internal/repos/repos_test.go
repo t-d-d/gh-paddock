@@ -108,3 +108,27 @@ func TestEachPoolHasItsOwnScaleSetName(t *testing.T) {
 		}
 	})
 }
+
+// Two repos of one org whose names differ only in what the scale-set name
+// folds away, or whose repo and pool names split one name two ways, would
+// share a scale set and a runner group. The later entry is skipped.
+func TestTwoPoolsThatWouldShareAScaleSetName(t *testing.T) {
+	t.Run("fitness: no two pools share a scale set or runner group (pool-per-repo.md)", func(t *testing.T) {
+		list, err := Parse(`{"repos": [
+			{"repo": "acme/widgets", "pools": [{"name": "dev-test", "capacity": "spot"}]},
+			{"repo": "acme/widgets-dev", "pools": [{"name": "test", "capacity": "spot"}]},
+			{"repo": "acme/gadgets.js", "pools": [{"name": "test", "capacity": "spot"}]},
+			{"repo": "Acme/gadgets-js", "pools": [{"name": "test", "capacity": "spot"}]},
+			{"repo": "other/gadgets-js", "pools": [{"name": "test", "capacity": "spot"}]}]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var served []string
+		for _, r := range list.Repos {
+			served = append(served, r.FullName())
+		}
+		if len(list.Skipped) != 2 || strings.Join(served, " ") != "acme/widgets acme/gadgets.js other/gadgets-js" {
+			t.Fatalf("served %v, skipped %v", served, list.Skipped)
+		}
+	})
+}

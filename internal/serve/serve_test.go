@@ -166,6 +166,7 @@ type fakeSession struct {
 	messages chan *scaleset.RunnerScaleSetMessage
 	acked    []int
 	max      []int
+	acquired []int64
 	closed   atomic.Bool
 	mu       sync.Mutex
 }
@@ -192,7 +193,12 @@ func (s *fakeSession) DeleteMessage(_ context.Context, id int) error {
 	return nil
 }
 
-func (s *fakeSession) AcquireJobs(context.Context, []int64) ([]int64, error) { return nil, nil }
+func (s *fakeSession) AcquireJobs(_ context.Context, ids []int64) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.acquired = append(s.acquired, ids...)
+	return ids, nil
+}
 
 func (s *fakeSession) Session() scaleset.RunnerScaleSetSession {
 	return scaleset.RunnerScaleSetSession{SessionID: s.id, Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3}}
@@ -331,6 +337,80 @@ func TestAFailedPollReopensTheSession(t *testing.T) {
 	<-done
 	if !first.closed.Load() || !second.closed.Load() {
 		t.Fatal("a session was left open")
+	}
+}
+
+// GitHub assigns a job to the scale set, and counts it in
+// TotalAssignedJobs, only once the listener acquires it. Each job a message
+// offers is acquired before the message is scaled and acked.
+func TestEachOfferedJobIsAcquired(t *testing.T) {
+	session := &fakeSession{id: uuid.New(), messages: make(chan *scaleset.RunnerScaleSetMessage)}
+	scaler := &recordingScaler{}
+	var logs syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, Pool{Repo: repos.Repo{Owner: "acme", Name: "widgets"}, Pool: repos.Pool{Name: "test", MaxRunners: 4}, ScaleSetID: 5},
+			func(context.Context) (Session, error) { return session, nil }, scaler, func() {}, slog.New(slog.NewJSONHandler(&logs, nil)), func(int) time.Duration { return time.Millisecond })
+		close(done)
+	}()
+	session.messages <- &scaleset.RunnerScaleSetMessage{
+		MessageID:  12,
+		Statistics: &scaleset.RunnerScaleSetStatistic{},
+		JobAvailableMessages: []*scaleset.JobAvailable{
+			{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 101}},
+			{JobMessageBase: scaleset.JobMessageBase{RunnerRequestID: 102}},
+		},
+	}
+	session.messages <- nil
+	waitFor(t, "the message handled", func() bool { return scaler.count() >= 2 })
+	cancel()
+	<-done
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if len(session.acquired) != 2 || session.acquired[0] != 101 || session.acquired[1] != 102 {
+		t.Fatalf("acquired %v, want 101 and 102", session.acquired)
+	}
+}
+
+// A session that opens clears the failures before it: the next failure
+// waits as briefly as the first did.
+func TestAnOpenedSessionResetsTheBackoff(t *testing.T) {
+	first := &fakeSession{id: uuid.New(), messages: make(chan *scaleset.RunnerScaleSetMessage)}
+	var opened atomic.Int32
+	var mu sync.Mutex
+	var waits []int
+	scaler := &recordingScaler{}
+	var logs syncBuffer
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, Pool{Repo: repos.Repo{Owner: "acme", Name: "widgets"}, Pool: repos.Pool{Name: "test", MaxRunners: 4}, ScaleSetID: 5},
+			func(context.Context) (Session, error) {
+				switch opened.Add(1) {
+				case 3:
+					return first, nil
+				default:
+					return nil, errors.New("GitHub answered 500")
+				}
+			}, scaler, func() {}, slog.New(slog.NewJSONHandler(&logs, nil)),
+			func(n int) time.Duration {
+				mu.Lock()
+				defer mu.Unlock()
+				waits = append(waits, n)
+				return time.Millisecond
+			})
+		close(done)
+	}()
+	waitFor(t, "the third open", func() bool { return scaler.count() >= 1 })
+	close(first.messages)
+	waitFor(t, "two more failures", func() bool { mu.Lock(); defer mu.Unlock(); return len(waits) >= 4 })
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	if waits[0] != 1 || waits[1] != 2 || waits[2] != 1 || waits[3] != 2 {
+		t.Fatalf("waited after failures %v, want 1 2 1 2", waits)
 	}
 }
 

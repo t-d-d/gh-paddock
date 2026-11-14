@@ -63,7 +63,6 @@ func mainWith(connect connector) int {
 // sets.
 type config struct {
 	heartbeatFile string
-	imageDigest   string
 	appKeyParam   string
 	reposParam    string
 	launch        runners.Launch
@@ -78,7 +77,6 @@ func readConfig(getenv func(string) string) (config, error) {
 	}
 	c := config{
 		heartbeatFile: or("PADDOCK_HEARTBEAT_FILE", defaultHeartbeatFile),
-		imageDigest:   getenv("PADDOCK_IMAGE_DIGEST"),
 		appKeyParam:   or("PADDOCK_APP_KEY_PARAMETER", defaultAppKeyParam),
 		reposParam:    or("PADDOCK_REPOS_PARAMETER", defaultReposParam),
 		launch: runners.Launch{
@@ -90,8 +88,10 @@ func readConfig(getenv func(string) string) (config, error) {
 			SecurityGroup:    getenv("PADDOCK_RUNNER_SECURITY_GROUP"),
 		},
 	}
-	if subnets := getenv("PADDOCK_SUBNETS"); subnets != "" {
-		c.launch.Subnets = strings.Split(subnets, ",")
+	for _, subnet := range strings.Split(getenv("PADDOCK_SUBNETS"), ",") {
+		if subnet = strings.TrimSpace(subnet); subnet != "" {
+			c.launch.Subnets = append(c.launch.Subnets, subnet)
+		}
 	}
 	var missing []string
 	for key, v := range map[string]string{

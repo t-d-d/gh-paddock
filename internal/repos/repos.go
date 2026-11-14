@@ -104,6 +104,9 @@ func Parse(raw string) (List, error) {
 		return list, fmt.Errorf("the repo list is not JSON: %w", err)
 	}
 	seen := map[string]bool{}
+	// Scale sets and runner groups live in the org, so two repos of one org
+	// must not fold to the same name: org/scale-set name -> repo.
+	scaleSets := map[string]string{}
 	for i, entry := range doc.Repos {
 		m := repoPattern.FindStringSubmatch(entry.Repo)
 		if m == nil {
@@ -136,14 +139,34 @@ func Parse(raw string) (List, error) {
 			names[pool.Name] = true
 			repo.Pools = append(repo.Pools, pool)
 		}
+		if problem == nil {
+			problem = sharedScaleSet(repo, scaleSets)
+		}
 		if problem != nil {
 			list.Skipped = append(list.Skipped, fmt.Errorf("entry %d: repo %s: %w", i, repo.FullName(), problem))
 			continue
+		}
+		owner := strings.ToLower(repo.Owner)
+		for _, p := range repo.Pools {
+			scaleSets[owner+"/"+repo.ScaleSetName(p)] = repo.FullName()
 		}
 		seen[key] = true
 		list.Repos = append(list.Repos, repo)
 	}
 	return list, nil
+}
+
+// sharedScaleSet says which earlier repo of the same org already has one of
+// repo's scale-set names.
+func sharedScaleSet(repo Repo, taken map[string]string) error {
+	owner := strings.ToLower(repo.Owner)
+	for _, p := range repo.Pools {
+		name := repo.ScaleSetName(p)
+		if other, ok := taken[owner+"/"+name]; ok {
+			return fmt.Errorf("pool %s: scale set %s is already %s's", p.Name, name, other)
+		}
+	}
+	return nil
 }
 
 func orDefault(v *int, def int) int {

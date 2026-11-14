@@ -444,3 +444,19 @@ func TestTheListenerExitsCleanlyOnSIGTERM(t *testing.T) {
 		t.Fatal("the listener did not exit on SIGTERM")
 	}
 }
+
+func TestSubnetsAreReadWithoutSpacesOrEmptyEntries(t *testing.T) {
+	env := listenerEnv("/tmp/unused")
+	env["PADDOCK_SUBNETS"] = "subnet-1, subnet-2,"
+	cfg, err := readConfig(envWith(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.launch.Subnets, "|"); got != "subnet-1|subnet-2" {
+		t.Fatalf("subnets %q", got)
+	}
+	env["PADDOCK_SUBNETS"] = ","
+	if _, err := readConfig(envWith(env)); err == nil || !strings.Contains(err.Error(), "PADDOCK_SUBNETS") {
+		t.Fatalf("a list of no subnets was taken: %v", err)
+	}
+}

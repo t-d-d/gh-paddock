@@ -86,6 +86,8 @@ type Scaler struct {
 	Log        *slog.Logger
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
+
+	last *scaleset.RunnerScaleSetStatistic
 }
 
 func (s *Scaler) now() time.Time {
@@ -103,11 +105,16 @@ func (s *Scaler) configDir() string { return ConfigPath + "/" + strconv.Itoa(s.S
 // pool's maximum. GitHub's statistics count every job assigned to the set,
 // running or waiting, and ECS counts every task that has not stopped, so a
 // listener that restarts starts only what is missing. A poll that carried
-// no message changes nothing.
+// no message means GitHub's counts have not changed, so it scales on the
+// last counts: that replaces a task that stopped before it took its job.
 func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
-	if msg == nil || msg.Statistics == nil {
+	if msg != nil && msg.Statistics != nil {
+		s.last = msg.Statistics
+	}
+	if s.last == nil {
 		return nil
 	}
+	stats := s.last
 	tasks, err := s.liveTasks(ctx)
 	if err != nil {
 		return err
@@ -115,7 +122,7 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	if err := s.sweepConfigs(ctx, tasks); err != nil {
 		s.Log.Warn("could not clear runner configs", "error", err.Error())
 	}
-	want := min(msg.Statistics.TotalAssignedJobs, s.Pool.MaxRunners)
+	want := min(stats.TotalAssignedJobs, s.Pool.MaxRunners)
 	for have := len(tasks); have < want; have++ {
 		if err := s.start(ctx); err != nil {
 			return err
@@ -320,7 +327,7 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 	}
 	started = true
 	arn := aws.ToString(out.Tasks[0].TaskArn)
-	s.Log.Info("runner task started", "repo", s.Repo.FullName(), "pool", s.Pool.Name, "runner", runner,
-		"task", arn[strings.LastIndex(arn, "/")+1:], "capacity", provider)
+	// The caller's logger carries the repo and the pool.
+	s.Log.Info("runner task started", "runner", runner, "task", arn[strings.LastIndex(arn, "/")+1:], "capacity", provider)
 	return nil
 }

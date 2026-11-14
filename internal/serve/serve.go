@@ -169,11 +169,13 @@ func Backoff(n int) time.Duration {
 }
 
 // Run serves one pool until ctx is cancelled: it opens the pool's session,
-// polls it, telling GitHub the pool's maximum each time, and hands each
-// message to scaler before acking it. A refused session is retried with no
-// limit; it beats, since GitHub answered, and the listener logs how long
-// the refusal lasted. Any other failure closes the session and opens
-// another after a wait. On cancel it closes the session.
+// polls it, telling GitHub the pool's maximum each time, acquires the jobs
+// each message offers, and hands the message to scaler before acking it. A
+// refused session is retried with no limit; it beats, since GitHub
+// answered, and the listener logs how long the refusal lasted. Any other
+// failure closes the session and opens another after a wait, which grows
+// with each failure in a row until a session opens. On cancel it closes the
+// session.
 func Run(ctx context.Context, pool Pool, open func(context.Context) (Session, error), scaler listener.Scaler, beat func(), log *slog.Logger, backoff func(int) time.Duration) {
 	log = log.With("repo", pool.Repo.FullName(), "pool", pool.Pool.Name, "scaleSetId", pool.ScaleSetID)
 	var refusedSince time.Time
@@ -207,6 +209,7 @@ func Run(ctx context.Context, pool Pool, open func(context.Context) (Session, er
 			}
 			continue
 		}
+		failures = 0
 		if !refusedSince.IsZero() {
 			log.Info("session opened after a refusal", "refusedFor", time.Since(refusedSince).Round(time.Second).String())
 			refusedSince = time.Time{}
@@ -231,8 +234,32 @@ func Run(ctx context.Context, pool Pool, open func(context.Context) (Session, er
 	}
 }
 
+// acquiring acquires each job a message offers before scaling it: GitHub
+// assigns a job to the scale set, and counts it in TotalAssignedJobs, only
+// once the listener acquires it. Demand still comes from the statistics
+// alone; acquiring counts nothing. Acquiring a job twice is harmless, so a
+// redelivered message is safe.
+type acquiring struct {
+	client listener.Client
+	scaler listener.Scaler
+}
+
+func (a acquiring) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	if msg != nil && len(msg.JobAvailableMessages) > 0 {
+		ids := make([]int64, 0, len(msg.JobAvailableMessages))
+		for _, job := range msg.JobAvailableMessages {
+			ids = append(ids, job.RunnerRequestID)
+		}
+		if _, err := a.client.AcquireJobs(ctx, ids); err != nil {
+			return fmt.Errorf("acquire offered jobs: %w", err)
+		}
+	}
+	return a.scaler.Scale(ctx, msg)
+}
+
 func runSession(ctx context.Context, pool Pool, session Session, scaler listener.Scaler, beat func(), log *slog.Logger) error {
-	l, err := listener.New(beating{s: session, beat: beat}, listener.Config{
+	client := beating{s: session, beat: beat}
+	l, err := listener.New(client, listener.Config{
 		ScaleSetID: pool.ScaleSetID,
 		MaxRunners: pool.Pool.MaxRunners,
 		Logger:     log.WithGroup("session"),
@@ -241,5 +268,5 @@ func runSession(ctx context.Context, pool Pool, session Session, scaler listener
 		return err
 	}
 	beat()
-	return l.Run(ctx, scaler)
+	return l.Run(ctx, acquiring{client: client, scaler: scaler})
 }

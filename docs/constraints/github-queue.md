@@ -11,6 +11,8 @@ pay for, for no job that GitHub's own queue does not already hold.
 
 - The listener reads a pool's demand from its message session's statistics,
   `TotalAssignedJobs`, and from nothing else. It does not count job messages.
+  It acquires each job a message offers, which is what makes GitHub assign
+  it to the pool, and acquiring counts nothing.
 - Each poll tells GitHub the pool's maximum, so GitHub assigns no more jobs
   than the pool can run. Extra jobs wait in GitHub.
 - A listener that starts takes the assigned counts from GitHub and the
