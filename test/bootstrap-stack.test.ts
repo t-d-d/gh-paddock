@@ -1,12 +1,14 @@
 /**
- * The bootstrap stack: the role a run on main assumes to deploy, and the
- * secret the operator writes before the first deploy
- * (docs/constraints/deploy.md).
+ * The bootstrap stack: the role a run on main assumes to deploy
+ * (docs/constraints/deploy.md). The App key is no part of a stack
+ * (docs/constraints/public-repo.md).
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTemplate } from './helpers/cfn.ts';
+import { readdirSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { loadTemplate, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
 
 const tpl = loadTemplate('infra/bootstrap.cfn.yml');
 
@@ -28,16 +30,38 @@ describe('the bootstrap stack', () => {
     assert.equal(tpl.Parameters?.GitHubRepoId?.AllowedPattern, '^[1-9][0-9]*$');
   });
 
-  test('the App key\'s secret outlives a template change, and is created holding only a placeholder', () => {
-    const secret = tpl.Resources.GitHubAppSecret;
-    assert.equal(secret?.Type, 'AWS::SecretsManager::Secret');
-    assert.equal(secret?.Properties?.Name, 'paddock/github-app');
-    assert.equal(secret?.DeletionPolicy, 'RetainExceptOnCreate');
-    assert.equal(secret?.UpdateReplacePolicy, 'Retain');
-    assert.equal(secret?.Properties?.SecretString, undefined, 'a value in the template would be public');
-  });
-
   test('hands the deploy role\'s ARN out, for the AWS_DEPLOY_ROLE_ARN secret', () => {
     assert.equal(tpl.Outputs?.DeployRoleArn?.Value, '${DeployRole.Arn}');
   });
+});
+
+// The operator writes the key by hand to the SecureString parameter
+// /paddock/github-app. CloudFormation writes only a String parameter, which
+// would store the key unencrypted and put its value in a public template.
+describe('fitness: no stack creates the App key or a Secrets Manager secret (public-repo.md)', () => {
+  const files = readdirSync(resolve(REPO_ROOT, 'infra'))
+    .filter((name) => name.endsWith('.cfn.yml'))
+    .map((name) => `infra/${name}`);
+
+  test('every stack in infra/ is read', () => {
+    assert.ok(files.includes('infra/bootstrap.cfn.yml') && files.includes('infra/paddock.cfn.yml'), files.join(', '));
+  });
+
+  for (const file of files) {
+    const stack = loadTemplate(file);
+
+    test(`${file} defines no Secrets Manager secret`, () => {
+      const secrets = Object.entries(stack.Resources).filter(([, r]) => String(r.Type).startsWith('AWS::SecretsManager::'));
+      assert.deepEqual(secrets.map(([name]) => name), []);
+    });
+
+    // By its logical id, name or description, since a stack could give the
+    // parameter any name.
+    test(`${file} defines no parameter for the App key`, () => {
+      const parameters = resourcesOfType(stack, 'AWS::SSM::Parameter').filter((entry) =>
+        /github.?app|app.?key/i.test(JSON.stringify(entry)),
+      );
+      assert.deepEqual(parameters.map(([name]) => name), []);
+    });
+  }
 });

@@ -126,10 +126,9 @@ jobs:
         if: ${{ !inputs.probe_only }}
         run: node scripts/cfn-continue-stalled-rollback.mjs paddock-bootstrap
 
-      # The role this job holds, and the secret the operator writes. The
-      # operator applies the stack once by hand; from then on each deploy
-      # applies it, naming the repo and its ids from the run, which is what
-      # the role's trust pins.
+      # The role this job holds. The operator applies the stack once by
+      # hand; from then on each deploy applies it, naming the repo and its
+      # ids from the run, which is what the role's trust pins.
       - name: Apply the bootstrap stack
         id: bootstrap
         if: ${{ !inputs.probe_only }}

@@ -27,7 +27,7 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 |---|---|
 | `cmd/listener/` | The listener, in Go, and its Dockerfile |
 | `internal/` | The listener's packages |
-| `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes, and the App key's secret |
+| `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes |
 | `infra/paddock.cfn.yml` | The listener's service, its alarm and the alerts topic |
 | `scripts/` | The deploy's probe and stack guard, and the public-repo scan |
 | `test/` | Tests of the stacks, the workflows and the scripts |
@@ -43,7 +43,7 @@ The deploy needs an AWS account that holds gh-paddock alone, with a default VPC 
 1. Apply `infra/bootstrap.cfn.yml` as the stack `paddock-bootstrap`, with `GitHubOwner`, `GitHubOwnerId`, `GitHubRepo` and `GitHubRepoId` set to your fork's names and numeric ids.
 2. Put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`, and set the repository variable `AWS_REGION`.
 3. Write the alert address to the Parameter Store parameter `/paddock/alert-email`, as a String, not a SecureString.
-4. Save the GitHub App's `{"appId", "privateKey"}` into the secret `paddock/github-app`. The skeleton does not read it yet.
+4. Write the GitHub App's `{"appId", "privateKey"}` to the Parameter Store parameter `/paddock/github-app`, as a SecureString. No stack creates this parameter. The skeleton does not read it yet.
 
 From then on every green merge to main deploys. The operator guide comes with v1.
 
