@@ -12,8 +12,8 @@ these runners serve is the owner's business, not the repo's.
   claude.ai environment or session id. Tests use AWS's documented example
   account, 123456789012, and short fakes.
 - Which repos the runners serve, their pools and their scale-set names are
-  deploy-time configuration in the CI account. No file names a served
-  private repo. A doc, meaning the README or Markdown under docs/, may name
+  configuration in the CI account, the parameter `/paddock/repos`
+  (served-repos.md). No file names a served private repo. A doc, meaning the README or Markdown under docs/, may name
   the service it builds, bare, and link its site.
 - No issue or pull request reference has four or more digits: it would
   point at another repo's numbers.
@@ -35,8 +35,9 @@ these runners serve is the owner's business, not the repo's.
   digests, never by an ARN or a registry: log lines get pasted into public
   issues.
 - The GitHub App's key lives in Parameter Store, `/paddock/github-app`, as
-  a SecureString the operator writes by hand. No stack creates it, and
-  nothing reads it from GitHub.
+  a SecureString the operator writes by hand. No stack creates it, nothing
+  reads it from GitHub, and only the listener reads it
+  (runner-isolation.md).
 - This repo's own workflows run on GitHub's runners, never on the runners
   it deploys, and the runner groups it serves leave public repos off: a
   fork's pull request must not reach a runner in the CI account.
@@ -67,4 +68,4 @@ these runners serve is the owner's business, not the repo's.
   only a String, which would store the key unencrypted.
 
 Judgment: no check sees three things. A log line or error message that names an ARN or a registry: the scan reads files, not what the code prints. A served repo other than the one name the scan knows: the list is private, so the scan cannot hold it. A runner group's setting for public repos: it lives in GitHub. Commit trailers and posts carry the session's URL on purpose, as gh-governor routes by it; this rule covers files.
-History: Set with the repo's scaffold, November 2026, under PRD #1. Adapted from gh-governor's. The App key moved from Secrets Manager to Parameter Store in #33.
+History: Set with the repo's scaffold, November 2026, under PRD #1. Adapted from gh-governor's. The App key moved from Secrets Manager to Parameter Store in #33. The served repos' rule points to served-repos.md since #16.

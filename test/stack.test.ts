@@ -1,8 +1,8 @@
 /**
- * The main stack, infra/paddock.cfn.yml. For now it runs the walking
- * skeleton: the listener as one Fargate Spot service whose health check is
- * the listener's own heartbeat, and the alarm that pages when it is down
- * (docs/constraints/deploy.md).
+ * The main stack, infra/paddock.cfn.yml: the listener as one Fargate Spot
+ * service whose health check is the listener's own heartbeat, what the
+ * listener needs to start runner tasks, and the alarm that pages when it is
+ * down (docs/constraints/deploy.md).
  */
 
 import { test, describe } from 'node:test';
@@ -13,6 +13,14 @@ const tpl = loadTemplate('infra/paddock.cfn.yml');
 const service = onlyResource(tpl, 'AWS::ECS::Service');
 const taskDef = onlyResource(tpl, 'AWS::ECS::TaskDefinition');
 const container = taskDef.Properties?.ContainerDefinitions?.[0];
+const env: Record<string, unknown> = Object.fromEntries(
+  (container?.Environment ?? []).map((e: { Name: string; Value: unknown }) => [e.Name, e.Value]),
+);
+const roles = Object.fromEntries(resourcesOfType(tpl, 'AWS::IAM::Role'));
+const statementsOf = (id: string): Statement[] =>
+  (roles[id]?.Properties?.Policies ?? []).flatMap((p: { PolicyDocument?: { Statement?: Statement[] } }) => p.PolicyDocument?.Statement ?? []);
+const actionsOf = (s: Statement): string[] => [s.Action].flat().map(String);
+const resourcesOf = (s: Statement): string[] => [s.Resource].flat().map(String);
 
 describe('the listener service', () => {
   test('runs one task on Fargate Spot, in a cluster that offers Spot and on-demand', () => {
@@ -26,9 +34,15 @@ describe('the listener service', () => {
     assert.deepEqual(service.Properties?.DeploymentConfiguration?.DeploymentCircuitBreaker, { Enable: true, Rollback: true });
   });
 
-  test('keeps the old task until the new one is healthy', () => {
-    assert.equal(service.Properties?.DeploymentConfiguration?.MinimumHealthyPercent, 100);
-    assert.equal(service.Properties?.DeploymentConfiguration?.MaximumPercent, 200);
+  // GitHub allows one message session per scale set, so a new listener
+  // started beside the old one would be refused until the old one stopped.
+  test('fitness: the old listener task stops before the new one starts (deploy.md)', () => {
+    assert.equal(service.Properties?.DeploymentConfiguration?.MinimumHealthyPercent, 0);
+    assert.equal(service.Properties?.DeploymentConfiguration?.MaximumPercent, 100);
+  });
+
+  test('gives the listener two minutes, Fargate Spot\'s notice, to close its sessions on SIGTERM', () => {
+    assert.equal(container?.StopTimeout, 120);
   });
 
   test('is healthy only while the listener\'s heartbeat is fresh', () => {
@@ -38,9 +52,26 @@ describe('the listener service', () => {
   test('runs the image the deploy names, on arm64, and logs its digest rather than its registry', () => {
     assert.equal(container?.Image, '${ImageUri}');
     assert.equal(taskDef.Properties?.RuntimePlatform?.CpuArchitecture, 'ARM64');
-    const env = Object.fromEntries((container?.Environment ?? []).map((e: { Name: string; Value: unknown }) => [e.Name, e.Value]));
     assert.equal(env.PADDOCK_IMAGE_DIGEST, '${Select}', 'the digest is the part of ImageUri after its @');
     assert.ok(!Object.values(env).includes('${ImageUri}'), 'the image URI carries the account id');
+  });
+
+  test('tells the listener where and how to start runner tasks', () => {
+    assert.deepEqual(env, {
+      PADDOCK_IMAGE_DIGEST: '${Select}',
+      PADDOCK_CLUSTER: '${Cluster}',
+      PADDOCK_SUBNETS: '${Join}',
+      PADDOCK_RUNNER_SECURITY_GROUP: '${RunnerSecurityGroup}',
+      PADDOCK_RUNNER_IMAGE: '${RunnerImageUri}',
+      PADDOCK_RUNNER_EXECUTION_ROLE_ARN: '${RunnerExecutionRole.Arn}',
+      PADDOCK_RUNNER_LOG_GROUP: '${RunnerLogs}',
+      AWS_REGION: '${AWS::Region}',
+    });
+  });
+
+  test('takes the runner\'s image as a second image parameter, pinned by digest', () => {
+    assert.equal(tpl.Parameters?.RunnerImageUri?.Type, 'String');
+    assert.equal(tpl.Parameters?.RunnerImageUri?.AllowedPattern, tpl.Parameters?.ImageUri?.AllowedPattern);
   });
 
   test('reaches GitHub and AWS through a public IP in the default VPC, with no NAT to pay for', () => {
@@ -53,29 +84,27 @@ describe('the listener service', () => {
     }
   });
 
-  test('keeps its logs for a bounded time', () => {
-    const logs = onlyResource(tpl, 'AWS::Logs::LogGroup');
-    assert.ok(Number(logs.Properties?.RetentionInDays) > 0);
+  test('keeps its logs, and the runners\', for a bounded time', () => {
+    const groups = resourcesOfType(tpl, 'AWS::Logs::LogGroup');
+    assert.deepEqual(groups.map(([id]) => id).sort(), ['ListenerLogs', 'RunnerLogs']);
+    for (const [, group] of groups) assert.ok(Number(group.Properties?.RetentionInDays) > 0);
   });
 });
 
 describe('the stack\'s grants', () => {
-  const roles = resourcesOfType(tpl, 'AWS::IAM::Role');
-
-  // The listener will hold the most power here: starting tasks and reading
-  // the App key. Every grant it gains is written in this template, scoped.
-  test('the listener\'s own role is granted nothing yet, and the execution role only ECS\'s task-execution policy', () => {
-    const byId = Object.fromEntries(roles);
-    assert.deepEqual(byId.ListenerTaskRole?.Properties?.ManagedPolicyArns ?? [], []);
-    assert.deepEqual(byId.ListenerTaskRole?.Properties?.Policies ?? [], []);
-    assert.deepEqual(byId.ListenerExecutionRole?.Properties?.ManagedPolicyArns, [
-      'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy',
-    ]);
+  test('the execution roles hold ECS\'s task-execution policy, and the listener\'s own role no managed policy', () => {
+    assert.deepEqual(roles.ListenerTaskRole?.Properties?.ManagedPolicyArns ?? [], []);
+    for (const id of ['ListenerExecutionRole', 'RunnerExecutionRole']) {
+      assert.deepEqual(roles[id]?.Properties?.ManagedPolicyArns, [
+        'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy',
+      ], id);
+    }
+    assert.deepEqual(roles.ListenerExecutionRole?.Properties?.Policies ?? [], []);
   });
 
   test('no role holds an administrator policy or a statement allowing every action', () => {
-    assert.ok(roles.length > 0);
-    for (const [id, role] of roles) {
+    assert.ok(Object.keys(roles).length > 0);
+    for (const [id, role] of Object.entries(roles)) {
       for (const arn of role.Properties?.ManagedPolicyArns ?? []) {
         assert.doesNotMatch(String(arn), /AdministratorAccess|PowerUserAccess/, id);
       }
@@ -111,5 +140,107 @@ describe('the listener-down alarm', () => {
 
   test('pages the operator through the alerts topic', () => {
     assert.deepEqual(down?.Properties?.AlarmActions, ['${AlertsTopic}']);
+  });
+});
+
+// Only the listener holds the App key and starts or stops tasks, and a
+// runner task reads only its own config.
+describe('fitness: only the listener reads the App key and starts tasks, and a runner reads only its own config (runner-isolation.md)', () => {
+  const listener = statementsOf('ListenerTaskRole');
+  const parameter = (path: string) => `arn:aws:ssm:\${AWS::Region}:\${AWS::AccountId}:parameter${path}`;
+
+  test('the listener reads the App key and the repo list, and no other parameter or secret of the operator\'s', () => {
+    const reads = listener.filter((s) => actionsOf(s).some((a) => /^ssm:GetParameters?$|^secretsmanager:/.test(a)));
+    assert.deepEqual(reads.flatMap(resourcesOf).sort(), [parameter('/paddock/github-app'), parameter('/paddock/repos')].sort());
+    for (const s of reads) assert.deepEqual(actionsOf(s), ['ssm:GetParameter']);
+  });
+
+  test('the listener writes, lists and deletes runner configs under /paddock/runners alone', () => {
+    const writes = listener.filter((s) => actionsOf(s).some((a) => /^ssm:(Put|Delete|GetParametersByPath)/.test(a)));
+    assert.deepEqual(writes.flatMap(resourcesOf), [parameter('/paddock/runners/*')]);
+  });
+
+  test('the listener starts runner tasks only from the runner family, in this stack\'s cluster', () => {
+    const run = listener.find((s) => actionsOf(s).includes('ecs:RunTask'));
+    assert.deepEqual(resourcesOf(run!), ['arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/paddock-runner:*']);
+    assert.deepEqual(run?.Condition, { ArnEquals: { 'ecs:cluster': '${Cluster.Arn}' } });
+  });
+
+  test('the listener passes the runner\'s execution role to ECS, and no other role', () => {
+    const pass = listener.filter((s) => actionsOf(s).includes('iam:PassRole'));
+    assert.deepEqual(pass.flatMap(resourcesOf), ['${RunnerExecutionRole.Arn}']);
+  });
+
+  test('no other role can start or stop a task, or read the App key', () => {
+    for (const [id] of Object.entries(roles)) {
+      if (id === 'ListenerTaskRole') continue;
+      for (const s of statementsOf(id)) {
+        assert.ok(!actionsOf(s).some((a) => /^ecs:(RunTask|StartTask|StopTask)$/.test(a)), `${id} can start or stop a task`);
+        assert.ok(!resourcesOf(s).some((r) => r.includes('github-app')), `${id} can read the App key`);
+      }
+    }
+  });
+
+  test('the runner\'s execution role reads runner configs alone, for ECS to inject each into its own task', () => {
+    const statements = statementsOf('RunnerExecutionRole');
+    assert.deepEqual(statements.map(actionsOf), [['ssm:GetParameters']]);
+    assert.deepEqual(statements.flatMap(resourcesOf), [parameter('/paddock/runners/*')]);
+  });
+
+  test('the stack defines no runner task definition or task role: the listener registers each runner\'s own', () => {
+    assert.deepEqual(resourcesOfType(tpl, 'AWS::ECS::TaskDefinition').map(([id]) => id), ['ListenerTaskDefinition']);
+    assert.deepEqual(Object.keys(roles).sort(), ['ListenerExecutionRole', 'ListenerTaskRole', 'RunnerExecutionRole']);
+  });
+});
+
+describe('fitness: the stack runs in us-east-1 alone (region.md)', () => {
+  test('a rule refuses any other region', () => {
+    const rules = (tpl as { Rules?: Record<string, { Assertions?: Array<{ Assert?: unknown }> }> }).Rules;
+    assert.equal(rules?.UsEast1Only?.Assertions?.[0]?.Assert, '${Equals:${AWS::Region},us-east-1}');
+  });
+});
+
+// GitHub holds the queue: jobs wait in GitHub until a pool has room, and
+// the listener polls for them. Nothing in the account takes a webhook or
+// holds a queue of its own.
+describe('fitness: GitHub is the queue, with no webhook and no queue of our own (github-queue.md)', () => {
+  const stacks = ['infra/bootstrap.cfn.yml', 'infra/paddock.cfn.yml'].map((file) => [file, loadTemplate(file)] as const);
+
+  test('no stack defines a queue, a stream, or anything that takes a request from outside', () => {
+    const refused = /^AWS::(SQS|Kinesis|Events|Pipes|Lambda|ApiGateway|ApiGatewayV2|ElasticLoadBalancing|ElasticLoadBalancingV2|AppRunner|CloudFront)::/;
+    for (const [file, stack] of stacks) {
+      const found = Object.entries(stack.Resources).filter(([, r]) => refused.test(r.Type));
+      assert.deepEqual(found.map(([id, r]) => `${id} ${r.Type}`), [], file);
+    }
+  });
+
+  test('no security group lets anything in', () => {
+    for (const [file, stack] of stacks) {
+      for (const [id, group] of resourcesOfType(stack, 'AWS::EC2::SecurityGroup')) {
+        assert.equal(group.Properties?.SecurityGroupIngress, undefined, `${file} ${id}`);
+      }
+      assert.deepEqual(resourcesOfType(stack, 'AWS::EC2::SecurityGroupIngress'), [], file);
+    }
+  });
+});
+
+// Which repos are served is the operator's business, kept in the CI
+// account: the listener reads it at start, and no stack writes it.
+describe('fitness: served repos are configuration in the CI account, never a file here (served-repos.md)', () => {
+  test('the listener reads the list from Parameter Store, /paddock/repos', () => {
+    const reads = statementsOf('ListenerTaskRole').filter((s) => actionsOf(s).includes('ssm:GetParameter'));
+    assert.ok(reads.flatMap(resourcesOf).some((r) => r.endsWith(':parameter/paddock/repos')));
+  });
+
+  test('no stack creates a parameter', () => {
+    for (const file of ['infra/bootstrap.cfn.yml', 'infra/paddock.cfn.yml']) {
+      assert.deepEqual(resourcesOfType(loadTemplate(file), 'AWS::SSM::Parameter'), [], file);
+    }
+  });
+
+  // The bootstrap stack takes this repo's own name, for the deploy role's
+  // trust; the main stack takes no repo at all.
+  test('the main stack takes no repo as a parameter', () => {
+    for (const name of Object.keys(tpl.Parameters ?? {})) assert.doesNotMatch(name, /repo/i, name);
   });
 });

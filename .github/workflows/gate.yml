@@ -1,5 +1,5 @@
-# The offline gate: the same `npm run gate` a contributor runs, and a build
-# of the listener's image. It holds no secret and reaches no AWS account, so
+# The offline gate: the same `npm run gate` a contributor runs, and builds
+# of the listener's image and the runner's. It holds no secret and reaches no AWS account, so
 # it is safe to run on any pull request, a fork's included.
 #
 # It runs on pull_request, not on a branch push. Each commit on a pull
@@ -69,22 +69,37 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the listener's image
         run: docker build --file cmd/listener/Dockerfile --tag paddock-listener:gate .
-      # As ECS runs it: the image's own user, the health check inside it.
-      - name: Start the listener, and check it turns healthy
+      # As ECS runs it: the image's own user, the health check inside it. The
+      # listener beats only once GitHub accepts the App key, which this
+      # offline job cannot give it. So it proves the entrypoint starts and
+      # logs, and the health check stays red with no beat.
+      - name: Start the listener, and check its health check stays red with no beat
         run: |
           if docker run --rm paddock-listener:gate -healthcheck 2>"$RUNNER_TEMP/before.err"; then
             echo "::error::the health check passed before the listener ran"
             exit 1
           fi
           grep -q "no heartbeat" "$RUNNER_TEMP/before.err"
-          docker run --detach --name listener paddock-listener:gate
-          for _ in $(seq 1 20); do
-            if docker exec listener /listener -healthcheck; then
-              docker stop listener >/dev/null
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs listener
-          echo "::error::the listener did not turn healthy in 20s"
-          exit 1
+          if docker run --rm paddock-listener:gate >"$RUNNER_TEMP/run.out" 2>&1; then
+            echo "::error::the listener started with none of its settings"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/run.out"
+          grep -q '"msg":"listener started"' "$RUNNER_TEMP/run.out"
+
+  # The runner's image, as the deploy builds it: x64, on an x64 runner. It
+  # starts the runner far enough to print its version, and checks the tools
+  # the image adds are on the path.
+  runner-image:
+    name: runner-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the runner's image
+        run: docker build --platform linux/amd64 --file runner/Dockerfile --tag paddock-runner:gate runner
+      - name: Start the runner, and check the tools it adds
+        run: |
+          docker run --rm --entrypoint /home/runner/bin/Runner.Listener paddock-runner:gate --version
+          docker run --rm --entrypoint bash paddock-runner:gate -c \
+            'set -e; aws --version; jq --version; zip -v >/dev/null; python3 --version; test "$(id -un)" = runner'
