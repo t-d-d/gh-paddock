@@ -185,42 +185,44 @@ func assigned(n int) *scaleset.RunnerScaleSetMessage {
 var spotTest = repos.Pool{Name: "test", Capacity: repos.Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10}
 
 func TestAnAssignedJobStartsARunnerTaskOfThePoolsCapacityAndSize(t *testing.T) {
-	f := newFakeAWS()
-	s, jit := newScaler(f, repos.Pool{Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10})
-	if err := s.Scale(context.Background(), assigned(1)); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.runs) != 1 || len(jit.calls) != 1 {
-		t.Fatalf("runs %d, jit configs %d", len(f.runs), len(jit.calls))
-	}
-	run := f.runs[0]
-	if got := run.CapacityProviderStrategy; len(got) != 1 || aws.ToString(got[0].CapacityProvider) != "FARGATE" {
-		t.Fatalf("capacity %+v", got)
-	}
-	def := f.defs[aws.ToString(run.TaskDefinition)]
-	if def == nil {
-		t.Fatal("the task ran a definition that was not registered")
-	}
-	if aws.ToString(def.Cpu) != "4096" || aws.ToString(def.Memory) != "16384" {
-		t.Fatalf("size %s/%s", aws.ToString(def.Cpu), aws.ToString(def.Memory))
-	}
-	if def.RuntimePlatform.CpuArchitecture != ecstypes.CPUArchitectureX8664 {
-		t.Fatalf("architecture %q", def.RuntimePlatform.CpuArchitecture)
-	}
-	if aws.ToString(run.StartedBy) != "paddock-5" || aws.ToString(run.Cluster) != "paddock" {
-		t.Fatalf("startedBy %q in %q", aws.ToString(run.StartedBy), aws.ToString(run.Cluster))
-	}
-	vpc := run.NetworkConfiguration.AwsvpcConfiguration
-	if vpc.AssignPublicIp != ecstypes.AssignPublicIpEnabled || len(vpc.Subnets) != 2 || vpc.SecurityGroups[0] != "sg-1" {
-		t.Fatalf("network %+v", vpc)
-	}
-	tags := map[string]string{}
-	for _, tag := range run.Tags {
-		tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
-	}
-	if tags["paddock:repo"] != "acme/widgets" || tags["paddock:pool"] != "dev" || tags["paddock:runner"] != jit.calls[0] {
-		t.Fatalf("tags %v", tags)
-	}
+	t.Run("fitness: a runner task runs x64, counted to its own pool (runner-image.md, pool-per-repo.md)", func(t *testing.T) {
+		f := newFakeAWS()
+		s, jit := newScaler(f, repos.Pool{Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10})
+		if err := s.Scale(context.Background(), assigned(1)); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.runs) != 1 || len(jit.calls) != 1 {
+			t.Fatalf("runs %d, jit configs %d", len(f.runs), len(jit.calls))
+		}
+		run := f.runs[0]
+		if got := run.CapacityProviderStrategy; len(got) != 1 || aws.ToString(got[0].CapacityProvider) != "FARGATE" {
+			t.Fatalf("capacity %+v", got)
+		}
+		def := f.defs[aws.ToString(run.TaskDefinition)]
+		if def == nil {
+			t.Fatal("the task ran a definition that was not registered")
+		}
+		if aws.ToString(def.Cpu) != "4096" || aws.ToString(def.Memory) != "16384" {
+			t.Fatalf("size %s/%s", aws.ToString(def.Cpu), aws.ToString(def.Memory))
+		}
+		if def.RuntimePlatform.CpuArchitecture != ecstypes.CPUArchitectureX8664 {
+			t.Fatalf("architecture %q", def.RuntimePlatform.CpuArchitecture)
+		}
+		if aws.ToString(run.StartedBy) != "paddock-5" || aws.ToString(run.Cluster) != "paddock" {
+			t.Fatalf("startedBy %q in %q", aws.ToString(run.StartedBy), aws.ToString(run.Cluster))
+		}
+		vpc := run.NetworkConfiguration.AwsvpcConfiguration
+		if vpc.AssignPublicIp != ecstypes.AssignPublicIpEnabled || len(vpc.Subnets) != 2 || vpc.SecurityGroups[0] != "sg-1" {
+			t.Fatalf("network %+v", vpc)
+		}
+		tags := map[string]string{}
+		for _, tag := range run.Tags {
+			tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+		}
+		if tags["paddock:repo"] != "acme/widgets" || tags["paddock:pool"] != "dev" || tags["paddock:runner"] != jit.calls[0] {
+			t.Fatalf("tags %v", tags)
+		}
+	})
 }
 
 func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
@@ -238,48 +240,50 @@ func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
 // parameter, which ECS injects from its own task definition, and the task
 // holds no role of its own to read any other.
 func TestARunnerTaskGetsOnlyItsOwnConfig(t *testing.T) {
-	f := newFakeAWS()
-	s, jit := newScaler(f, spotTest)
-	if err := s.Scale(context.Background(), assigned(2)); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.paramPuts) != 2 {
-		t.Fatalf("%d parameters written", len(f.paramPuts))
-	}
-	for i, run := range f.runs {
-		def := f.defs[aws.ToString(run.TaskDefinition)]
-		if def.TaskRoleArn != nil {
-			t.Errorf("runner task %d holds a role", i)
+	t.Run("fitness: a runner task reads only its own config and holds no role (runner-isolation.md)", func(t *testing.T) {
+		f := newFakeAWS()
+		s, jit := newScaler(f, spotTest)
+		if err := s.Scale(context.Background(), assigned(2)); err != nil {
+			t.Fatal(err)
 		}
-		if aws.ToString(def.ExecutionRoleArn) != s.Launch.ExecutionRoleARN {
-			t.Errorf("execution role %q", aws.ToString(def.ExecutionRoleArn))
+		if len(f.paramPuts) != 2 {
+			t.Fatalf("%d parameters written", len(f.paramPuts))
 		}
-		c := def.ContainerDefinitions[0]
-		if len(c.Secrets) != 1 || aws.ToString(c.Secrets[0].Name) != "ACTIONS_RUNNER_INPUT_JITCONFIG" {
-			t.Fatalf("secrets %+v", c.Secrets)
-		}
-		put := f.paramPuts[i]
-		if aws.ToString(c.Secrets[0].ValueFrom) != aws.ToString(put.Name) {
-			t.Errorf("task %d reads %q, its config is in %q", i, aws.ToString(c.Secrets[0].ValueFrom), aws.ToString(put.Name))
-		}
-		if put.Type != ssmtypes.ParameterTypeSecureString || aws.ToString(put.Value) != "jit-for-"+jit.calls[i] {
-			t.Errorf("parameter %d is %s", i, put.Type)
-		}
-		if !strings.HasPrefix(aws.ToString(put.Name), "/paddock/runners/5/") {
-			t.Errorf("parameter %q", aws.ToString(put.Name))
-		}
-		for _, e := range c.Environment {
-			if strings.Contains(aws.ToString(e.Value), "jit-for-") {
-				t.Errorf("the JIT config is in the task's plain environment")
+		for i, run := range f.runs {
+			def := f.defs[aws.ToString(run.TaskDefinition)]
+			if def.TaskRoleArn != nil {
+				t.Errorf("runner task %d holds a role", i)
+			}
+			if aws.ToString(def.ExecutionRoleArn) != s.Launch.ExecutionRoleARN {
+				t.Errorf("execution role %q", aws.ToString(def.ExecutionRoleArn))
+			}
+			c := def.ContainerDefinitions[0]
+			if len(c.Secrets) != 1 || aws.ToString(c.Secrets[0].Name) != "ACTIONS_RUNNER_INPUT_JITCONFIG" {
+				t.Fatalf("secrets %+v", c.Secrets)
+			}
+			put := f.paramPuts[i]
+			if aws.ToString(c.Secrets[0].ValueFrom) != aws.ToString(put.Name) {
+				t.Errorf("task %d reads %q, its config is in %q", i, aws.ToString(c.Secrets[0].ValueFrom), aws.ToString(put.Name))
+			}
+			if put.Type != ssmtypes.ParameterTypeSecureString || aws.ToString(put.Value) != "jit-for-"+jit.calls[i] {
+				t.Errorf("parameter %d is %s", i, put.Type)
+			}
+			if !strings.HasPrefix(aws.ToString(put.Name), "/paddock/runners/5/") {
+				t.Errorf("parameter %q", aws.ToString(put.Name))
+			}
+			for _, e := range c.Environment {
+				if strings.Contains(aws.ToString(e.Value), "jit-for-") {
+					t.Errorf("the JIT config is in the task's plain environment")
+				}
+			}
+			if aws.ToString(c.Image) != s.Launch.Image {
+				t.Errorf("image %q", aws.ToString(c.Image))
 			}
 		}
-		if aws.ToString(c.Image) != s.Launch.Image {
-			t.Errorf("image %q", aws.ToString(c.Image))
+		if len(f.deleted) != 2 {
+			t.Fatalf("deleted %d of 2 one-off task definitions", len(f.deleted))
 		}
-	}
-	if len(f.deleted) != 2 {
-		t.Fatalf("deleted %d of 2 one-off task definitions", len(f.deleted))
-	}
+	})
 }
 
 func TestAPoolNeverRunsMoreThanItsMaximum(t *testing.T) {

@@ -17,7 +17,7 @@ The name comes from the paddock where racehorses are kept warm before a race.
 
 ## Status
 
-Under construction. The [v1 PRD](https://github.com/t-d-d/gh-paddock/issues/1) sets the scope: test and dev pools on Fargate Spot. Today the deploy runs a walking skeleton: a listener that only beats, a health check on that beat, a probe after each deploy, and a rollback when the probe fails.
+Under construction. The [v1 PRD](https://github.com/t-d-d/gh-paddock/issues/1) sets the scope: test and dev pools on Fargate Spot. Today the listener serves each listed repo's pools: it makes a scale set and a runner group per pool, polls GitHub for the pool's jobs, and starts a single-use Fargate runner task per job, up to the pool's maximum. Each runner runs one job and its task exits. A deploy probes the listener and rolls both images back when the probe fails.
 
 Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHub's runners.
 
@@ -28,7 +28,8 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 | `cmd/listener/` | The listener, in Go, and its Dockerfile |
 | `internal/` | The listener's packages |
 | `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes |
-| `infra/paddock.cfn.yml` | The listener's service, its alarm and the alerts topic |
+| `infra/paddock.cfn.yml` | The listener's service, what it needs to start runner tasks, its alarm and the alerts topic |
+| `runner/` | The runner's image, built FROM GitHub's runner image |
 | `scripts/` | The deploy's probe and stack guard, and the public-repo scan |
 | `test/` | Tests of the stacks, the workflows and the scripts |
 | `docs/constraints/` | The rules in force |
@@ -38,12 +39,13 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 
 ## Deploying your own
 
-The deploy needs an AWS account that holds gh-paddock alone, with a default VPC in the region it uses and no OIDC provider for GitHub yet. Once, as an administrator:
+The deploy needs an AWS account that holds gh-paddock alone, in us-east-1, with a default VPC and no OIDC provider for GitHub yet. Once, as an administrator:
 
 1. Apply `infra/bootstrap.cfn.yml` as the stack `paddock-bootstrap`, with `GitHubOwner`, `GitHubOwnerId`, `GitHubRepo` and `GitHubRepoId` set to your fork's names and numeric ids.
-2. Put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`, and set the repository variable `AWS_REGION`.
+2. Put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`.
 3. Write the alert address to the Parameter Store parameter `/paddock/alert-email`, as a String, not a SecureString.
-4. Write the GitHub App's `{"appId", "privateKey"}` to the Parameter Store parameter `/paddock/github-app`, as a SecureString. No stack creates this parameter. The skeleton does not read it yet.
+4. Write the GitHub App's key to the Parameter Store parameter `/paddock/github-app`, as a SecureString under the account's default key. Its value is one JSON object: `appId`, a JSON number, and `privateKey`, the PKCS#1 PEM GitHub gives you, with its line breaks as `\n` escapes. `jq -n --argjson id <app id> --rawfile key <key file> '{appId: $id, privateKey: $key}'` builds it. No stack creates this parameter, and only the listener reads it.
+5. List the repos to serve in the Parameter Store parameter `/paddock/repos`, as a String: `{"repos": [{"repo": "owner/name", "pools": [{"name": "test", "capacity": "spot"}, {"name": "dev", "capacity": "on-demand"}]}]}`. A pool may also set `vcpu`, `memoryGb` and `maxRunners`, which default to 2, 8 and 10. The App must be installed on each repo's org, and each repo must be private. The listener reads the list when it starts, so restart its task after a change. Each pool's workflows run on `runs-on: paddock-<repo>-<pool>`.
 
 From then on every green merge to main deploys. The operator guide comes with v1.
 

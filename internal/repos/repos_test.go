@@ -96,13 +96,15 @@ func TestARepoListedTwiceIsServedOnce(t *testing.T) {
 // Every pool belongs to one repo: its scale set and runner group carry the
 // repo and the pool in their name, so no two pools share either.
 func TestEachPoolHasItsOwnScaleSetName(t *testing.T) {
-	repo := Repo{Owner: "acme", Name: "Widgets.js"}
-	test := repo.ScaleSetName(Pool{Name: "test"})
-	dev := repo.ScaleSetName(Pool{Name: "dev"})
-	if test != "paddock-widgets-js-test" || dev != "paddock-widgets-js-dev" {
-		t.Fatalf("names %q and %q", test, dev)
-	}
-	if got := repo.FullName(); got != "acme/Widgets.js" {
-		t.Fatalf("full name %q", got)
-	}
+	t.Run("fitness: each pool has its own scale set and runner group, named for its repo (pool-per-repo.md)", func(t *testing.T) {
+		repo := Repo{Owner: "acme", Name: "Widgets.js"}
+		test := repo.ScaleSetName(Pool{Name: "test"})
+		dev := repo.ScaleSetName(Pool{Name: "dev"})
+		if test != "paddock-widgets-js-test" || dev != "paddock-widgets-js-dev" {
+			t.Fatalf("names %q and %q", test, dev)
+		}
+		if got := repo.FullName(); got != "acme/Widgets.js" {
+			t.Fatalf("full name %q", got)
+		}
+	})
 }

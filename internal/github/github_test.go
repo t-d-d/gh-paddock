@@ -224,46 +224,48 @@ func TestAnOrgWithoutTheAppCannotBeServed(t *testing.T) {
 }
 
 func TestARepoGetsARunnerGroupOpenToItAloneWithPublicReposOff(t *testing.T) {
-	f, app := newFake(t)
-	ctx := context.Background()
-	inst, err := app.Installation(ctx, "acme")
-	if err != nil {
-		t.Fatal(err)
-	}
-	repo, err := inst.Repo(ctx, "acme", "widgets")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repo.ID != 7 || !repo.Private {
-		t.Fatalf("repo %+v", repo)
-	}
-	if err := inst.EnsureRunnerGroup(ctx, "acme", "paddock-widgets-test", repo.ID); err != nil {
-		t.Fatal(err)
-	}
-	g := f.groups["paddock-widgets-test"]
-	if g["visibility"] != "selected" || g["allows_public_repositories"] != false {
-		t.Fatalf("group %v", g)
-	}
-	if got := f.groupRepo[g["id"].(int)]; len(got) != 1 || got[0] != 7 {
-		t.Fatalf("group open to %v", got)
-	}
-	// Run again, against a group someone widened by hand: it is narrowed
-	// back to the one repo, with public repos off.
-	g["visibility"] = "all"
-	g["allows_public_repositories"] = true
-	f.groupRepo[g["id"].(int)] = []int{7, 8}
-	if err := inst.EnsureRunnerGroup(ctx, "acme", "paddock-widgets-test", repo.ID); err != nil {
-		t.Fatal(err)
-	}
-	if len(f.groups) != 1 || g["visibility"] != "selected" || g["allows_public_repositories"] != false {
-		t.Fatalf("groups %v", f.groups)
-	}
-	if got := f.groupRepo[g["id"].(int)]; len(got) != 1 || got[0] != 7 {
-		t.Fatalf("group open to %v", got)
-	}
-	if f.tokens != 1 {
-		t.Fatalf("minted %d installation tokens, want one reused", f.tokens)
-	}
+	t.Run("fitness: a pool's runner group is open to its one repo, with public repos off (pool-per-repo.md)", func(t *testing.T) {
+		f, app := newFake(t)
+		ctx := context.Background()
+		inst, err := app.Installation(ctx, "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		repo, err := inst.Repo(ctx, "acme", "widgets")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if repo.ID != 7 || !repo.Private {
+			t.Fatalf("repo %+v", repo)
+		}
+		if err := inst.EnsureRunnerGroup(ctx, "acme", "paddock-widgets-test", repo.ID); err != nil {
+			t.Fatal(err)
+		}
+		g := f.groups["paddock-widgets-test"]
+		if g["visibility"] != "selected" || g["allows_public_repositories"] != false {
+			t.Fatalf("group %v", g)
+		}
+		if got := f.groupRepo[g["id"].(int)]; len(got) != 1 || got[0] != 7 {
+			t.Fatalf("group open to %v", got)
+		}
+		// Run again, against a group someone widened by hand: it is narrowed
+		// back to the one repo, with public repos off.
+		g["visibility"] = "all"
+		g["allows_public_repositories"] = true
+		f.groupRepo[g["id"].(int)] = []int{7, 8}
+		if err := inst.EnsureRunnerGroup(ctx, "acme", "paddock-widgets-test", repo.ID); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.groups) != 1 || g["visibility"] != "selected" || g["allows_public_repositories"] != false {
+			t.Fatalf("groups %v", f.groups)
+		}
+		if got := f.groupRepo[g["id"].(int)]; len(got) != 1 || got[0] != 7 {
+			t.Fatalf("group open to %v", got)
+		}
+		if f.tokens != 1 {
+			t.Fatalf("minted %d installation tokens, want one reused", f.tokens)
+		}
+	})
 }
 
 func TestAMissingRepoIsAnError(t *testing.T) {

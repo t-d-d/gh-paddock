@@ -27,7 +27,7 @@ import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
-const GATE_CHECKS = ['gate', 'image'];
+const GATE_CHECKS = ['gate', 'image', 'runner-image'];
 
 const workflowFiles = readdirSync(resolve(REPO_ROOT, '.github/workflows')).filter((f) => /\.ya?ml$/.test(f));
 const workflows = workflowFiles.map((file) => ({ file, ...loadWorkflow(`.github/workflows/${file}`) }));
@@ -155,13 +155,23 @@ describe('the gate', () => {
   });
 
   // ECS runs the image as its nonroot user and calls the health check inside
-  // it. A heartbeat path that user cannot write, or an entrypoint that does
-  // not start, would otherwise surface only after merge, as a rollback.
-  test('builds the listener\'s image, starts it, and its health check passes once it beats', () => {
+  // it. The listener beats only once GitHub has accepted the App key, which
+  // the offline gate cannot give it, so the gate proves the entrypoint runs
+  // and that the health check stays red until a beat.
+  test('builds the listener\'s image, starts it, and its health check stays red with no beat', () => {
     const runs = stepsOf(workflow, 'image').map((s) => s.run ?? '').join('\n');
     assert.match(runs, /docker build --file cmd\/listener\/Dockerfile/);
-    assert.match(runs, /docker run --detach/);
-    assert.match(runs, /docker exec \S+ \/listener -healthcheck/);
+    assert.match(runs, /-healthcheck/);
+    assert.match(runs, /grep -q "no heartbeat"/);
+    assert.match(runs, /grep -q '"msg":"listener started"'/);
+  });
+
+  test('fitness: the gate builds the runner\'s image on x64 and starts its runner (runner-image.md)', () => {
+    assert.equal(workflow.jobs?.['runner-image']?.['runs-on'], 'ubuntu-24.04');
+    const runs = stepsOf(workflow, 'runner-image').map((s) => s.run ?? '').join('\n');
+    assert.match(runs, /docker build --platform linux\/amd64 --file runner\/Dockerfile/);
+    assert.match(runs, /--entrypoint \/home\/runner\/bin\/Runner\.Listener \S+ --version/);
+    for (const tool of ['aws --version', 'jq --version', 'zip -v', 'python3 --version']) assert.ok(runs.includes(tool), tool);
   });
 });
 

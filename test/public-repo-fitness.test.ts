@@ -30,26 +30,33 @@ describe('fitness: no tracked file holds an id or names the served service outsi
 // action masks the account id in every later line when asked to.
 describe('fitness: the deploy\'s log never shows the AWS account id (public-repo.md)', () => {
   const { workflow, codeOnly } = loadWorkflow('.github/workflows/deploy.yml');
-  const steps = stepsOf(workflow, 'deploy');
-  const credentials = steps.filter((step) => step.uses?.startsWith('aws-actions/configure-aws-credentials@'));
+  const jobs = Object.entries(workflow.jobs ?? {}) as [string, { steps?: WorkflowStep[] }][];
+  const isCredentials = (step: WorkflowStep) => step.uses?.startsWith('aws-actions/configure-aws-credentials@') ?? false;
+  // The deploy job, and the job that builds the runner's image on x64.
+  const withCredentials = jobs.filter(([, job]) => (job.steps ?? []).some(isCredentials));
 
-  test('the deploy assumes the role named by a secret, and masks the account id', () => {
-    assert.equal(credentials.length, 1);
-    assert.equal(credentials[0]?.with?.['role-to-assume'], '${{ secrets.AWS_DEPLOY_ROLE_ARN }}');
-    assert.equal(credentials[0]?.with?.['mask-aws-account-id'], true);
+  test('only the deploy and the runner\'s image build hold AWS credentials', () => {
+    assert.deepEqual(withCredentials.map(([name]) => name).sort(), ['deploy', 'runner-image']);
   });
 
-  test('no step before the credentials step runs a command, and no other job holds AWS credentials', () => {
-    const before = steps.slice(0, steps.indexOf(credentials[0]!));
-    for (const step of before) {
-      assert.equal(step.run, undefined, 'a step before the credentials step runs a command the mask does not cover');
-      assert.match(step.uses ?? '', /^actions\/(checkout|setup-node)@/);
-    }
-    for (const [name, job] of Object.entries(workflow.jobs ?? {}) as [string, { steps?: WorkflowStep[] }][]) {
-      if (name === 'deploy') continue;
-      assert.ok(!(job.steps ?? []).some((s) => s.uses?.startsWith('aws-actions/configure-aws-credentials@')), `${name} holds AWS credentials`);
-    }
-  });
+  for (const [name, job] of withCredentials) {
+    const steps = job.steps ?? [];
+    const credentials = steps.filter(isCredentials);
+
+    test(`${name} assumes the role named by a secret, and masks the account id`, () => {
+      assert.equal(credentials.length, 1);
+      assert.equal(credentials[0]?.with?.['role-to-assume'], '${{ secrets.AWS_DEPLOY_ROLE_ARN }}');
+      assert.equal(credentials[0]?.with?.['mask-aws-account-id'], true);
+    });
+
+    test(`${name}: no step before the credentials step runs a command`, () => {
+      const before = steps.slice(0, steps.indexOf(credentials[0]!));
+      for (const step of before) {
+        assert.equal(step.run, undefined, 'a step before the credentials step runs a command the mask does not cover');
+        assert.match(step.uses ?? '', /^actions\/(checkout|setup-node)@/);
+      }
+    });
+  }
 
   test('the deploy\'s switch reads the secret, never a variable of the same name', () => {
     assert.doesNotMatch(codeOnly, /vars\.AWS_DEPLOY_ROLE_ARN/);

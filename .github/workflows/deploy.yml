@@ -1,7 +1,8 @@
 # gh-paddock's deploy, modelled on gh-governor's.
 #
-# Builds the listener's image and applies infra/paddock.cfn.yml: the stack
-# that runs the listener on Fargate Spot. Only main deploys, after a green
+# Builds the listener's image and the runner's, and applies
+# infra/paddock.cfn.yml: the stack that runs the listener on Fargate Spot,
+# which starts the runner tasks. Only main deploys, after a green
 # gate: a push to main, or a run by hand on main. The deploy role's trust
 # pins refs/heads/main, so a run on any other branch cannot assume it.
 #
@@ -17,28 +18,34 @@
 #
 #   AWS_DEPLOY_ROLE_ARN  secret: the role the job assumes through GitHub's
 #                        OIDC, the bootstrap stack's output
-#   AWS_REGION           variable: where the stacks live (default us-east-1)
 #
-# The deploy job, in order: apply the bootstrap stack (infra/bootstrap.cfn.yml),
-# derive the image tag from the image's inputs, build only when that tag is
-# new, read the default VPC, apply the main stack, and probe the listener
+# The stacks live in us-east-1, the CI account's region, which no variable
+# moves (docs/constraints/region.md).
+#
+# The runner-image job builds the runner's image on an x64 runner, under a
+# tag that hashes runner/, and hands on its digest. The deploy job, in
+# order: apply the bootstrap stack (infra/bootstrap.cfn.yml), derive the
+# listener's image tag from the image's inputs, build only when that tag is
+# new, join the runner's digest to the registry, read the default VPC, apply
+# the main stack with both images, and probe the listener
 # (scripts/probe.mjs): the service runs the new image and a task of it
-# reports healthy. A red probe is a red deploy.
+# reports healthy, which it does only once GitHub has accepted the App key.
+# A red probe is a red deploy.
 #
 # Two layers roll back (docs/constraints/deploy.md). A new task that never
 # turns healthy trips the service's circuit breaker: ECS returns to the last
 # good task definition, the apply fails, and CloudFormation rolls the stack
 # back itself. A red probe after a green apply rolls the stack back here:
-# before the apply, the job reads the image the stack runs, and on a red
-# probe that changed the image it applies the same template again with that
-# image, changing nothing else, and probes again. The deploy stays red
+# before the apply, the job reads both images the stack runs, and on a red
+# probe that changed either it applies the same template again with both,
+# changing nothing else, and probes again. The deploy stays red
 # either way. A rollback that does not bring the listener back, because its
 # apply or its probe failed, pages the operator through the stack's alerts
 # topic: jobs on these runners then queue with nothing to start them. A
 # probe-only run applies nothing, so it rolls nothing back.
 #
-# No secret is written here. The operator saves the GitHub App's key into
-# the bootstrap stack's secret once, before the first deploy.
+# No secret is written here. The operator writes the GitHub App's key to the
+# parameter /paddock/github-app once, before the first deploy.
 
 name: Deploy
 
@@ -87,9 +94,65 @@ jobs:
             echo "set=false" >> "$GITHUB_OUTPUT"
           fi
 
-  deploy:
+  # The runner's image, built on x64 as the runners run. Its job output is
+  # the digest alone: Actions drops an output that holds a masked string,
+  # and the image URI carries the account id, which the credentials step
+  # masks.
+  runner-image:
     needs: [gate, role]
-    if: ${{ needs.role.outputs.set == 'true' }}
+    if: ${{ needs.role.outputs.set == 'true' && !inputs.probe_only }}
+    name: Build the runner's image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      id-token: write   # OIDC token for AWS assume-role
+      contents: read    # checkout
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      # The Dockerfile copies nothing from the repo, so runner/ is all the
+      # image is built from; test/deploy-workflow.test.ts holds that.
+      - name: Plan the image tag
+        id: plan
+        run: |
+          set -o pipefail
+          IMAGE_TAG=$(git ls-tree -r HEAD -- runner | git hash-object --stdin)
+          if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 ]; then
+            echo "::error::image tag hashed an empty file list."
+            exit 1
+          fi
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve the runner's image
+        id: image
+        uses: ./.github/actions/image
+        with:
+          repo_name: paddock-runner
+          image_tag: ${{ steps.plan.outputs.image_tag }}
+          dockerfile: runner/Dockerfile
+          region: us-east-1
+          platform: linux/amd64
+          cache_scope: runner
+
+      - name: Hand on the digest
+        id: digest
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        run: echo "digest=${IMAGE_URI##*@}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: [gate, role, runner-image]
+    # A probe-only run skips the runner's image and still probes.
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.role.outputs.set == 'true' && (inputs.probe_only || needs.runner-image.result == 'success') }}
     name: "${{ inputs.probe_only && 'Probe only: probe the listener' || 'Build the image, apply the stacks, probe the listener' }}"
     # Native arm64: the listener runs on arm64.
     runs-on: ubuntu-24.04-arm
@@ -111,7 +174,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          aws-region: us-east-1
           # Every later line masks the account id: the registry and the
           # image URI carry it.
           mask-aws-account-id: true
@@ -156,7 +219,7 @@ jobs:
         # test/deploy-workflow.test.ts holds the two lists together.
         run: |
           set -o pipefail
-          IMAGE_TAG=$(git ls-tree -r HEAD -- go.mod cmd internal cmd/listener/Dockerfile \
+          IMAGE_TAG=$(git ls-tree -r HEAD -- go.mod go.sum cmd internal cmd/listener/Dockerfile \
               | git hash-object --stdin)
           if [ -z "$IMAGE_TAG" ] || [ "$IMAGE_TAG" = e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 ]; then
             echo "::error::image tag hashed an empty file list."
@@ -172,8 +235,23 @@ jobs:
           repo_name: paddock-listener
           image_tag: ${{ steps.plan.outputs.image_tag }}
           dockerfile: cmd/listener/Dockerfile
-          region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          region: us-east-1
           cache_scope: listener
+
+      # The runner-image job hands on the digest; the registry is this
+      # account's, in the stacks' region.
+      - name: Join the runner's digest to the registry
+        id: runner
+        if: ${{ !inputs.probe_only }}
+        env:
+          DIGEST: ${{ needs.runner-image.outputs.digest }}
+        run: |
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::the runner-image job handed on no digest"
+            exit 1
+          fi
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "image_uri=${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/paddock-runner@${DIGEST}" >> "$GITHUB_OUTPUT"
 
       # The listener runs in the default VPC's subnets: public, with an
       # internet gateway and no NAT to pay for. An account without a default
@@ -210,35 +288,44 @@ jobs:
         if: ${{ !inputs.probe_only }}
         run: node scripts/cfn-continue-stalled-rollback.mjs paddock
 
-      # The image a red probe rolls back to. A stack that does not exist yet
+      # The images a red probe rolls back to. A stack that does not exist yet
       # runs no image, so a red probe on its first apply has nothing to roll
       # back to; any other error stops the deploy before it changes anything.
-      - name: Read the image the stack runs now
+      # A stack from before the runner's image has no runner image to read.
+      - name: Read the images the stack runs now
         id: previous
         if: ${{ !inputs.probe_only }}
         run: |
           # stderr apart from the value, so a warning never becomes the image.
-          if ! PREVIOUS=$(aws cloudformation describe-stacks --stack-name paddock \
-              --query "Stacks[0].Parameters[?ParameterKey=='ImageUri'].ParameterValue" --output text 2>"$RUNNER_TEMP/previous.err"); then
-            if ! grep -q "does not exist" "$RUNNER_TEMP/previous.err"; then
-              echo "::error::could not read the image the stack runs: $(cat "$RUNNER_TEMP/previous.err")"
-              exit 1
+          read_parameter() {
+            local value
+            if ! value=$(aws cloudformation describe-stacks --stack-name paddock \
+                --query "Stacks[0].Parameters[?ParameterKey=='$1'].ParameterValue" --output text 2>"$RUNNER_TEMP/previous.err"); then
+              if ! grep -q "does not exist" "$RUNNER_TEMP/previous.err"; then
+                echo "::error::could not read the image the stack runs: $(cat "$RUNNER_TEMP/previous.err")" >&2
+                return 1
+              fi
+              value=""
             fi
-            PREVIOUS=""
-          fi
-          if [[ -z "$PREVIOUS" || "$PREVIOUS" == None ]]; then
+            [[ "$value" == None ]] && value=""
+            echo "$value"
+          }
+          PREVIOUS=$(read_parameter ImageUri)
+          PREVIOUS_RUNNER=$(read_parameter RunnerImageUri)
+          if [[ -z "$PREVIOUS" ]]; then
             echo "::notice::the stack runs no image yet, so a red probe has nothing to roll back to"
-            PREVIOUS=""
           else
-            echo "the stack runs ${PREVIOUS##*@}; a red probe rolls back to it"
+            echo "the stack runs ${PREVIOUS##*@}, and the runner ${PREVIOUS_RUNNER##*@}; a red probe rolls back to them"
           fi
           echo "image_uri=${PREVIOUS}" >> "$GITHUB_OUTPUT"
+          echo "runner_image_uri=${PREVIOUS_RUNNER}" >> "$GITHUB_OUTPUT"
 
       - name: Apply the stack
         id: apply
         if: ${{ !inputs.probe_only }}
         env:
           IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          RUNNER_IMAGE_URI: ${{ steps.runner.outputs.image_uri }}
           VPC_ID: ${{ steps.network.outputs.vpc_id }}
           SUBNET_IDS: ${{ steps.network.outputs.subnet_ids }}
         run: |
@@ -249,6 +336,7 @@ jobs:
             --no-fail-on-empty-changeset \
             --parameter-overrides \
               "ImageUri=${IMAGE_URI}" \
+              "RunnerImageUri=${RUNNER_IMAGE_URI}" \
               "VpcId=${VPC_ID}" \
               "SubnetIds=${SUBNET_IDS}"
 
@@ -261,22 +349,27 @@ jobs:
         run: node scripts/probe.mjs
 
       # Every step from here runs only after a red probe. `aws cloudformation
-      # deploy` keeps every parameter it is not given, so the image is the
-      # one thing the rollback changes.
-      - name: Roll the stack back to the image it ran before this deploy
+      # deploy` keeps every parameter it is not given, so the two images are
+      # the one thing the rollback changes. A stack from before the runner's
+      # image ran none, so the rollback keeps the one just built.
+      - name: Roll the stack back to the images it ran before this deploy
         id: rollback
-        if: ${{ failure() && !inputs.probe_only && steps.probe.outcome == 'failure' && steps.previous.outputs.image_uri != '' && steps.previous.outputs.image_uri != steps.image.outputs.image_uri }}
+        if: ${{ failure() && !inputs.probe_only && steps.probe.outcome == 'failure' && steps.previous.outputs.image_uri != '' && (steps.previous.outputs.image_uri != steps.image.outputs.image_uri || (steps.previous.outputs.runner_image_uri != '' && steps.previous.outputs.runner_image_uri != steps.runner.outputs.image_uri)) }}
         env:
           PREVIOUS_IMAGE_URI: ${{ steps.previous.outputs.image_uri }}
+          PREVIOUS_RUNNER_IMAGE_URI: ${{ steps.previous.outputs.runner_image_uri }}
+          RUNNER_IMAGE_URI: ${{ steps.runner.outputs.image_uri }}
         run: |
-          echo "::error::the probe failed; rolling the stack back to ${PREVIOUS_IMAGE_URI##*@}, the image it ran before this deploy"
+          ROLLBACK_RUNNER_IMAGE_URI="${PREVIOUS_RUNNER_IMAGE_URI:-$RUNNER_IMAGE_URI}"
+          echo "::error::the probe failed; rolling the stack back to ${PREVIOUS_IMAGE_URI##*@}, and the runner to ${ROLLBACK_RUNNER_IMAGE_URI##*@}, the images it ran before this deploy"
           aws cloudformation deploy \
             --stack-name paddock \
             --template-file infra/paddock.cfn.yml \
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides \
-              "ImageUri=${PREVIOUS_IMAGE_URI}"
+              "ImageUri=${PREVIOUS_IMAGE_URI}" \
+              "RunnerImageUri=${ROLLBACK_RUNNER_IMAGE_URI}"
 
       - name: Probe the listener on the image it rolled back to
         id: reprobe

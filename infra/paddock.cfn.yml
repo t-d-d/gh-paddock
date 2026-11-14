@@ -1,18 +1,35 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   gh-paddock: the listener that drives self-hosted GitHub Actions runners on
-  Fargate. Stack paddock. For now it runs the walking skeleton: the listener
-  as one Fargate Spot service, healthy while its heartbeat is fresh.
+  Fargate. Stack paddock. The listener runs as one Fargate Spot service,
+  healthy while GitHub answers it, and starts single-use runner tasks in the
+  same cluster.
 
 # Applied by .github/workflows/deploy.yml on a green push to main, after the
 # bootstrap stack. Every value the operator chooses is a parameter, never a
-# literal here (docs/constraints/public-repo.md).
+# literal here (docs/constraints/public-repo.md). The served repos are no
+# parameter: the listener reads them from Parameter Store, /paddock/repos
+# (docs/constraints/served-repos.md).
+
+# The CI account is in us-east-1 (docs/constraints/region.md).
+Rules:
+  UsEast1Only:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: gh-paddock's CI account is in us-east-1.
 
 Parameters:
   ImageUri:
     Type: String
     AllowedPattern: '^.+@sha256:[0-9a-f]{64}$'
     Description: The listener's image, pinned by digest. The deploy builds it.
+
+  RunnerImageUri:
+    Type: String
+    AllowedPattern: '^.+@sha256:[0-9a-f]{64}$'
+    Description: >-
+      The runner's image, pinned by digest: x64, built FROM GitHub's runner
+      image. The deploy builds it on an x64 runner.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -36,8 +53,8 @@ Resources:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: paddock
-      # Runner tasks will run on both: Spot for test and dev, on-demand for
-      # prod. The listener runs on Spot.
+      # Each pool's runner tasks run on the capacity the repo list gives it,
+      # Spot or on-demand. The listener runs on Spot.
       CapacityProviders:
         - FARGATE
         - FARGATE_SPOT
@@ -66,9 +83,9 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
-  # What the listener itself may do. The skeleton needs nothing; the
-  # scale-set work adds reading the App key, starting and stopping runner
-  # tasks, and writing their configs, each scoped to this stack's own.
+  # What the listener itself may do: read the App key and the repo list,
+  # write each runner's config, and start runner tasks. Only the listener
+  # holds these (docs/constraints/runner-isolation.md).
   ListenerTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -79,6 +96,107 @@ Resources:
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
+      Policies:
+        - PolicyName: listener
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The operator writes both by hand; no stack creates either.
+              - Sid: ReadTheAppKeyAndTheRepoList
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/paddock/github-app'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/paddock/repos'
+              # One SecureString per runner, deleted once its task runs.
+              - Sid: KeepRunnerConfigs
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/paddock/runners/*'
+              # Each runner gets a task definition of its own, naming its own
+              # config. ECS takes no resource scope on these two.
+              - Sid: RegisterRunnerTaskDefinitions
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                Resource: '*'
+              - Sid: DeleteRunnerTaskDefinitions
+                Effect: Allow
+                Action: ecs:DeleteTaskDefinitions
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/paddock-runner:*'
+              - Sid: StartRunnerTasks
+                Effect: Allow
+                Action: ecs:RunTask
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/paddock-runner:*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Sid: TagRunnerTasks
+                Effect: Allow
+                Action: ecs:TagResource
+                Resource:
+                  - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/paddock-runner:*'
+                  - !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/paddock/*'
+              - Sid: CountRunnerTasks
+                Effect: Allow
+                Action: ecs:ListTasks
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              - Sid: ReadRunnerTasks
+                Effect: Allow
+                Action: ecs:DescribeTasks
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/paddock/*'
+              - Sid: PassTheRunnersExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt RunnerExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  RunnerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /paddock/runners
+      RetentionInDays: 30
+
+  # Pulls the runner's image, writes its logs, and reads its config for ECS
+  # to inject. A runner task holds no role of its own, so the job it runs
+  # can read nothing in the account
+  # (docs/constraints/runner-isolation.md).
+  RunnerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: runner-config
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/paddock/runners/*'
+
+  # Outbound only: a runner calls GitHub, and nothing calls it.
+  RunnerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: gh-paddock runners, outbound only
+      VpcId: !Ref VpcId
 
   ListenerTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -106,12 +224,31 @@ Resources:
             # carries the account id.
             - Name: PADDOCK_IMAGE_DIGEST
               Value: !Select [1, !Split ['@', !Ref ImageUri]]
+            # Where and how to start runner tasks. The listener never logs
+            # these, since the image URI and the role's ARN carry the
+            # account id.
+            - Name: PADDOCK_CLUSTER
+              Value: !Ref Cluster
+            - Name: PADDOCK_SUBNETS
+              Value: !Join [',', !Ref SubnetIds]
+            - Name: PADDOCK_RUNNER_SECURITY_GROUP
+              Value: !Ref RunnerSecurityGroup
+            - Name: PADDOCK_RUNNER_IMAGE
+              Value: !Ref RunnerImageUri
+            - Name: PADDOCK_RUNNER_EXECUTION_ROLE_ARN
+              Value: !GetAtt RunnerExecutionRole.Arn
+            - Name: PADDOCK_RUNNER_LOG_GROUP
+              Value: !Ref RunnerLogs
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          # Healthy while GitHub answers: the first beat follows the App's
+          # check with GitHub, and each later one a poll.
           HealthCheck:
             Command: ['CMD', '/listener', '-healthcheck']
             Interval: 30
             Timeout: 5
             Retries: 3
-            StartPeriod: 30
+            StartPeriod: 60
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -137,9 +274,11 @@ Resources:
         - CapacityProvider: FARGATE_SPOT
           Weight: 1
       DeploymentConfiguration:
-        # The old task keeps running until the new one is healthy.
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
+        # The old task stops, closing its sessions, before the new one
+        # starts: GitHub allows one message session per scale set
+        # (docs/constraints/deploy.md). Jobs wait in GitHub meanwhile.
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
         # A new task that never turns healthy rolls the service back to the
         # last good task definition, and fails the apply, so CloudFormation
         # rolls the stack back too rather than waiting hours on it.
