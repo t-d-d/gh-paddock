@@ -3,19 +3,222 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+
+	"github.com/actions/scaleset"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	"github.com/google/uuid"
+
+	"github.com/t-d-d/gh-paddock/internal/github"
 	"github.com/t-d-d/gh-paddock/internal/heartbeat"
+	"github.com/t-d-d/gh-paddock/internal/runners"
+	"github.com/t-d-d/gh-paddock/internal/serve"
 )
 
 func envWith(vars map[string]string) func(string) string {
 	return func(key string) string { return vars[key] }
+}
+
+// syncBuffer is a log both the listener's goroutines and the test touch.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+var appKey = func() string {
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(err)
+	}
+	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(k)})
+	raw, _ := json.Marshal(map[string]any{"appId": 42, "privateKey": string(pemKey)})
+	return string(raw)
+}()
+
+// fakeCloud is every client the listener calls, offline.
+type fakeCloud struct {
+	params   map[string]string
+	paramErr error
+	checkErr error
+	checks   int
+	repos    map[string]github.Repo
+	session  *fakeSession
+	runs     []*ecs.RunTaskInput
+	mu       sync.Mutex
+}
+
+func (c *fakeCloud) Parameter(_ context.Context, name string) (string, bool, error) {
+	if name == "/paddock/repos" && c.paramErr != nil {
+		return "", false, c.paramErr
+	}
+	v, ok := c.params[name]
+	return v, ok, nil
+}
+
+func (c *fakeCloud) App(key github.AppKey) (app, error) {
+	if key.AppID != 42 {
+		return nil, fmt.Errorf("app id %d", key.AppID)
+	}
+	return c, nil
+}
+
+func (c *fakeCloud) Check(context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.checks++
+	return c.checkErr
+}
+
+func (c *fakeCloud) Installation(_ context.Context, org string) (serve.Installation, int64, error) {
+	if org != "acme" {
+		return nil, 0, fmt.Errorf("the App is not installed on %s", org)
+	}
+	return c, 1, nil
+}
+
+func (c *fakeCloud) Repo(_ context.Context, owner, name string) (github.Repo, error) {
+	r, ok := c.repos[owner+"/"+name]
+	if !ok {
+		return github.Repo{}, errors.New("not found")
+	}
+	return r, nil
+}
+
+func (c *fakeCloud) EnsureRunnerGroup(context.Context, string, string, int64) error { return nil }
+
+func (c *fakeCloud) ScaleSets(github.AppKey, string, int64) (serve.ScaleSets, error) { return c, nil }
+
+func (c *fakeCloud) GetRunnerGroupByName(_ context.Context, name string) (*scaleset.RunnerGroup, error) {
+	return &scaleset.RunnerGroup{ID: 3, Name: name}, nil
+}
+
+func (c *fakeCloud) GetRunnerScaleSet(context.Context, int, string) (*scaleset.RunnerScaleSet, error) {
+	return nil, nil
+}
+
+func (c *fakeCloud) CreateRunnerScaleSet(_ context.Context, s *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error) {
+	out := *s
+	out.ID = 9
+	return &out, nil
+}
+
+func (c *fakeCloud) UpdateRunnerScaleSet(_ context.Context, _ int, s *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error) {
+	return s, nil
+}
+
+func (c *fakeCloud) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, _ int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
+	return &scaleset.RunnerScaleSetJitRunnerConfig{EncodedJITConfig: "jit"}, nil
+}
+
+func (c *fakeCloud) OpenSession(context.Context, int, string) (serve.Session, error) {
+	return c.session, nil
+}
+
+func (c *fakeCloud) ECS() runners.ECS { return fakeECS{c} }
+func (c *fakeCloud) SSM() runners.SSM { return fakeSSM{} }
+
+type fakeECS struct{ c *fakeCloud }
+
+func (f fakeECS) ListTasks(context.Context, *ecs.ListTasksInput, ...func(*ecs.Options)) (*ecs.ListTasksOutput, error) {
+	return &ecs.ListTasksOutput{}, nil
+}
+func (f fakeECS) DescribeTasks(context.Context, *ecs.DescribeTasksInput, ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error) {
+	return &ecs.DescribeTasksOutput{}, nil
+}
+func (f fakeECS) RegisterTaskDefinition(context.Context, *ecs.RegisterTaskDefinitionInput, ...func(*ecs.Options)) (*ecs.RegisterTaskDefinitionOutput, error) {
+	return &ecs.RegisterTaskDefinitionOutput{TaskDefinition: &ecstypes.TaskDefinition{TaskDefinitionArn: aws.String("def")}}, nil
+}
+func (f fakeECS) DeregisterTaskDefinition(context.Context, *ecs.DeregisterTaskDefinitionInput, ...func(*ecs.Options)) (*ecs.DeregisterTaskDefinitionOutput, error) {
+	return &ecs.DeregisterTaskDefinitionOutput{}, nil
+}
+func (f fakeECS) DeleteTaskDefinitions(context.Context, *ecs.DeleteTaskDefinitionsInput, ...func(*ecs.Options)) (*ecs.DeleteTaskDefinitionsOutput, error) {
+	return &ecs.DeleteTaskDefinitionsOutput{}, nil
+}
+func (f fakeECS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+	f.c.mu.Lock()
+	defer f.c.mu.Unlock()
+	f.c.runs = append(f.c.runs, in)
+	return &ecs.RunTaskOutput{Tasks: []ecstypes.Task{{TaskArn: aws.String("arn:aws:ecs:us-east-1:123456789012:task/paddock/abc")}}}, nil
+}
+
+type fakeSSM struct{}
+
+func (fakeSSM) PutParameter(context.Context, *ssm.PutParameterInput, ...func(*ssm.Options)) (*ssm.PutParameterOutput, error) {
+	return &ssm.PutParameterOutput{}, nil
+}
+func (fakeSSM) DeleteParameter(context.Context, *ssm.DeleteParameterInput, ...func(*ssm.Options)) (*ssm.DeleteParameterOutput, error) {
+	return &ssm.DeleteParameterOutput{}, nil
+}
+func (fakeSSM) GetParametersByPath(context.Context, *ssm.GetParametersByPathInput, ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error) {
+	return &ssm.GetParametersByPathOutput{}, nil
+}
+
+type fakeSession struct {
+	messages chan *scaleset.RunnerScaleSetMessage
+	closed   chan struct{}
+}
+
+func (s *fakeSession) GetMessage(ctx context.Context, _, _ int) (*scaleset.RunnerScaleSetMessage, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case m := <-s.messages:
+		return m, nil
+	}
+}
+func (s *fakeSession) DeleteMessage(context.Context, int) error              { return nil }
+func (s *fakeSession) AcquireJobs(context.Context, []int64) ([]int64, error) { return nil, nil }
+func (s *fakeSession) Close(context.Context) error                           { close(s.closed); return nil }
+func (s *fakeSession) Session() scaleset.RunnerScaleSetSession {
+	return scaleset.RunnerScaleSetSession{SessionID: uuid.New(), Statistics: &scaleset.RunnerScaleSetStatistic{}}
+}
+
+func connectTo(c *fakeCloud) connector {
+	return func(context.Context, string) (cloud, error) { return c, nil }
+}
+
+func listenerEnv(path string) map[string]string {
+	return map[string]string{
+		"PADDOCK_HEARTBEAT_FILE":            path,
+		"PADDOCK_IMAGE_DIGEST":              "sha256:abc123",
+		"PADDOCK_CLUSTER":                   "paddock",
+		"PADDOCK_RUNNER_IMAGE":              "registry.example/runner@sha256:def",
+		"PADDOCK_RUNNER_EXECUTION_ROLE_ARN": "arn:aws:iam::123456789012:role/runner",
+		"PADDOCK_RUNNER_LOG_GROUP":          "/paddock/runners",
+		"PADDOCK_RUNNER_SECURITY_GROUP":     "sg-1",
+		"PADDOCK_SUBNETS":                   "subnet-1,subnet-2",
+		"AWS_REGION":                        "us-east-1",
+	}
 }
 
 func TestHealthcheckPassesOnAFreshBeat(t *testing.T) {
@@ -24,7 +227,7 @@ func TestHealthcheckPassesOnAFreshBeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"-healthcheck"}, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path}), &out, &errOut)
+	code := run(context.Background(), []string{"-healthcheck"}, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path}), &out, &errOut, nil)
 	if code != 0 {
 		t.Fatalf("exit %d, stderr %q", code, errOut.String())
 	}
@@ -33,7 +236,7 @@ func TestHealthcheckPassesOnAFreshBeat(t *testing.T) {
 func TestHealthcheckFailsWithNoBeat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "heartbeat")
 	var out, errOut bytes.Buffer
-	code := run(context.Background(), []string{"-healthcheck"}, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path}), &out, &errOut)
+	code := run(context.Background(), []string{"-healthcheck"}, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path}), &out, &errOut, nil)
 	if code == 0 {
 		t.Fatal("the health check passed with no heartbeat file")
 	}
@@ -42,48 +245,162 @@ func TestHealthcheckFailsWithNoBeat(t *testing.T) {
 	}
 }
 
-// The listener runs until SIGTERM, which reaches run as a cancelled context,
-// and logs its start and stop as JSON lines.
-func TestListenerBeatsAndStopsOnCancel(t *testing.T) {
+// A beat may be as old as the longest poll, and the listener must still be
+// counted alive; a listener with no pool checks the App often enough to
+// keep its beat fresh.
+func TestTheHealthCheckOutlastsTheLongestPoll(t *testing.T) {
+	if beatMaxAge <= scaleset.MessagePollTimeout {
+		t.Fatalf("beatMaxAge %s is no longer than a poll may take, %s", beatMaxAge, scaleset.MessagePollTimeout)
+	}
+	if beatMaxAge < 2*idleCheckEvery {
+		t.Fatalf("beatMaxAge %s is under two idle checks of %s", beatMaxAge, idleCheckEvery)
+	}
+	if beatMaxAge > 5*time.Minute {
+		t.Fatalf("beatMaxAge %s lets a stuck listener look healthy too long", beatMaxAge)
+	}
+}
+
+func TestTheListenerWillNotStartWithoutItsSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "heartbeat")
-	ctx, cancel := context.WithCancel(context.Background())
 	var out, errOut bytes.Buffer
+	code := run(context.Background(), nil, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path}), &out, &errOut, connectTo(&fakeCloud{}))
+	if code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	if !strings.Contains(out.String(), "PADDOCK_CLUSTER") {
+		t.Fatalf("logs do not name the missing setting:\n%s", out.String())
+	}
+	if heartbeat.Check(path, time.Minute, time.Now()) == nil {
+		t.Fatal("a listener that never started beat")
+	}
+}
+
+// The App call comes before the first beat, so a bad key never turns the
+// task healthy, and the deploy fails.
+func TestABadAppKeyFailsBeforeAnyBeat(t *testing.T) {
+	cases := map[string]*fakeCloud{
+		"no key":         {params: map[string]string{}},
+		"key not JSON":   {params: map[string]string{"/paddock/github-app": "nope"}},
+		"GitHub refuses": {params: map[string]string{"/paddock/github-app": appKey}, checkErr: errors.New("401 Bad credentials")},
+	}
+	for name, c := range cases {
+		path := filepath.Join(t.TempDir(), "heartbeat")
+		var out, errOut bytes.Buffer
+		code := run(context.Background(), nil, envWith(listenerEnv(path)), &out, &errOut, connectTo(c))
+		if code != 1 {
+			t.Errorf("%s: exit %d", name, code)
+		}
+		if heartbeat.Check(path, time.Minute, time.Now()) == nil {
+			t.Errorf("%s: the listener beat", name)
+		}
+		if strings.Contains(out.String(), "PRIVATE KEY") {
+			t.Errorf("%s: the logs carry the key", name)
+		}
+	}
+}
+
+func runUntilBeat(t *testing.T, c *fakeCloud) (cancel func() (int, string)) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "heartbeat")
+	ctx, stop := context.WithCancel(context.Background())
+	var out syncBuffer
+	var errOut bytes.Buffer
 	done := make(chan int, 1)
-	go func() {
-		done <- run(ctx, nil, envWith(map[string]string{"PADDOCK_HEARTBEAT_FILE": path, "PADDOCK_IMAGE_DIGEST": "sha256:abc123"}), &out, &errOut)
-	}()
-	deadline := time.Now().Add(2 * time.Second)
+	go func() { done <- run(ctx, nil, envWith(listenerEnv(path)), &out, &errOut, connectTo(c)) }()
+	deadline := time.Now().Add(5 * time.Second)
 	for heartbeat.Check(path, time.Minute, time.Now()) != nil {
 		if time.Now().After(deadline) {
-			t.Fatal("the listener wrote no beat")
+			stop()
+			t.Fatalf("the listener wrote no beat; logs:\n%s", out.String())
 		}
 		time.Sleep(time.Millisecond)
 	}
-	cancel()
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("exit %d on cancel, stderr %q", code, errOut.String())
+	return func() (int, string) {
+		stop()
+		select {
+		case code := <-done:
+			return code, out.String()
+		case <-time.After(5 * time.Second):
+			t.Fatal("the listener did not stop on cancel")
+			return -1, ""
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the listener did not stop on cancel")
 	}
-	logs := out.String()
-	for _, want := range []string{`"msg":"listener started"`, `"image":"sha256:abc123"`, `"msg":"listener stopped"`} {
+}
+
+// With no list the listener serves nothing, but it still checks the App
+// first and beats, and stops cleanly.
+func TestWithAnEmptyListTheListenerChecksTheAppBeatsAndStops(t *testing.T) {
+	c := &fakeCloud{params: map[string]string{"/paddock/github-app": appKey}}
+	stop := runUntilBeat(t, c)
+	code, logs := stop()
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if c.checks < 1 {
+		t.Fatal("no App call before the beat")
+	}
+	for _, want := range []string{`"msg":"listener started"`, `"image":"sha256:abc123"`, `"msg":"no repo list; serving nothing"`, `"msg":"listener stopped"`} {
 		if !strings.Contains(logs, want) {
 			t.Errorf("logs lack %s:\n%s", want, logs)
 		}
 	}
 }
 
-// One slow write must not fail the health check, and the check must still
-// notice a listener that has stopped beating within a few beats.
-func TestTheHealthCheckToleratesAMissedBeat(t *testing.T) {
-	if beatMaxAge < 2*beatEvery {
-		t.Fatalf("beatMaxAge %s is under two beats of %s", beatMaxAge, beatEvery)
+func TestAnUnreadableListServesNothingAndSaysSo(t *testing.T) {
+	for name, c := range map[string]*fakeCloud{
+		"unreadable": {params: map[string]string{"/paddock/github-app": appKey}, paramErr: errors.New("AccessDenied")},
+		"not JSON":   {params: map[string]string{"/paddock/github-app": appKey, "/paddock/repos": "{"}},
+	} {
+		stop := runUntilBeat(t, c)
+		code, logs := stop()
+		if code != 0 || !strings.Contains(logs, "serving nothing") {
+			t.Errorf("%s: exit %d, logs:\n%s", name, code, logs)
+		}
 	}
-	if beatMaxAge > 6*beatEvery {
-		t.Fatalf("beatMaxAge %s lets six beats of %s go missing", beatMaxAge, beatEvery)
+}
+
+// End to end, offline: a listed repo's pool gets a scale set, its session's
+// message of one assigned job starts one runner task on the pool's
+// capacity, and SIGTERM closes the session.
+func TestAJobOnAListedPoolStartsARunnerTask(t *testing.T) {
+	session := &fakeSession{messages: make(chan *scaleset.RunnerScaleSetMessage), closed: make(chan struct{})}
+	c := &fakeCloud{
+		params: map[string]string{
+			"/paddock/github-app": appKey,
+			"/paddock/repos":      `{"repos": [{"repo": "acme/widgets", "pools": [{"name": "dev", "capacity": "on-demand"}]}]}`,
+		},
+		repos:   map[string]github.Repo{"acme/widgets": {ID: 7, Private: true}},
+		session: session,
+	}
+	stop := runUntilBeat(t, c)
+	session.messages <- &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c.mu.Lock()
+		n := len(c.runs)
+		c.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no runner task started")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	code, logs := stop()
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, logs)
+	}
+	select {
+	case <-session.closed:
+	default:
+		t.Fatal("the session was not closed on stop")
+	}
+	if got := aws.ToString(c.runs[0].CapacityProviderStrategy[0].CapacityProvider); got != "FARGATE" {
+		t.Fatalf("capacity %s", got)
+	}
+	if !strings.Contains(logs, `"msg":"pool ready"`) || !strings.Contains(logs, `"scaleSet":"paddock-widgets-dev"`) {
+		t.Fatalf("logs:\n%s", logs)
 	}
 }
 
@@ -93,12 +410,14 @@ func TestTheListenerExitsCleanlyOnSIGTERM(t *testing.T) {
 	if os.Getenv("PADDOCK_LISTENER_SUBPROCESS") == "1" {
 		// The listener's own flags, not the test binary's.
 		os.Args = os.Args[:1]
-		main()
-		return
+		os.Exit(mainWith(connectTo(&fakeCloud{params: map[string]string{"/paddock/github-app": appKey}})))
 	}
 	path := filepath.Join(t.TempDir(), "heartbeat")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestTheListenerExitsCleanlyOnSIGTERM$")
-	cmd.Env = append(os.Environ(), "PADDOCK_LISTENER_SUBPROCESS=1", "PADDOCK_HEARTBEAT_FILE="+path)
+	cmd.Env = append(os.Environ(), "PADDOCK_LISTENER_SUBPROCESS=1")
+	for k, v := range listenerEnv(path) {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}

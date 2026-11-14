@@ -1,0 +1,108 @@
+package repos
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestAnEmptyOrMissingListServesNothing(t *testing.T) {
+	for _, raw := range []string{"", "  ", `{}`, `{"repos": []}`} {
+		list, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("%q: %v", raw, err)
+		}
+		if len(list.Repos) != 0 || len(list.Skipped) != 0 {
+			t.Fatalf("%q serves %+v", raw, list)
+		}
+	}
+}
+
+func TestAPoolTakesGitHubsPrivateRunnerSizeAndTenRunnersByDefault(t *testing.T) {
+	list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spot"}]}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Repos) != 1 {
+		t.Fatalf("repos %+v, skipped %v", list.Repos, list.Skipped)
+	}
+	repo := list.Repos[0]
+	if repo.Owner != "acme" || repo.Name != "widgets" {
+		t.Fatalf("repo %+v", repo)
+	}
+	want := Pool{Name: "test", Capacity: Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10}
+	if len(repo.Pools) != 1 || repo.Pools[0] != want {
+		t.Fatalf("pools %+v, want %+v", repo.Pools, want)
+	}
+}
+
+func TestAPoolSetsItsOwnCapacitySizeAndMaximum(t *testing.T) {
+	list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [
+		{"name": "dev", "capacity": "on-demand", "vcpu": 4, "memoryGb": 16, "maxRunners": 3}]}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Pool{Name: "dev", Capacity: OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 3}
+	if got := list.Repos[0].Pools[0]; got != want {
+		t.Fatalf("pool %+v, want %+v", got, want)
+	}
+}
+
+func TestAListThatIsNotJSONIsAnError(t *testing.T) {
+	if _, err := Parse(`{"repos": [`); err == nil {
+		t.Fatal("a broken list parsed")
+	}
+}
+
+// One bad entry must not stop the rest being served.
+func TestABadRepoIsSkippedWithItsReasonAndTheRestServed(t *testing.T) {
+	cases := map[string]string{
+		`{"repo": "no-slash", "pools": [{"name": "test", "capacity": "spot"}]}`:                                     "owner/name",
+		`{"repo": "acme/x", "pools": []}`:                                                                           "no pools",
+		`{"repo": "acme/x", "pools": [{"name": "test"}]}`:                                                           "capacity",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spotty"}]}`:                                     "capacity",
+		`{"repo": "acme/x", "pools": [{"name": "Test!", "capacity": "spot"}]}`:                                      "pool name",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot"}, {"name": "test", "capacity": "spot"}]}`: "twice",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "vcpu": 3}]}`:                            "size",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "vcpu": 1, "memoryGb": 16}]}`:            "size",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": -1}]}`:                     "maxRunners",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": 101}]}`:                    "maxRunners",
+	}
+	for entry, reason := range cases {
+		list, err := Parse(`{"repos": [` + entry + `, {"repo": "acme/good", "pools": [{"name": "test", "capacity": "spot"}]}]}`)
+		if err != nil {
+			t.Fatalf("%s: %v", entry, err)
+		}
+		if len(list.Repos) != 1 || list.Repos[0].Name != "good" {
+			t.Errorf("%s: served %+v", entry, list.Repos)
+		}
+		if len(list.Skipped) != 1 || !strings.Contains(list.Skipped[0].Error(), reason) {
+			t.Errorf("%s: skipped %v, want a reason with %q", entry, list.Skipped, reason)
+		}
+	}
+}
+
+func TestARepoListedTwiceIsServedOnce(t *testing.T) {
+	list, err := Parse(`{"repos": [
+		{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spot"}]},
+		{"repo": "Acme/Widgets", "pools": [{"name": "dev", "capacity": "spot"}]}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Repos) != 1 || len(list.Skipped) != 1 {
+		t.Fatalf("repos %+v, skipped %v", list.Repos, list.Skipped)
+	}
+}
+
+// Every pool belongs to one repo: its scale set and runner group carry the
+// repo and the pool in their name, so no two pools share either.
+func TestEachPoolHasItsOwnScaleSetName(t *testing.T) {
+	repo := Repo{Owner: "acme", Name: "Widgets.js"}
+	test := repo.ScaleSetName(Pool{Name: "test"})
+	dev := repo.ScaleSetName(Pool{Name: "dev"})
+	if test != "paddock-widgets-js-test" || dev != "paddock-widgets-js-dev" {
+		t.Fatalf("names %q and %q", test, dev)
+	}
+	if got := repo.FullName(); got != "acme/Widgets.js" {
+		t.Fatalf("full name %q", got)
+	}
+}

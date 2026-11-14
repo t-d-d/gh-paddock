@@ -1,12 +1,11 @@
 // Package heartbeat is how the listener tells ECS it is alive. The listener
 // writes the time to a file on each beat, and its container health check
-// (`listener -healthcheck`) reads it back. Once the listener polls GitHub, a
-// beat follows each successful poll, so a healthy task is one that is
-// talking to GitHub, not merely one whose process is up.
+// (`listener -healthcheck`) reads it back. A beat follows each time GitHub
+// answers the listener, so a healthy task is one that is talking to GitHub,
+// not merely one whose process is up.
 package heartbeat
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,21 +51,4 @@ func Check(path string, maxAge time.Duration, now time.Time) error {
 		return fmt.Errorf("heartbeat is %s old, over %s", age.Round(time.Second), maxAge)
 	}
 	return nil
-}
-
-// Run beats at once and then every interval until ctx is cancelled, when it
-// returns nil. A failed write ends it with the error.
-func Run(ctx context.Context, path string, interval time.Duration, clock func() time.Time) error {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		if err := Beat(path, clock()); err != nil {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-	}
 }
