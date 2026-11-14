@@ -34,8 +34,9 @@ these runners serve is the owner's business, not the repo's.
 - What the listener logs names tasks by their ids and images by their
   digests, never by an ARN or a registry: log lines get pasted into public
   issues.
-- The GitHub App's key lives in AWS Secrets Manager, `paddock/github-app`,
-  in the bootstrap stack. Nothing reads it from GitHub.
+- The GitHub App's key lives in Parameter Store, `/paddock/github-app`, as
+  a SecureString the operator writes by hand. No stack creates it, and
+  nothing reads it from GitHub.
 - This repo's own workflows run on GitHub's runners, never on the runners
   it deploys, and the runner groups it serves leave public repos off: a
   fork's pull request must not reach a runner in the CI account.
@@ -51,6 +52,8 @@ these runners serve is the owner's business, not the repo's.
 - The deploy's log: `fitness: the deploy's log never shows the AWS account id (public-repo.md)`.
 - The listener's environment carries its image's digest, `PADDOCK_IMAGE_DIGEST`,
   not its URI (infra/paddock.cfn.yml).
+- The App key: `fitness: no stack creates the App key or a Secrets Manager secret (public-repo.md)`
+  in test/bootstrap-stack.test.ts.
 
 ## Do not
 
@@ -60,6 +63,8 @@ these runners serve is the owner's business, not the repo's.
   public: the step prints it.
 - Do not run this repo's workflows on its own runners: a fork's pull
   request would run code in the CI account.
+- Do not let a stack create the App key's parameter: CloudFormation writes
+  only a String, which would store the key unencrypted.
 
 Judgment: no check sees three things. A log line or error message that names an ARN or a registry: the scan reads files, not what the code prints. A served repo other than the one name the scan knows: the list is private, so the scan cannot hold it. A runner group's setting for public repos: it lives in GitHub. Commit trailers and posts carry the session's URL on purpose, as gh-governor routes by it; this rule covers files.
-History: Set with the repo's scaffold, November 2026, under PRD #1. Adapted from gh-governor's.
+History: Set with the repo's scaffold, November 2026, under PRD #1. Adapted from gh-governor's. The App key moved from Secrets Manager to Parameter Store in #33.

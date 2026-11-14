@@ -1,13 +1,17 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  gh-paddock's bootstrap: GitHub's OIDC provider, the role a run on main
-  assumes to deploy, and the secret the operator writes before the first
-  deploy. Stack paddock-bootstrap, in the main stack's region.
+  gh-paddock's bootstrap: GitHub's OIDC provider and the role a run on main
+  assumes to deploy. Stack paddock-bootstrap, in the main stack's region.
 
 # Applied once by hand as an administrator, since nothing can assume a role
 # that does not exist yet. Every deploy applies it again before the main
 # stack (.github/workflows/deploy.yml), naming the repo and its ids from the
 # run. Copied from gh-governor's.
+#
+# The GitHub App's key is no resource here. The operator writes it by hand to
+# the SecureString parameter /paddock/github-app: CloudFormation writes only
+# a String parameter, which would store the key unencrypted
+# (docs/constraints/public-repo.md).
 
 Parameters:
   GitHubOwner:
@@ -67,28 +71,6 @@ Resources:
       # The trust above, the owner's merges and the gate guard it.
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AdministratorAccess
-
-  # The GitHub App's key, which only the listener reads, to talk to the
-  # scale-set API. It lives here, not in the main stack, so it exists before
-  # the first deploy and survives deleting a failed first create of the main
-  # stack. Created holding a random placeholder: CloudFormation owns the
-  # secret's existence, never its contents. The operator writes it once.
-  # Retained, so a template change that drops or replaces it leaves the
-  # stored value in place; a failed first create deletes it, since it then
-  # holds only the placeholder.
-  GitHubAppSecret:
-    Type: AWS::SecretsManager::Secret
-    DeletionPolicy: RetainExceptOnCreate
-    UpdateReplacePolicy: Retain
-    Properties:
-      Name: paddock/github-app
-      Description: >-
-        {"appId", "privateKey"} of gh-paddock's GitHub App, written by the
-        operator. The listener mints installation tokens from it.
-      GenerateSecretString:
-        SecretStringTemplate: '{}'
-        GenerateStringKey: placeholder
-        ExcludePunctuation: true
 
 Outputs:
   DeployRoleArn:
