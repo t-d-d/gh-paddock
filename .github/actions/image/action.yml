@@ -41,6 +41,14 @@ inputs:
     description: 'Newline-separated `KEY=value` build args, passed straight to buildx'
     required: false
     default: ''
+  compression:
+    description: >-
+      The layers' compression, such as zstd, which Fargate pulls and unpacks
+      faster than gzip. Every layer is recompressed, the base's included,
+      and the image is pushed with OCI media types. Empty pushes as buildx
+      does by default: gzip, with the base's layers as published.
+    required: false
+    default: ''
 
 outputs:
   image_uri:
@@ -50,6 +58,22 @@ outputs:
 runs:
   using: composite
   steps:
+    # The compression lands inside buildx's output string, where a comma
+    # would add exporter options of its own, such as push=false.
+    - name: Check the compression
+      id: compression
+      shell: bash
+      env:
+        COMPRESSION: ${{ inputs.compression }}
+      run: |
+        case "$COMPRESSION" in
+          '' | gzip | zstd | estargz | uncompressed) ;;
+          *)
+            echo "::error::compression must be empty, gzip, zstd, estargz or uncompressed, not '${COMPRESSION}'"
+            exit 1
+            ;;
+        esac
+
     - name: Resolve registry (${{ inputs.repo_name }})
       id: registry
       shell: bash
@@ -158,7 +182,10 @@ runs:
         context: .
         file: ./${{ inputs.dockerfile }}
         platforms: ${{ inputs.platform }}
-        push: true
+        # A compression pushes through an image output, which carries it;
+        # push and that output together would push twice.
+        push: ${{ inputs.compression == '' }}
+        outputs: ${{ inputs.compression != '' && format('type=image,push=true,oci-mediatypes=true,compression={0},force-compression=true', inputs.compression) || '' }}
         provenance: false
         tags: ${{ steps.registry.outputs.repo_uri }}:${{ inputs.image_tag }}
         # An empty scope is an empty list to buildx: no cache import or export.

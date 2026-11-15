@@ -8,6 +8,9 @@
 # runner more than 30 days behind its latest release once updates are off,
 # and the scale set turns them off.
 #
+# The deploy pushes it with every layer recompressed as zstd, which Fargate
+# pulls and unpacks faster than gzip, so a cold runner task starts sooner.
+#
 # It copies nothing from the repo, so the deploy's tag hashes runner/ alone:
 # the entrypoint below is written inline. The listener's task definition for
 # each task injects its first config as PADDOCK_CONFIG, and the entrypoint
