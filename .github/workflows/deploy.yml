@@ -153,6 +153,9 @@ jobs:
           region: us-east-1
           platform: linux/amd64
           cache_scope: runner
+          # A cold runner task pulls and unpacks the whole image before it
+          # starts, and Fargate does both faster from zstd layers.
+          compression: zstd
 
       - name: Hand on the digest
         id: digest
