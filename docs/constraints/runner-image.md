@@ -1,5 +1,5 @@
 # The runner image
-Relevance: runner/Dockerfile, the runner's task definition (internal/runners), the gate's and the deploy's runner-image jobs, Dependabot's config
+Relevance: runner/Dockerfile and its entrypoint, the runner's task definition (internal/runners), the gate's and the deploy's runner-image jobs, Dependabot's config
 Decision: Every pool runs x64 in v1, from one runner image built FROM GitHub's runner image and kept within 30 days of its latest release.
 
 Why: One image keeps the runners alike and cheap to keep current. x64 is
@@ -14,8 +14,12 @@ latest release, so the image must keep up.
   a release by number, and adds only CLI tools common workflows call
   without a setup action: the AWS CLI, jq, zip, Python 3 and the libraries
   Chromium needs.
-- It copies nothing from the repo, runs as the `runner` user, and starts
-  `run.sh`, which reads its injected config, runs one job and exits.
+- It copies nothing from the repo and runs as the `runner` user. Its
+  entrypoint runs a runner for each config the task is handed: `run.sh`
+  reads the config and runs one job. Before each runner it wipes the last
+  job's checkout and temporary directories and keeps the caches
+  (pool-per-repo.md). It exits when no config comes or its URL is refused
+  (runner-isolation.md).
 - Every runner task runs x64.
 - Dependabot watches the image's base weekly, with the week's cooldown every
   update gets.
@@ -36,4 +40,4 @@ latest release, so the image must keep up.
   and a single-use runner would lose its job.
 
 Judgment: no offline check sees how far the image is behind GitHub's latest runner release. A Dependabot pull request left unmerged for three weeks is the warning.
-History: Settled with the owner in PRD #1, and written by #16.
+History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed.
