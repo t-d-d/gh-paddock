@@ -84,9 +84,10 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
   # What the listener itself may do: read the App key and the repo list,
-  # write each runner's config, hand a running task its next one, and start
-  # runner tasks. Only the listener
-  # holds these (docs/constraints/runner-isolation.md).
+  # write each runner's config, hand a running task its next one, start
+  # runner tasks, stop one whose runner never took its job, and read its
+  # pools' job counts back. Only the listener holds these
+  # (docs/constraints/runner-isolation.md).
   ListenerTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -136,6 +137,22 @@ Resources:
                 Condition:
                   ArnEquals:
                     ecs:cluster: !GetAtt Cluster.Arn
+              # Only a task whose runner never took its job, once that
+              # runner's record is removed (docs/constraints/remove-then-terminate.md).
+              - Sid: StopRunnerTasksThatNeverStarted
+                Effect: Allow
+                Action: ecs:StopTask
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/paddock/*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt Cluster.Arn
+              # Each pool's finished and Spot-killed jobs over 30 days,
+              # which no alarm can look back over. CloudWatch takes no
+              # resource scope on this.
+              - Sid: ReadPoolJobCounts
+                Effect: Allow
+                Action: cloudwatch:GetMetricData
+                Resource: '*'
               - Sid: TagRunnerTasks
                 Effect: Allow
                 Action: ecs:TagResource
@@ -368,30 +385,227 @@ Resources:
         - Protocol: email
           Endpoint: !Ref AlertEmail
 
-  # ECS reports the service's CPU each minute while a task runs, and nothing
-  # while none does, so missing data is the listener down. Five minutes
-  # covers a Spot replacement.
+  # The alarms count lines the listener logs. Each filter below makes a
+  # metric of one kind of line; the messages are constants in
+  # internal/runners/recover.go and cmd/listener/main.go.
+  ListenerPollsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "listener polling" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: ListenerPolls
+          MetricValue: '1'
+
+  JobsWaitingFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "job waiting for a runner" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: JobsWaitingLong
+          MetricValue: '1'
+
+  FailedStartsFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "failed start" && $.inARow >= 3 }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: FailedStartsInARow
+          MetricValue: '1'
+
+  TasksPastMaxJobFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "task past its pool''s maximum job time" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: TasksPastMaxJob
+          MetricValue: '1'
+
+  SpotKillRateFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "spot kills over their limit" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: SpotKillsOverLimit
+          MetricValue: '1'
+
+  # Each pool's job counts, by repo and pool. The listener reads the first
+  # two back over 30 days for the Spot-kill rate.
+  JobsFinishedFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "job finished" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: JobsFinished
+          MetricValue: '1'
+          Dimensions:
+            - Key: Repo
+              Value: $.repo
+            - Key: Pool
+              Value: $.pool
+
+  JobsKilledBySpotFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "job killed by a Spot reclaim" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: JobsKilledBySpot
+          MetricValue: '1'
+          Dimensions:
+            - Key: Repo
+              Value: $.repo
+            - Key: Pool
+              Value: $.pool
+
+  JobsFinishedInWarningFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "job finished inside the warning" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: JobsFinishedInWarning
+          MetricValue: '1'
+          Dimensions:
+            - Key: Repo
+              Value: $.repo
+            - Key: Pool
+              Value: $.pool
+
+  JobsReRunFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "job re-run" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: JobsReRun
+          MetricValue: '1'
+          Dimensions:
+            - Key: Repo
+              Value: $.repo
+            - Key: Pool
+              Value: $.pool
+
+  # The listener logs a poll each minute GitHub answered it. None for five
+  # minutes is a listener down, or up and not polling: no task running
+  # logs nothing, so missing data counts.
   ListenerDownAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: paddock-listener-down
       AlarmDescription: >-
-        No listener task has run for five minutes. Jobs on gh-paddock's
-        runners queue and nothing starts them; clearing the runner-label
-        variables sends them back to GitHub's runners.
-      Namespace: AWS/ECS
-      MetricName: CPUUtilization
-      Dimensions:
-        - Name: ClusterName
-          Value: !Ref Cluster
-        - Name: ServiceName
-          Value: !GetAtt ListenerService.Name
-      Statistic: SampleCount
+        The listener has not polled GitHub for five minutes. Jobs on
+        gh-paddock's runners queue and nothing starts them; clearing the
+        runner-label variables sends them back to GitHub's runners.
+      Namespace: paddock
+      MetricName: ListenerPolls
+      Statistic: Sum
       Period: 60
       EvaluationPeriods: 5
       Threshold: 1
       ComparisonOperator: LessThanThreshold
       TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  JobWaitingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: paddock-job-waiting
+      AlarmDescription: >-
+        A job has waited five minutes for a gh-paddock runner. The
+        listener's log names the pool. Clearing the repo's runner-label
+        variables sends its next jobs to GitHub's runners.
+      Namespace: paddock
+      MetricName: JobsWaitingLong
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  FailedStartsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: paddock-failed-starts
+      AlarmDescription: >-
+        Three runner tasks in a row in one pool never took their jobs. The
+        listener replaces each, but something stops runners registering:
+        the runner image, GitHub, or the network.
+      Namespace: paddock
+      MetricName: FailedStartsInARow
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  TaskPastMaxJobAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: paddock-task-past-max-job
+      AlarmDescription: >-
+        A runner task has run 30 minutes past its pool's maximum job time.
+        The listener does not stop it; the listener's log names the task.
+      Namespace: paddock
+      MetricName: TasksPastMaxJob
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # The listener checks each pool's rate a little over an hour apart, so an
+  # hour can pass with no line while the rate stays over: the alarm looks
+  # back two hours and fires on one line, so it does not flap.
+  SpotKillRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: paddock-spot-kill-rate
+      AlarmDescription: >-
+        Spot reclaims killed more than 1 in 200 of a pool's jobs over 30
+        days. The listener's log names the pool; its capacity can move to
+        on-demand in the repo list.
+      Namespace: paddock
+      MetricName: SpotKillsOverLimit
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertsTopic
       OKActions:

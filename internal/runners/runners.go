@@ -14,6 +14,10 @@
 // comes. The scaler hands a waiting task a config before it starts any new
 // task, and only for a job already assigned to the pool
 // (docs/constraints/pool-per-repo.md, remove-then-terminate.md).
+//
+// The scaler also recovers what fails: recover.go replaces a task whose
+// runner never took its job, re-runs a job a Spot reclaim killed, and logs
+// the events the stack's alarms count.
 package runners
 
 import (
@@ -77,6 +81,8 @@ type ECS interface {
 	DeregisterTaskDefinition(context.Context, *ecs.DeregisterTaskDefinitionInput, ...func(*ecs.Options)) (*ecs.DeregisterTaskDefinitionOutput, error)
 	DeleteTaskDefinitions(context.Context, *ecs.DeleteTaskDefinitionsInput, ...func(*ecs.Options)) (*ecs.DeleteTaskDefinitionsOutput, error)
 	RunTask(context.Context, *ecs.RunTaskInput, ...func(*ecs.Options)) (*ecs.RunTaskOutput, error)
+	StopTask(context.Context, *ecs.StopTaskInput, ...func(*ecs.Options)) (*ecs.StopTaskOutput, error)
+	TagResource(context.Context, *ecs.TagResourceInput, ...func(*ecs.Options)) (*ecs.TagResourceOutput, error)
 }
 
 // SSM is the part of the Parameter Store client the scaler calls.
@@ -86,9 +92,12 @@ type SSM interface {
 	GetParametersByPath(context.Context, *ssm.GetParametersByPathInput, ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error)
 }
 
-// JIT makes a runner's just-in-time config.
+// JIT makes a runner's just-in-time config, and removes the record a config
+// made of a runner that never took its job.
 type JIT interface {
 	GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error)
+	RemoveRunner(context.Context, int64) error
 }
 
 // Objects is the part of the S3 client the scaler calls: it writes a task's
@@ -131,6 +140,10 @@ type Scaler struct {
 	Log        *slog.Logger
 	// Now is the clock; nil is time.Now.
 	Now func() time.Time
+	// Actions re-runs a job a Spot reclaim killed; nil re-runs none.
+	Actions Actions
+	// Metrics reads the pool's 30-day counts; nil reads none.
+	Metrics Metrics
 
 	last *scaleset.RunnerScaleSetStatistic
 	// tasks is what the scaler knows of each live task, by its ARN. A
@@ -141,11 +154,14 @@ type Scaler struct {
 	// finished and startedJobs are the runners messages said finished or
 	// took a job, and when.
 	finished    map[string]time.Time
-	startedJobs map[string]time.Time
+	startedJobs map[string]jobNote
+
+	recovery
 }
 
 // task is what the scaler knows of one of its pool's tasks.
 type task struct {
+	arn     string
 	key     string    // its object in the bucket, which its URL reaches
 	runner  string    // the runner it was last handed
 	created time.Time // when it started, for the warm limit
@@ -155,6 +171,12 @@ type task struct {
 	// done is when its runner's job finished, zero while the runner has a
 	// job or is starting.
 	done time.Time
+	// handed is when its runner's config was handed over, at its start or
+	// through its URL, and started is whether that runner took its job.
+	handed  time.Time
+	started bool
+	// warned is when it was last logged as past its pool's job time.
+	warned time.Time
 }
 
 func (s *Scaler) now() time.Time {
@@ -187,11 +209,13 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	if msg != nil && msg.Statistics != nil {
 		s.last = msg.Statistics
 	}
-	if s.last == nil {
-		return nil
-	}
+	// Before any statistics, nothing is scaled, but failed starts and
+	// reclaims are still read back from ECS.
 	stats := s.last
-	live, err := s.liveTasks(ctx)
+	if stats == nil {
+		stats = &scaleset.RunnerScaleSetStatistic{}
+	}
+	live, err := s.tasksOf(ctx, ecstypes.DesiredStatusRunning)
 	if err != nil {
 		return err
 	}
@@ -199,6 +223,8 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		s.Log.Warn("could not clear runner configs", "error", err.Error())
 	}
 	s.track(ctx, live)
+	live = s.replaceFailedStarts(ctx, live)
+	s.watch(ctx)
 
 	now := s.now()
 	busy := 0
@@ -230,27 +256,42 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	return nil
 }
 
-// hear notes which runners a message says took a job or finished one.
+// jobNote is what a message said of a job a runner took: when it was heard,
+// and the job's workflow run.
+type jobNote struct {
+	at    time.Time
+	runID int64
+}
+
+// hear notes which runners a message says took a job or finished one, and
+// which jobs wait for a runner. Each finished job is logged, for its pool's
+// count.
 func (s *Scaler) hear(msg *scaleset.RunnerScaleSetMessage) {
 	if s.finished == nil {
-		s.finished, s.startedJobs = map[string]time.Time{}, map[string]time.Time{}
+		s.finished, s.startedJobs = map[string]time.Time{}, map[string]jobNote{}
 	}
 	now := s.now()
-	for _, notes := range []map[string]time.Time{s.finished, s.startedJobs} {
-		for runner, at := range notes {
-			if now.Sub(at) > heardFor {
-				delete(notes, runner)
-			}
+	for runner, at := range s.finished {
+		if now.Sub(at) > heardFor {
+			delete(s.finished, runner)
+		}
+	}
+	for runner, note := range s.startedJobs {
+		if now.Sub(note.at) > heardFor {
+			delete(s.startedJobs, runner)
 		}
 	}
 	if msg == nil {
 		return
 	}
+	s.hearWaits(msg)
 	for _, job := range msg.JobStartedMessages {
-		s.startedJobs[job.RunnerName] = now
+		s.startedJobs[job.RunnerName] = jobNote{at: now, runID: job.WorkflowRunID}
+		s.failedInARow = 0
 	}
 	for _, job := range msg.JobCompletedMessages {
 		s.finished[job.RunnerName] = now
+		s.Log.Info(logJobFinished, "runner", job.RunnerName, "result", job.Result)
 	}
 }
 
@@ -269,12 +310,7 @@ func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 		if _, ok := s.tasks[arn]; ok {
 			continue
 		}
-		first := tagOf(lt, "paddock:runner")
-		created := s.now()
-		if lt.CreatedAt != nil {
-			created = *lt.CreatedAt
-		}
-		s.tasks[arn] = &task{key: s.objectKey(first), runner: first, created: created}
+		s.tasks[arn] = s.readTask(lt)
 	}
 	for arn, t := range s.tasks {
 		if !seen[arn] {
@@ -289,11 +325,15 @@ func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 		// just-in-time runner takes its job as soon as it registers, so
 		// its job's start is the sign; its finish, or its task gone, is
 		// the backstop.
-		if t.pending {
-			_, took := s.startedJobs[t.runner]
-			_, ended := s.finished[t.runner]
-			if took || ended {
-				s.deleteObject(ctx, t)
+		note, took := s.startedJobs[t.runner]
+		_, ended := s.finished[t.runner]
+		if t.pending && (took || ended) {
+			s.deleteObject(ctx, t)
+		}
+		if !t.started && (took || ended) {
+			t.started = true
+			if took {
+				s.tag(ctx, t, tagJob, t.runner+"@"+strconv.FormatInt(note.runID, 10))
 			}
 		}
 		if at, ok := s.finished[t.runner]; ok && t.done.IsZero() {
@@ -348,6 +388,8 @@ func (s *Scaler) hand(ctx context.Context, t *task) error {
 		return fmt.Errorf("hand a waiting task its config: %w", err)
 	}
 	t.runner, t.pending, t.done = runner, true, time.Time{}
+	t.handed, t.started = s.now(), false
+	s.tag(ctx, t, tagHanded, runner+"@"+strconv.FormatInt(t.handed.Unix(), 10))
 	s.Log.Info("config handed to a waiting task", "runner", runner, "task", t.key[strings.LastIndex(t.key, "/")+1:])
 	return nil
 }
@@ -367,14 +409,25 @@ func (s *Scaler) newRunner(ctx context.Context) (name, jit string, err error) {
 	return name, cfg.EncodedJITConfig, nil
 }
 
-func (s *Scaler) liveTasks(ctx context.Context) ([]ecstypes.Task, error) {
+// tasksOf lists the pool's tasks of one desired status, with their tags.
+// ECS shows a stopped task for about an hour.
+func (s *Scaler) tasksOf(ctx context.Context, status ecstypes.DesiredStatus) ([]ecstypes.Task, error) {
+	arns, err := s.taskARNs(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+	return s.describeTasks(ctx, arns)
+}
+
+// taskARNs lists the ARNs of the pool's tasks of one desired status.
+func (s *Scaler) taskARNs(ctx context.Context, status ecstypes.DesiredStatus) ([]string, error) {
 	var arns []string
 	var next *string
 	for {
 		out, err := s.ECS.ListTasks(ctx, &ecs.ListTasksInput{
 			Cluster:       aws.String(s.Launch.Cluster),
 			StartedBy:     aws.String(s.startedBy()),
-			DesiredStatus: ecstypes.DesiredStatusRunning,
+			DesiredStatus: status,
 			NextToken:     next,
 		})
 		if err != nil {
@@ -382,9 +435,13 @@ func (s *Scaler) liveTasks(ctx context.Context) ([]ecstypes.Task, error) {
 		}
 		arns = append(arns, out.TaskArns...)
 		if next = out.NextToken; next == nil {
-			break
+			return arns, nil
 		}
 	}
+}
+
+// describeTasks describes tasks by their ARNs, with their tags.
+func (s *Scaler) describeTasks(ctx context.Context, arns []string) ([]ecstypes.Task, error) {
 	var tasks []ecstypes.Task
 	for len(arns) > 0 {
 		batch := arns[:min(len(arns), 100)]
@@ -513,7 +570,10 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 			Name:      aws.String("runner"),
 			Image:     aws.String(s.Launch.Image),
 			Essential: aws.Bool(true),
-			Secrets:   []ecstypes.Secret{{Name: aws.String("PADDOCK_CONFIG"), ValueFrom: aws.String(param)}},
+			// Fargate Spot's two minutes' notice, the most Fargate allows:
+			// the entrypoint holds the stop back from a running job.
+			StopTimeout: aws.Int32(120),
+			Secrets:     []ecstypes.Secret{{Name: aws.String("PADDOCK_CONFIG"), ValueFrom: aws.String(param)}},
 			LogConfiguration: &ecstypes.LogConfiguration{
 				LogDriver: ecstypes.LogDriverAwslogs,
 				Options: map[string]string{

@@ -90,6 +90,9 @@ type fakeGitHub struct {
 	repos     map[string]map[string]any
 	installs  map[string]int64
 	tokens    int
+	// jobs of run 5's attempts, and the jobs re-run
+	jobs   map[string][]map[string]any
+	reruns []string
 }
 
 func newFake(t *testing.T) (*fakeGitHub, *App) {
@@ -147,6 +150,19 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && r.URL.Path == "/app/installations/99/access_tokens":
 		f.tokens++
 		reply(201, map[string]any{"token": "installation-token", "expires_at": time.Now().Add(time.Hour).Format(time.RFC3339)})
+	case r.Method == "GET" && r.URL.Path == "/repos/acme/widgets/actions/runs/5":
+		reply(200, map[string]any{"id": 5, "status": "completed", "run_attempt": 2})
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/actions/runs/5/attempts/"):
+		attempt := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/repos/acme/widgets/actions/runs/5/attempts/"), "/jobs")
+		all := f.jobs[attempt]
+		var page int
+		fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
+		per := 2
+		from, to := min((page-1)*per, len(all)), min(page*per, len(all))
+		reply(200, map[string]any{"total_count": len(all), "jobs": all[from:to]})
+	case r.Method == "POST" && strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/actions/jobs/") && strings.HasSuffix(r.URL.Path, "/rerun"):
+		f.reruns = append(f.reruns, strings.Split(r.URL.Path, "/")[6])
+		reply(201, map[string]any{})
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/repos/"):
 		name := strings.TrimPrefix(r.URL.Path, "/repos/")
 		if repo, ok := f.repos[name]; ok {
@@ -276,5 +292,43 @@ func TestAMissingRepoIsAnError(t *testing.T) {
 	}
 	if _, err := inst.Repo(context.Background(), "acme", "gone"); err == nil {
 		t.Fatal("a missing repo was found")
+	}
+}
+
+func TestAKilledJobIsFoundInItsRunsAttemptAndReRun(t *testing.T) {
+	f, app := newFake(t)
+	f.jobs = map[string][]map[string]any{"2": {
+		{"id": 70, "runner_name": "GitHub Actions 1", "conclusion": "success", "completed_at": "2026-11-01T10:00:00Z"},
+		{"id": 71, "runner_name": "paddock-aaaa", "conclusion": "success", "completed_at": "2026-11-01T10:01:00Z"},
+		{"id": 72, "runner_name": "paddock-bbbb", "conclusion": "failure", "completed_at": "2026-11-01T10:02:00Z"},
+	}}
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := inst.Run(ctx, "acme", "widgets", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != "completed" || run.Attempt != 2 {
+		t.Fatalf("run %+v", run)
+	}
+	jobs, err := inst.RunJobs(ctx, "acme", "widgets", 5, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("jobs %+v, want all three pages' worth", jobs)
+	}
+	want := Job{ID: 72, RunnerName: "paddock-bbbb", Conclusion: "failure", CompletedAt: time.Date(2026, 11, 1, 10, 2, 0, 0, time.UTC)}
+	if jobs[2] != want {
+		t.Fatalf("job %+v, want %+v", jobs[2], want)
+	}
+	if err := inst.RerunJob(ctx, "acme", "widgets", 72); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.reruns) != 1 || f.reruns[0] != "72" {
+		t.Fatalf("re-ran %v", f.reruns)
 	}
 }

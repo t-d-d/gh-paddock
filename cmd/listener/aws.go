@@ -9,6 +9,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -25,6 +26,7 @@ type awsCloud struct {
 	ssm *ssm.Client
 	ecs *ecs.Client
 	s3  *s3.Client
+	cw  *cloudwatch.Client
 }
 
 func connectAWS(ctx context.Context, region string) (cloud, error) {
@@ -32,7 +34,7 @@ func connectAWS(ctx context.Context, region string) (cloud, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &awsCloud{ssm: ssm.NewFromConfig(cfg), ecs: ecs.NewFromConfig(cfg), s3: s3.NewFromConfig(cfg)}, nil
+	return &awsCloud{ssm: ssm.NewFromConfig(cfg), ecs: ecs.NewFromConfig(cfg), s3: s3.NewFromConfig(cfg), cw: cloudwatch.NewFromConfig(cfg)}, nil
 }
 
 func (a *awsCloud) Parameter(ctx context.Context, name string) (string, bool, error) {
@@ -75,6 +77,8 @@ func (a *awsCloud) ECS() runners.ECS { return a.ecs }
 func (a *awsCloud) SSM() runners.SSM { return a.ssm }
 
 func (a *awsCloud) Objects() runners.Objects { return a.s3 }
+
+func (a *awsCloud) Metrics() runners.Metrics { return a.cw }
 
 // Presigner signs with the listener's own credentials, so a task's URL
 // lasts no longer than they do.

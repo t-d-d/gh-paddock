@@ -20,10 +20,14 @@ import (
 	"github.com/t-d-d/gh-paddock/internal/repos"
 )
 
-// Installation is the App's REST calls on one org.
+// Installation is the App's REST calls on one org. Run, RunJobs and
+// RerunJob re-run a job a Spot reclaim killed.
 type Installation interface {
 	Repo(ctx context.Context, owner, name string) (github.Repo, error)
 	EnsureRunnerGroup(ctx context.Context, org, name string, repoID int64) error
+	Run(ctx context.Context, owner, name string, runID int64) (github.Run, error)
+	RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]github.Job, error)
+	RerunJob(ctx context.Context, owner, name string, jobID int64) error
 }
 
 // App finds the App's installation on an org, and its id.
@@ -44,16 +48,19 @@ type ScaleSets interface {
 	CreateRunnerScaleSet(ctx context.Context, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	UpdateRunnerScaleSet(ctx context.Context, id int, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
+	GetRunnerByName(ctx context.Context, name string) (*scaleset.RunnerReference, error)
+	RemoveRunner(ctx context.Context, runnerID int64) error
 	OpenSession(ctx context.Context, scaleSetID int, owner string) (Session, error)
 }
 
-// Pool is a pool the listener serves: its repo, its settings, its scale set
-// and the scale-set client of its org.
+// Pool is a pool the listener serves: its repo, its settings, its scale set,
+// and the scale-set client and App installation of its org.
 type Pool struct {
-	Repo       repos.Repo
-	Pool       repos.Pool
-	ScaleSetID int
-	ScaleSets  ScaleSets
+	Repo         repos.Repo
+	Pool         repos.Pool
+	ScaleSetID   int
+	ScaleSets    ScaleSets
+	Installation Installation
 }
 
 // Setup makes each listed repo's pools ready on GitHub: for each pool a
@@ -135,7 +142,7 @@ func setupRepo(ctx context.Context, inst Installation, sets ScaleSets, repo repo
 		if err != nil {
 			return nil, fmt.Errorf("pool %s: scale set: %w", pool.Name, err)
 		}
-		pools = append(pools, Pool{Repo: repo, Pool: pool, ScaleSetID: set.ID, ScaleSets: sets})
+		pools = append(pools, Pool{Repo: repo, Pool: pool, ScaleSetID: set.ID, ScaleSets: sets, Installation: inst})
 	}
 	return pools, nil
 }

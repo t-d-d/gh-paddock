@@ -6,12 +6,13 @@
 //	{"repos": [
 //	  {"repo": "owner/name", "pools": [
 //	    {"name": "test", "capacity": "spot"},
-//	    {"name": "dev", "capacity": "on-demand", "vcpu": 2, "memoryGb": 8, "maxRunners": 10}
+//	    {"name": "dev", "capacity": "on-demand", "vcpu": 2, "memoryGb": 8, "maxRunners": 10, "maxJobMinutes": 120}
 //	  ]}
 //	]}
 //
 // A pool's size defaults to 2 vCPU and 8 GB, as GitHub's private-repo
-// runners, and its maximum to 10 runners.
+// runners, its maximum to 10 runners, and its longest job to two hours. A
+// task running well past its pool's longest job raises an alarm.
 package repos
 
 import (
@@ -19,6 +20,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Capacity is the Fargate capacity a pool's runner tasks run on.
@@ -33,6 +35,9 @@ const (
 	defaultVCPU       = 2
 	defaultMemoryGB   = 8
 	defaultMaxRunners = 10
+	defaultMaxJobMins = 120
+	// GitHub's own limit on a self-hosted runner's job: five days.
+	maxMaxJobMins = 5 * 24 * 60
 	// A sanity bound on one pool, not a budget: a typo of 1000 should not
 	// start a thousand tasks.
 	maxMaxRunners = 100
@@ -45,6 +50,8 @@ type Pool struct {
 	VCPU       int
 	MemoryGB   int
 	MaxRunners int
+	// MaxJob is the longest a job of the pool should run.
+	MaxJob time.Duration
 }
 
 // Repo is a served repo and its pools.
@@ -82,6 +89,7 @@ type document struct {
 			VCPU       *int     `json:"vcpu"`
 			MemoryGB   *int     `json:"memoryGb"`
 			MaxRunners *int     `json:"maxRunners"`
+			MaxJobMins *int     `json:"maxJobMinutes"`
 		} `json:"pools"`
 	} `json:"repos"`
 }
@@ -133,6 +141,12 @@ func Parse(raw string) (List, error) {
 				MemoryGB:   orDefault(p.MemoryGB, defaultMemoryGB),
 				MaxRunners: orDefault(p.MaxRunners, defaultMaxRunners),
 			}
+			jobMins := orDefault(p.MaxJobMins, defaultMaxJobMins)
+			if jobMins < 1 || jobMins > maxMaxJobMins {
+				problem = fmt.Errorf("pool %s: maxJobMinutes %d is not between 1 and %d", p.Name, jobMins, maxMaxJobMins)
+				break
+			}
+			pool.MaxJob = time.Duration(jobMins) * time.Minute
 			if problem = checkPool(pool, names); problem != nil {
 				break
 			}

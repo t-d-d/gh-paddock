@@ -110,16 +110,50 @@ next_config() {
 }
 
 # ECS stops a task with SIGTERM to this script alone, which as process 1
-# ignores any signal it has no handler for. The signal goes on to run.sh,
-# whose own trap stops the runner, and the task exits once run.sh has.
+# ignores any signal it has no handler for. A waiting task, with no runner
+# registered, exits at once. A runner with no job yet is told to stop, and
+# leaves GitHub. A runner whose job is running never sees the signal:
+# Fargate Spot gives two minutes' notice, so a job near its end finishes,
+# and the task then exits with no wait for another config. A job still
+# running when the notice ends dies with the task, and the listener re-runs
+# it once its workflow run completes.
+#
+# The runner runs each job in a process named Runner.Worker. job_running
+# looks for one among run.sh's descendants alone, so no other process on
+# the machine counts. The brackets keep grep from matching its own line.
+job_running() {
+  local -A parent=()
+  local d s p workers=()
+  for d in /proc/[0-9]*; do
+    s=$(cat "$d/stat" 2>/dev/null) || continue
+    s=${s##*) }
+    read -r _ p _ <<<"$s"
+    parent[${d#/proc/}]=$p
+    if grep -qs 'Runner[.]Worker' "$d/cmdline"; then workers+=("${d#/proc/}"); fi
+  done
+  for p in "${workers[@]}"; do
+    while [ -n "$p" ] && [ "$p" != 0 ]; do
+      [ "$p" = "$child" ] && return 0
+      [ "$p" = 1 ] && break
+      p=${parent[$p]:-}
+    done
+  done
+  return 1
+}
+
 child=""
+stopping=""
 stop() {
   trap - TERM INT
-  if [ -n "$child" ]; then
-    kill -TERM "$child" 2>/dev/null || true
-    wait "$child" || true
+  stopping=1
+  if [ -z "$child" ]; then
+    exit 143
   fi
-  exit 143
+  if job_running; then
+    echo "paddock: stop held back from runner $runner while its job runs"
+  else
+    kill -TERM "$child" 2>/dev/null || true
+  fi
 }
 trap stop TERM INT
 
@@ -132,7 +166,13 @@ while :; do
   child=$!
   code=0
   wait "$child" || code=$?
+  # A trapped signal cuts the wait short: wait again for the job itself.
+  while [ -n "$stopping" ] && kill -0 "$child" 2>/dev/null; do
+    code=0
+    wait "$child" || code=$?
+  done
   child=""
+  [ -z "$stopping" ] || exit 143
   ((code == 0)) || exit "$code"
   next_config || exit 0
 done

@@ -1,13 +1,15 @@
 /**
  * The main stack, infra/paddock.cfn.yml: the listener as one Fargate Spot
  * service whose health check is the listener's own heartbeat, what the
- * listener needs to start runner tasks, and the alarm that pages when it is
- * down (docs/constraints/deploy.md).
+ * listener needs to start runner tasks, and the alarms that page the
+ * operator (docs/constraints/deploy.md).
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadTemplate, onlyResource, resourcesOfType, type Statement } from './helpers/cfn.ts';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { loadTemplate, onlyResource, resourcesOfType, REPO_ROOT, type Statement } from './helpers/cfn.ts';
 
 const tpl = loadTemplate('infra/paddock.cfn.yml');
 const service = onlyResource(tpl, 'AWS::ECS::Service');
@@ -129,24 +131,90 @@ describe('fitness: the alert address never passes through GitHub (public-repo.md
   });
 });
 
-describe('the listener-down alarm', () => {
-  const alarms = resourcesOfType(tpl, 'AWS::CloudWatch::Alarm');
-  const down = alarms.find(([id]) => id === 'ListenerDownAlarm')?.[1];
+// Each alarm counts a line the listener logs, through a metric filter on
+// its log group, and pages the operator through the alerts topic.
+describe('the alarms', () => {
+  const alarms = Object.fromEntries(resourcesOfType(tpl, 'AWS::CloudWatch::Alarm'));
+  const filters = resourcesOfType(tpl, 'AWS::Logs::MetricFilter').map(([, f]) => f.Properties ?? {});
+  const filterOf = (metric: string) => filters.find((f) => f.MetricTransformations?.[0]?.MetricName === metric);
+  // The messages the listener logs, from its Go source.
+  const goSource = ['internal/runners/recover.go', 'cmd/listener/main.go']
+    .map((f) => readFileSync(resolve(REPO_ROOT, f), 'utf-8')).join('\n');
+  const logged = (msg: string) => goSource.includes(`"${msg}"`);
+  const msgOf = (pattern: string) => /\$\.msg = "([^"]+)"/.exec(pattern)?.[1] ?? '';
 
-  test('fires when the service reports no task, and when it reports nothing at all', () => {
-    assert.equal(down?.Properties?.Namespace, 'AWS/ECS');
-    assert.equal(down?.Properties?.Statistic, 'SampleCount');
-    assert.equal(down?.Properties?.ComparisonOperator, 'LessThanThreshold');
-    assert.equal(down?.Properties?.Threshold, 1);
-    assert.equal(down?.Properties?.TreatMissingData, 'breaching');
-    assert.deepEqual(down?.Properties?.Dimensions, [
-      { Name: 'ClusterName', Value: '${Cluster}' },
-      { Name: 'ServiceName', Value: '${ListenerService.Name}' },
-    ]);
+  const cases: [alarm: string, metric: string, pattern: string][] = [
+    ['ListenerDownAlarm', 'ListenerPolls', '{ $.msg = "listener polling" }'],
+    ['JobWaitingAlarm', 'JobsWaitingLong', '{ $.msg = "job waiting for a runner" }'],
+    ['FailedStartsAlarm', 'FailedStartsInARow', '{ $.msg = "failed start" && $.inARow >= 3 }'],
+    ['TaskPastMaxJobAlarm', 'TasksPastMaxJob', '{ $.msg = "task past its pool\'s maximum job time" }'],
+    ['SpotKillRateAlarm', 'SpotKillsOverLimit', '{ $.msg = "spot kills over their limit" }'],
+  ];
+  for (const [id, metric, pattern] of cases) {
+    test(`${id} counts the listener's "${msgOf(pattern)}" lines and pages the operator`, () => {
+      const alarm = alarms[id]?.Properties;
+      assert.ok(alarm, `no ${id}`);
+      assert.equal(alarm.Namespace, 'paddock');
+      assert.equal(alarm.MetricName, metric);
+      assert.deepEqual(alarm.AlarmActions, ['${AlertsTopic}']);
+      assert.deepEqual(alarm.OKActions, ['${AlertsTopic}']);
+      const filter = filterOf(metric);
+      assert.equal(filter?.LogGroupName, '${ListenerLogs}');
+      assert.equal(filter?.FilterPattern, pattern);
+      assert.equal(filter?.MetricTransformations?.[0]?.MetricNamespace, 'paddock');
+      assert.ok(logged(msgOf(pattern)), `the listener never logs "${msgOf(pattern)}"`);
+    });
+  }
+
+  test('the listener-down alarm fires when the listener logs no poll for five minutes, running or not', () => {
+    const down = alarms.ListenerDownAlarm?.Properties;
+    assert.equal(down?.Statistic, 'Sum');
+    assert.equal(down?.ComparisonOperator, 'LessThanThreshold');
+    assert.equal(down?.Threshold, 1);
+    assert.equal(down?.Period * down?.EvaluationPeriods, 300);
+    assert.equal(down?.TreatMissingData, 'breaching');
   });
 
-  test('pages the operator through the alerts topic', () => {
-    assert.deepEqual(down?.Properties?.AlarmActions, ['${AlertsTopic}']);
+  test('the other alarms fire on any line, and treat none as all is well', () => {
+    for (const id of ['JobWaitingAlarm', 'FailedStartsAlarm', 'TaskPastMaxJobAlarm', 'SpotKillRateAlarm']) {
+      const a = alarms[id]?.Properties;
+      assert.equal(a?.Statistic, 'Sum', id);
+      assert.equal(a?.ComparisonOperator, 'GreaterThanOrEqualToThreshold', id);
+      assert.equal(a?.Threshold, 1, id);
+      assert.equal(a?.TreatMissingData, 'notBreaching', id);
+    }
+  });
+
+  // The listener logs the rate a little over an hour apart, so an hour can
+  // pass with no line while the rate stays over its limit: the alarm looks
+  // back two hours and fires on one line, so it does not flap.
+  test('the Spot-kill alarm holds through an hour with no line', () => {
+    const a = alarms.SpotKillRateAlarm?.Properties;
+    assert.equal(a?.Period, 3600);
+    assert.equal(a?.EvaluationPeriods, 2);
+    assert.equal(a?.DatapointsToAlarm, 1);
+  });
+
+  test('each pool\'s finished, Spot-killed, warned and re-run jobs are counted by repo and pool', () => {
+    for (const [metric, msg] of [
+      ['JobsFinished', 'job finished'],
+      ['JobsKilledBySpot', 'job killed by a Spot reclaim'],
+      ['JobsFinishedInWarning', 'job finished inside the warning'],
+      ['JobsReRun', 'job re-run'],
+    ]) {
+      const f = filterOf(metric!);
+      assert.equal(f?.FilterPattern, `{ $.msg = "${msg}" }`, metric);
+      assert.deepEqual(f?.MetricTransformations?.[0]?.Dimensions, [
+        { Key: 'Repo', Value: '$.repo' },
+        { Key: 'Pool', Value: '$.pool' },
+      ], metric);
+      assert.ok(logged(msg!), `the listener never logs "${msg}"`);
+    }
+  });
+
+  test('the listener reads its pools\' job counts back, for the 30 days no alarm can look over', () => {
+    const read = statementsOf('ListenerTaskRole').filter((s) => actionsOf(s).some((a) => a.startsWith('cloudwatch:')));
+    assert.deepEqual(read.map(actionsOf), [['cloudwatch:GetMetricData']]);
   });
 });
 
@@ -286,11 +354,20 @@ describe('fitness: served repos are configuration in the CI account, never a fil
 });
 
 // A task ends itself once its runner has left GitHub and no new config
-// comes, so the listener has no task to stop.
-describe('fitness: the listener stops no task (remove-then-terminate.md)', () => {
-  test('no role may stop a task', () => {
+// comes. The listener stops a task only when its runner never took its job,
+// and only a runner task in its own cluster.
+describe('fitness: the listener stops only runner tasks whose runners never took their jobs (remove-then-terminate.md)', () => {
+  test('the listener may stop tasks in its own cluster alone, and no other role may stop any', () => {
     for (const [id] of Object.entries(roles)) {
-      for (const s of statementsOf(id)) assert.ok(!actionsOf(s).includes('ecs:StopTask'), `${id} can stop a task`);
+      const stops = statementsOf(id).filter((s) => actionsOf(s).includes('ecs:StopTask'));
+      if (id !== 'ListenerTaskRole') {
+        assert.deepEqual(stops, [], `${id} can stop a task`);
+        continue;
+      }
+      assert.equal(stops.length, 1);
+      assert.deepEqual(actionsOf(stops[0]!), ['ecs:StopTask']);
+      assert.deepEqual(resourcesOf(stops[0]!), ['arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/paddock/*']);
+      assert.deepEqual(stops[0]!.Condition, { ArnEquals: { 'ecs:cluster': '${Cluster.Arn}' } });
     }
   });
 });

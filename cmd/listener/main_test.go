@@ -23,6 +23,7 @@ import (
 	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -150,6 +151,26 @@ func (c *fakeCloud) ECS() runners.ECS             { return fakeECS{c} }
 func (c *fakeCloud) SSM() runners.SSM             { return fakeSSM{} }
 func (c *fakeCloud) Objects() runners.Objects     { return fakeS3{} }
 func (c *fakeCloud) Presigner() runners.Presigner { return fakeS3{} }
+func (c *fakeCloud) Metrics() runners.Metrics     { return fakeMetrics{} }
+
+type fakeMetrics struct{}
+
+func (fakeMetrics) GetMetricData(context.Context, *cloudwatch.GetMetricDataInput, ...func(*cloudwatch.Options)) (*cloudwatch.GetMetricDataOutput, error) {
+	return &cloudwatch.GetMetricDataOutput{}, nil
+}
+
+func (c *fakeCloud) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
+	return nil, nil
+}
+func (c *fakeCloud) RemoveRunner(context.Context, int64) error { return nil }
+
+func (c *fakeCloud) Run(context.Context, string, string, int64) (github.Run, error) {
+	return github.Run{}, nil
+}
+func (c *fakeCloud) RunJobs(context.Context, string, string, int64, int) ([]github.Job, error) {
+	return nil, nil
+}
+func (c *fakeCloud) RerunJob(context.Context, string, string, int64) error { return nil }
 
 type fakeS3 struct{}
 
@@ -179,6 +200,12 @@ func (f fakeECS) DeregisterTaskDefinition(context.Context, *ecs.DeregisterTaskDe
 }
 func (f fakeECS) DeleteTaskDefinitions(context.Context, *ecs.DeleteTaskDefinitionsInput, ...func(*ecs.Options)) (*ecs.DeleteTaskDefinitionsOutput, error) {
 	return &ecs.DeleteTaskDefinitionsOutput{}, nil
+}
+func (f fakeECS) StopTask(context.Context, *ecs.StopTaskInput, ...func(*ecs.Options)) (*ecs.StopTaskOutput, error) {
+	return &ecs.StopTaskOutput{}, nil
+}
+func (f fakeECS) TagResource(context.Context, *ecs.TagResourceInput, ...func(*ecs.Options)) (*ecs.TagResourceOutput, error) {
+	return &ecs.TagResourceOutput{}, nil
 }
 func (f fakeECS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 	f.c.mu.Lock()
@@ -360,6 +387,23 @@ func TestWithAnEmptyListTheListenerChecksTheAppBeatsAndStops(t *testing.T) {
 		if !strings.Contains(logs, want) {
 			t.Errorf("logs lack %s:\n%s", want, logs)
 		}
+	}
+}
+
+// The stack's listener-down alarm counts this line: a listener that is up
+// but cannot reach GitHub logs none.
+func TestTheListenerLogsThatItPollsOncePerIntervalWhileGitHubAnswers(t *testing.T) {
+	was := pollLogEvery
+	pollLogEvery = 20 * time.Millisecond
+	t.Cleanup(func() { pollLogEvery = was })
+	c := &fakeCloud{params: map[string]string{"/paddock/github-app": appKey}}
+	stop := runUntilBeat(t, c)
+	time.Sleep(200 * time.Millisecond)
+	_, logs := stop()
+	// One beat, at the start: the idle check beats again only after a
+	// minute, so one interval logs it and the rest log nothing.
+	if n := strings.Count(logs, `"msg":"listener polling"`); n != 1 {
+		t.Fatalf("logged polling %d times for one beat:\n%s", n, logs)
 	}
 }
 

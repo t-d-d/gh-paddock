@@ -39,6 +39,12 @@ type fakeAWS struct {
 	params    map[string]ssmtypes.Parameter
 	paramPuts []*ssm.PutParameterInput
 	failRun   bool
+	// events is what was done to runners and tasks, in order: "remove
+	// <runner>" and "stop <first runner>".
+	events  []string
+	stopped []string
+	// described is every task ARN asked of DescribeTasks, in order.
+	described []string
 }
 
 func newFakeAWS() *fakeAWS {
@@ -103,12 +109,12 @@ func (f *fakeAWS) object(t *testing.T, key string) (later struct{ Runner, JITCon
 func (f *fakeAWS) ListTasks(_ context.Context, in *ecs.ListTasksInput, _ ...func(*ecs.Options)) (*ecs.ListTasksOutput, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if in.DesiredStatus != ecstypes.DesiredStatusRunning {
+	if in.DesiredStatus != ecstypes.DesiredStatusRunning && in.DesiredStatus != ecstypes.DesiredStatusStopped {
 		return nil, fmt.Errorf("listed tasks of desired status %q", in.DesiredStatus)
 	}
 	var arns []string
 	for _, t := range f.tasks {
-		if aws.ToString(t.StartedBy) == aws.ToString(in.StartedBy) && aws.ToString(t.DesiredStatus) == "RUNNING" {
+		if aws.ToString(t.StartedBy) == aws.ToString(in.StartedBy) && aws.ToString(t.DesiredStatus) == string(in.DesiredStatus) {
 			arns = append(arns, aws.ToString(t.TaskArn))
 		}
 	}
@@ -119,6 +125,7 @@ func (f *fakeAWS) DescribeTasks(_ context.Context, in *ecs.DescribeTasksInput, _
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []ecstypes.Task
+	f.described = append(f.described, in.Tasks...)
 	for _, arn := range in.Tasks {
 		for _, t := range f.tasks {
 			if aws.ToString(t.TaskArn) == arn {
@@ -166,6 +173,45 @@ func (f *fakeAWS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ec
 	}
 	f.tasks = append(f.tasks, task)
 	return &ecs.RunTaskOutput{Tasks: []ecstypes.Task{task}}, nil
+}
+
+func (f *fakeAWS) StopTask(_ context.Context, in *ecs.StopTaskInput, _ ...func(*ecs.Options)) (*ecs.StopTaskOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if aws.ToString(in.Cluster) != "paddock" {
+		return nil, fmt.Errorf("stopped a task in cluster %q", aws.ToString(in.Cluster))
+	}
+	for i, t := range f.tasks {
+		if aws.ToString(t.TaskArn) == aws.ToString(in.Task) {
+			f.tasks[i].DesiredStatus = aws.String("STOPPED")
+			f.tasks[i].StopCode = ecstypes.TaskStopCodeUserInitiated
+			f.stopped = append(f.stopped, aws.ToString(in.Task))
+			f.events = append(f.events, "stop "+tagOf(t, "paddock:runner"))
+			return &ecs.StopTaskOutput{}, nil
+		}
+	}
+	return nil, errors.New("no such task")
+}
+
+func (f *fakeAWS) TagResource(_ context.Context, in *ecs.TagResourceInput, _ ...func(*ecs.Options)) (*ecs.TagResourceOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, t := range f.tasks {
+		if aws.ToString(t.TaskArn) != aws.ToString(in.ResourceArn) {
+			continue
+		}
+		for _, tag := range in.Tags {
+			kept := t.Tags[:0:0]
+			for _, old := range f.tasks[i].Tags {
+				if aws.ToString(old.Key) != aws.ToString(tag.Key) {
+					kept = append(kept, old)
+				}
+			}
+			f.tasks[i].Tags = append(kept, tag)
+		}
+		return &ecs.TagResourceOutput{}, nil
+	}
+	return nil, errors.New("no such task")
 }
 
 func (f *fakeAWS) PutParameter(_ context.Context, in *ssm.PutParameterInput, _ ...func(*ssm.Options)) (*ssm.PutParameterOutput, error) {
@@ -219,7 +265,42 @@ func (f *fakeAWS) setLastStatus(status string) {
 	}
 }
 
-type fakeJIT struct{ calls []string }
+type fakeJIT struct {
+	calls        []string
+	removed      []string
+	refuseRemove bool
+	// jobRunning refuses each removal as GitHub does a busy runner's.
+	jobRunning  bool
+	removeTries int
+	aws         *fakeAWS // where removals are logged beside the stops
+}
+
+func (j *fakeJIT) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
+	for i, c := range j.calls {
+		if c == name {
+			return &scaleset.RunnerReference{ID: i + 1, Name: name, RunnerScaleSetID: 5}, nil
+		}
+	}
+	return nil, nil
+}
+
+func (j *fakeJIT) RemoveRunner(_ context.Context, id int64) error {
+	j.removeTries++
+	if j.jobRunning {
+		return fmt.Errorf("remove runner: %w", scaleset.JobStillRunningError)
+	}
+	if j.refuseRemove {
+		return errors.New("the runner is running a job")
+	}
+	name := j.calls[id-1]
+	j.removed = append(j.removed, name)
+	if j.aws != nil {
+		j.aws.mu.Lock()
+		j.aws.events = append(j.aws.events, "remove "+name)
+		j.aws.mu.Unlock()
+	}
+	return nil
+}
 
 func (j *fakeJIT) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, id int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
 	j.calls = append(j.calls, s.Name)
@@ -482,7 +563,7 @@ func TestAFailedStartIsAnErrorAndLeavesNoConfigBehind(t *testing.T) {
 // task runs, or is gone, the parameter is deleted.
 func TestAConfigIsDeletedOnceItsTaskRuns(t *testing.T) {
 	f := newFakeAWS()
-	s, _ := newScaler(f, spotTest)
+	s, jit := newScaler(f, spotTest)
 	s.Now = func() time.Time { return time.Now().Add(10 * time.Minute) }
 	ctx := context.Background()
 	if err := s.Scale(ctx, assigned(1)); err != nil {
@@ -492,7 +573,9 @@ func TestAConfigIsDeletedOnceItsTaskRuns(t *testing.T) {
 		t.Fatal("the pending task's config is gone")
 	}
 	f.setLastStatus("RUNNING")
-	if err := s.Scale(ctx, assigned(1)); err != nil {
+	// Its runner took its job: ten minutes on, a task that had not would be
+	// a failed start, and replaced.
+	if err := s.Scale(ctx, started(1, jit.calls[0])); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.params) != 0 {
