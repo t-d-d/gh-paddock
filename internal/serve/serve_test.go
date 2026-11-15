@@ -85,10 +85,6 @@ func (f *fakeScaleSets) GenerateJitRunnerConfig(context.Context, *scaleset.Runne
 	return nil, errors.New("not in this test")
 }
 
-func (f *fakeScaleSets) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
-	return nil, errors.New("not in this test")
-}
-
 func (f *fakeScaleSets) OpenSession(context.Context, int, string) (Session, error) {
 	return nil, errors.New("not in this test")
 }

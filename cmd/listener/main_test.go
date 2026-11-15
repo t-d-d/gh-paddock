@@ -142,10 +142,6 @@ func (c *fakeCloud) GenerateJitRunnerConfig(_ context.Context, s *scaleset.Runne
 	return &scaleset.RunnerScaleSetJitRunnerConfig{EncodedJITConfig: "jit"}, nil
 }
 
-func (c *fakeCloud) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
-	return nil, nil
-}
-
 func (c *fakeCloud) OpenSession(context.Context, int, string) (serve.Session, error) {
 	return c.session, nil
 }

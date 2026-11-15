@@ -86,11 +86,9 @@ type SSM interface {
 	GetParametersByPath(context.Context, *ssm.GetParametersByPathInput, ...func(*ssm.Options)) (*ssm.GetParametersByPathOutput, error)
 }
 
-// JIT makes a runner's just-in-time config, and finds a runner GitHub has
-// registered. A runner not registered is nil, with no error.
+// JIT makes a runner's just-in-time config.
 type JIT interface {
 	GenerateJitRunnerConfig(context.Context, *scaleset.RunnerScaleSetJitRunnerSetting, int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
-	GetRunnerByName(ctx context.Context, name string) (*scaleset.RunnerReference, error)
 }
 
 // Objects is the part of the S3 client the scaler calls: it writes a task's
@@ -136,8 +134,9 @@ type Scaler struct {
 
 	last *scaleset.RunnerScaleSetStatistic
 	// tasks is what the scaler knows of each live task, by its ARN. A
-	// restart loses it: until a task's runner is next heard to finish, the
-	// task counts as busy, as every task did before warm reuse.
+	// restart loses it: the scaler then knows a task only by its first
+	// runner, so a task on a later runner counts as busy until it exits, as
+	// every task did before warm reuse.
 	tasks map[string]*task
 	// finished and startedJobs are the runners messages said finished or
 	// took a job, and when.
@@ -257,7 +256,7 @@ func (s *Scaler) hear(msg *scaleset.RunnerScaleSetMessage) {
 
 // track brings what the scaler knows of its tasks up to date with the live
 // ones. A gone task's object is deleted; so is one whose runner has
-// registered, or taken a job. A task whose runner was heard to finish is
+// registered and taken its job. A task whose runner was heard to finish is
 // waiting from then.
 func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 	if s.tasks == nil {
@@ -285,16 +284,14 @@ func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 			delete(s.tasks, arn)
 			continue
 		}
+		// GitHub keeps a record of a runner from the moment its config is
+		// made, so the record cannot show the runner registered. A
+		// just-in-time runner takes its job as soon as it registers, so
+		// its job's start is the sign; its finish, or its task gone, is
+		// the backstop.
 		if t.pending {
 			_, took := s.startedJobs[t.runner]
 			_, ended := s.finished[t.runner]
-			if !took && !ended {
-				ref, err := s.JIT.GetRunnerByName(ctx, t.runner)
-				if err != nil {
-					s.Log.Warn("could not see whether a runner registered", "runner", t.runner, "error", err.Error())
-				}
-				took = ref != nil
-			}
 			if took || ended {
 				s.deleteObject(ctx, t)
 			}
@@ -327,9 +324,8 @@ type laterConfig struct {
 // firstConfig is what a task's parameter holds: its first config, and the
 // URL to its object.
 type firstConfig struct {
-	Runner    string `json:"runner"`
-	JITConfig string `json:"jitconfig"`
-	URL       string `json:"url"`
+	laterConfig
+	URL string `json:"url"`
 }
 
 // hand writes a new runner's config to a waiting task's object, which the
@@ -474,7 +470,7 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("sign a task's config URL: %w", err)
 	}
-	value, err := json.Marshal(firstConfig{Runner: runner, JITConfig: jit, URL: signed.URL})
+	value, err := json.Marshal(firstConfig{laterConfig{Runner: runner, JITConfig: jit}, signed.URL})
 	if err != nil {
 		return err
 	}

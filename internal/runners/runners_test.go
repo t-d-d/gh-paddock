@@ -219,25 +219,15 @@ func (f *fakeAWS) setLastStatus(status string) {
 	}
 }
 
-type fakeJIT struct {
-	calls      []string
-	registered map[string]bool
-}
+type fakeJIT struct{ calls []string }
 
 func (j *fakeJIT) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerScaleSetJitRunnerSetting, id int) (*scaleset.RunnerScaleSetJitRunnerConfig, error) {
 	j.calls = append(j.calls, s.Name)
 	return &scaleset.RunnerScaleSetJitRunnerConfig{EncodedJITConfig: "jit-for-" + s.Name}, nil
 }
 
-func (j *fakeJIT) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
-	if !j.registered[name] {
-		return nil, nil
-	}
-	return &scaleset.RunnerReference{ID: 1, Name: name}, nil
-}
-
 func newScaler(f *fakeAWS, pool repos.Pool) (*Scaler, *fakeJIT) {
-	jit := &fakeJIT{registered: map[string]bool{}}
+	jit := &fakeJIT{}
 	return &Scaler{
 		ECS: f, SSM: f, JIT: jit, Objects: f, Presigner: f,
 		Launch: Launch{

@@ -44,7 +44,6 @@ type ScaleSets interface {
 	CreateRunnerScaleSet(ctx context.Context, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	UpdateRunnerScaleSet(ctx context.Context, id int, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
-	GetRunnerByName(ctx context.Context, name string) (*scaleset.RunnerReference, error)
 	OpenSession(ctx context.Context, scaleSetID int, owner string) (Session, error)
 }
 

@@ -25,6 +25,10 @@ const entrypoint = inline?.[2] ?? '';
 const fakeRun = `#!/bin/bash
 set -eu
 echo "run $ACTIONS_RUNNER_INPUT_JITCONFIG" >> "$FAKE_LOG"
+if [ -n "\${FAKE_HOLD:-}" ]; then
+  trap 'echo "term" >> "$FAKE_LOG"; exit 143' TERM
+  sleep 30 & wait $!
+fi
 for f in _work/widgets/widgets/checkout.txt _work/_temp/temp.txt _work/_actions/a/action.yml tmp/job.txt \\
          _work/_tool/node/cached .npm/cached go/pkg/mod/cached .runner; do
   if [ -e "$FAKE_ROOT/home/$f" ] || [ -e "$FAKE_ROOT/$f" ]; then echo "  sees $f" >> "$FAKE_LOG"; fi
@@ -65,7 +69,7 @@ class ConfigURL {
 
 type Run = { code: number | null; log: string[]; seconds: number; root: string };
 
-async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: number; exit?: number } = {}): Promise<Run> {
+async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: number; exit?: number; term?: boolean } = {}): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), 'paddock-entrypoint-'));
   const home = join(root, 'home');
   mkdirSync(join(root, 'tmp'), { recursive: true });
@@ -92,11 +96,23 @@ async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: nu
         FAKE_ROOT: root,
         FAKE_URL_HOST: url.host,
         FAKE_EXIT: String(opts.exit ?? 0),
+        FAKE_HOLD: opts.term ? '1' : '',
         PADDOCK_CONFIG_WAIT: String(opts.wait ?? 2),
         PADDOCK_CONFIG: JSON.stringify({ runner: 'paddock-first', jitconfig: 'jit-first', url: url.url }),
       },
     });
     child.on('exit', (c) => done(c));
+    // ECS stops a task with SIGTERM to its first process: send it once the
+    // runner is running.
+    if (opts.term) {
+      const poll = setInterval(() => {
+        if (readFileSync(log, 'utf-8').includes('run jit-first')) {
+          clearInterval(poll);
+          setTimeout(() => child.kill('SIGTERM'), 200);
+        }
+      }, 50);
+      child.on('exit', () => clearInterval(poll));
+    }
   });
   const result = { code, log: readFileSync(log, 'utf-8').split('\n').filter(Boolean), seconds: (Date.now() - started) / 1000, root };
   rmSync(root, { recursive: true, force: true });
@@ -136,6 +152,12 @@ describe('the runner image\'s entrypoint', () => {
     assert.equal(r.code, 0);
     assert.deepEqual(runs(r), ['run jit-first']);
     assert.ok(r.seconds < 10, `waited ${r.seconds}s after a refusal`);
+  });
+
+  test('treats a config with no just-in-time config as none, and runs nothing for it', async () => {
+    const r = await runEntrypoint(url, [{ status: 200, body: { runner: 'paddock-second' } }], { wait: 1 });
+    assert.equal(r.code, 0);
+    assert.deepEqual(runs(r), ['run jit-first']);
   });
 
   test('keeps waiting through a network failure or a server error', async () => {
@@ -193,6 +215,14 @@ describe('fitness: a task exits only with no runner registered (remove-then-term
     assert.deepEqual(events.slice(0, firstPoll), ['run jit-first', 'end']);
     const second = events.indexOf('run jit-paddock-second');
     assert.equal(events.slice(second).indexOf('end'), 1, events.join(' '));
+  });
+
+  test('a stop passes to the running runner, and the task exits once it has, with no wait for another config', async () => {
+    const r = await runEntrypoint(url, [config('paddock-second')], { term: true });
+    assert.ok(r.log.includes('term'), `the runner was not told to stop: ${r.log.join(' | ')}`);
+    assert.equal(r.code, 143);
+    assert.deepEqual(runs(r), ['run jit-first']);
+    assert.equal(url.requests.length, 0);
   });
 
   test('a runner that fails ends the task, with no wait for another config', async () => {

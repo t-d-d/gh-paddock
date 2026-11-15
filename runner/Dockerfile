@@ -49,8 +49,9 @@ set -euo pipefail
 
 wait_for=${PADDOCK_CONFIG_WAIT:-30}
 first=${PADDOCK_CONFIG:?the task was given no config}
-# The URL reads the task's later configs: keep it out of every runner's
-# environment.
+# The URL reads the task's later configs: keep it out of the runners'
+# environment. A job can still read this process's first environment, but
+# only a job of the same pool, which is the boundary (pool-per-repo.md).
 unset PADDOCK_CONFIG PADDOCK_CONFIG_WAIT
 url=$(jq -er .url <<<"$first")
 runner=$(jq -er .runner <<<"$first")
@@ -76,15 +77,18 @@ wipe() {
 # no config yet, and so is a server error or a network failure; any other
 # refusal ends the wait.
 next_config() {
-  local deadline=$((SECONDS + wait_for)) body code name
+  local deadline=$((SECONDS + wait_for)) body code name next
   body=$(mktemp)
   while ((SECONDS < deadline)); do
     code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 5 "$url" 2>/dev/null) || code=000
     case $code in
       200)
         name=$(jq -r '.runner // empty' "$body" 2>/dev/null) || name=""
-        if [ -n "$name" ] && [[ $ran != *" $name "* ]]; then
-          jit=$(jq -er .jitconfig "$body")
+        # This runs under ||, where set -e does not hold, so a config with
+        # no just-in-time config is checked here and counts as none.
+        if [ -n "$name" ] && [[ $ran != *" $name "* ]] &&
+          next=$(jq -er '.jitconfig | select(type == "string" and length > 0)' "$body" 2>/dev/null); then
+          jit=$next
           runner=$name
           ran="$ran$name "
           rm -f "$body"
@@ -105,12 +109,31 @@ next_config() {
   return 1
 }
 
+# ECS stops a task with SIGTERM to this script alone, which as process 1
+# ignores any signal it has no handler for. The signal goes on to run.sh,
+# whose own trap stops the runner, and the task exits once run.sh has.
+child=""
+stop() {
+  trap - TERM INT
+  if [ -n "$child" ]; then
+    kill -TERM "$child" 2>/dev/null || true
+    wait "$child" || true
+  fi
+  exit 143
+}
+trap stop TERM INT
+
 while :; do
   wipe
   echo "paddock: starting runner $runner"
   # run.sh registers the runner, runs one job, and leaves GitHub before it
   # returns, so the task never waits or exits with a runner registered.
-  ACTIONS_RUNNER_INPUT_JITCONFIG=$jit "$HOME/run.sh" || exit $?
+  ACTIONS_RUNNER_INPUT_JITCONFIG=$jit "$HOME/run.sh" &
+  child=$!
+  code=0
+  wait "$child" || code=$?
+  child=""
+  ((code == 0)) || exit "$code"
   next_config || exit 0
 done
 PADDOCK_ENTRYPOINT

@@ -153,7 +153,10 @@ func TestNoConfigIsHandedToATaskPastTheWarmLimit(t *testing.T) {
 	}
 }
 
-func TestALaterConfigsObjectIsDeletedOnceItsRunnerRegisters(t *testing.T) {
+// GitHub keeps a record of a runner as soon as its config is made, so the
+// record does not show it registered. A just-in-time runner takes its job
+// as it registers: the job's start is the sign.
+func TestALaterConfigsObjectIsDeletedOnceItsRunnerRegistersAndTakesItsJob(t *testing.T) {
 	f := newFakeAWS()
 	s, jit := newScaler(f, spotTest)
 	withClock(s)
@@ -166,24 +169,6 @@ func TestALaterConfigsObjectIsDeletedOnceItsRunnerRegisters(t *testing.T) {
 	if _, ok := f.object(t, objectKey(first)); !ok {
 		t.Fatal("the config was deleted before its runner registered")
 	}
-	jit.registered[jit.calls[1]] = true
-	mustScale(t, s, nil)
-	if _, ok := f.object(t, objectKey(first)); ok {
-		t.Fatal("the config is kept after its runner registered")
-	}
-}
-
-// A runner that takes its job and leaves between two polls is never seen
-// registered, but its job's start shows it did.
-func TestALaterConfigsObjectIsDeletedOnceItsRunnersJobStarts(t *testing.T) {
-	f := newFakeAWS()
-	s, jit := newScaler(f, spotTest)
-	withClock(s)
-	mustScale(t, s, assigned(1))
-	f.setLastStatus("RUNNING")
-	first := jit.calls[0]
-	mustScale(t, s, finished(1, first))
-
 	mustScale(t, s, started(1, jit.calls[1]))
 	if _, ok := f.object(t, objectKey(first)); ok {
 		t.Fatal("the config is kept after its runner took a job")
