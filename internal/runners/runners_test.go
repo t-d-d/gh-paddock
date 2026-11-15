@@ -384,6 +384,50 @@ func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
 // A runner task reads only its own config: its JIT config sits in its own
 // parameter, which ECS injects from its own task definition, and the task
 // holds no role of its own to read any other.
+
+// Cost Explorer reads a repo's and a pool's runner cost from these two
+// tags, once the operator turns them on as cost allocation tags. A task
+// started without them shows as cost of no repo.
+func TestEveryRunnerTaskIsTaggedWithItsRepoAndPool(t *testing.T) {
+	pools := []repos.Pool{spotTest, {Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10}}
+	for _, pool := range pools {
+		t.Run(pool.Name, func(t *testing.T) {
+			f := newFakeAWS()
+			s, _ := newScaler(f, pool)
+			s.Repo = repos.Repo{Owner: "acme", Name: "gadgets"}
+			ctx := context.Background()
+			if err := s.Scale(ctx, assigned(3)); err != nil {
+				t.Fatal(err)
+			}
+			// The tasks finish, and the next jobs get new ones.
+			f.stopAll()
+			if err := s.Scale(ctx, assigned(2)); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.runs) != 5 {
+				t.Fatalf("started %d tasks, want 5", len(f.runs))
+			}
+			want := func(what string, tags []ecstypes.Tag) {
+				t.Helper()
+				got := map[string]string{}
+				for _, tag := range tags {
+					got[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+				}
+				if got["paddock:repo"] != "acme/gadgets" || got["paddock:pool"] != pool.Name {
+					t.Fatalf("%s tagged %v, want paddock:repo acme/gadgets and paddock:pool %s", what, got, pool.Name)
+				}
+			}
+			for i, run := range f.runs {
+				want(fmt.Sprintf("task %d", i+1), run.Tags)
+				def := f.defs[aws.ToString(run.TaskDefinition)]
+				if def == nil {
+					t.Fatalf("task %d ran a definition that was not registered", i+1)
+				}
+				want(fmt.Sprintf("task %d's definition", i+1), def.Tags)
+			}
+		})
+	}
+}
 func TestARunnerTaskGetsOnlyItsOwnConfig(t *testing.T) {
 	t.Run("fitness: a runner task reads only its own config and holds no role (runner-isolation.md)", func(t *testing.T) {
 		f := newFakeAWS()
