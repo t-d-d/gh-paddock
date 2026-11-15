@@ -360,10 +360,7 @@ func TestAnAssignedJobStartsARunnerTaskOfThePoolsCapacityAndSize(t *testing.T) {
 		if vpc.AssignPublicIp != ecstypes.AssignPublicIpEnabled || len(vpc.Subnets) != 2 || vpc.SecurityGroups[0] != "sg-1" {
 			t.Fatalf("network %+v", vpc)
 		}
-		tags := map[string]string{}
-		for _, tag := range run.Tags {
-			tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
-		}
+		tags := tagMap(run.Tags)
 		if tags["paddock:repo"] != "acme/widgets" || tags["paddock:pool"] != "dev" || tags["paddock:runner"] != jit.calls[0] {
 			t.Fatalf("tags %v", tags)
 		}
@@ -381,9 +378,14 @@ func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
 	}
 }
 
-// A runner task reads only its own config: its JIT config sits in its own
-// parameter, which ECS injects from its own task definition, and the task
-// holds no role of its own to read any other.
+// tagMap reads tags as a map of key to value.
+func tagMap(tags []ecstypes.Tag) map[string]string {
+	m := map[string]string{}
+	for _, tag := range tags {
+		m[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+	}
+	return m
+}
 
 // Cost Explorer reads a repo's and a pool's runner cost from these two
 // tags, once the operator turns them on as cost allocation tags. A task
@@ -391,7 +393,7 @@ func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
 func TestEveryRunnerTaskIsTaggedWithItsRepoAndPool(t *testing.T) {
 	pools := []repos.Pool{spotTest, {Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10}}
 	for _, pool := range pools {
-		t.Run(pool.Name, func(t *testing.T) {
+		t.Run("fitness: every runner task of a "+pool.Name+" pool is tagged with its repo and pool (pool-per-repo.md)", func(t *testing.T) {
 			f := newFakeAWS()
 			s, _ := newScaler(f, pool)
 			s.Repo = repos.Repo{Owner: "acme", Name: "gadgets"}
@@ -409,10 +411,7 @@ func TestEveryRunnerTaskIsTaggedWithItsRepoAndPool(t *testing.T) {
 			}
 			want := func(what string, tags []ecstypes.Tag) {
 				t.Helper()
-				got := map[string]string{}
-				for _, tag := range tags {
-					got[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
-				}
+				got := tagMap(tags)
 				if got["paddock:repo"] != "acme/gadgets" || got["paddock:pool"] != pool.Name {
 					t.Fatalf("%s tagged %v, want paddock:repo acme/gadgets and paddock:pool %s", what, got, pool.Name)
 				}
@@ -428,6 +427,10 @@ func TestEveryRunnerTaskIsTaggedWithItsRepoAndPool(t *testing.T) {
 		})
 	}
 }
+
+// A runner task reads only its own config: its JIT config sits in its own
+// parameter, which ECS injects from its own task definition, and the task
+// holds no role of its own to read any other.
 func TestARunnerTaskGetsOnlyItsOwnConfig(t *testing.T) {
 	t.Run("fitness: a runner task reads only its own config and holds no role (runner-isolation.md)", func(t *testing.T) {
 		f := newFakeAWS()

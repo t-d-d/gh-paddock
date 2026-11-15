@@ -51,13 +51,13 @@ From then on every green merge to main deploys. The operator guide comes with v1
 
 ## Cost per repo
 
-The listener tags every runner task it starts with two keys. `paddock:repo` holds the repo as `owner/name`, and `paddock:pool` holds the pool's name. Cost Explorer can split the tasks' Fargate cost by either key once both are cost allocation tags. To turn them on:
+Of the tags the listener puts on every runner task it starts, two say whose cost it is. `paddock:repo` holds the repo as `owner/name`, and `paddock:pool` holds the pool's name. Cost Explorer can split the tasks' Fargate cost by either key once both are cost allocation tags. To turn them on:
 
 1. Sign in to the organisation's management account. If the CI account is in an AWS Organization, only that account can turn on cost allocation tags. A standalone CI account is its own management account.
 2. Open Billing and Cost Management, then Cost allocation tags, and find `paddock:repo` and `paddock:pool` under the user-defined tags. A key shows there only after a task carrying it has run, which can take up to 24 hours.
 3. Select both keys and choose Activate. AWS takes up to 24 hours to apply them.
 
-To read cost per repo, open Cost Explorer, filter Service to Elastic Container Service, and group by the tag `paddock:repo`. To split one repo's cost by pool, filter that tag to the repo and group by `paddock:pool`. The listener's own task, its logs, Parameter Store and the tasks' public IPv4 addresses carry neither tag, so they show as cost of no repo.
+To read cost per repo, open Cost Explorer, filter Service to EC2 Container Service, which is how Cost Explorer names ECS. Group by the tag `paddock:repo`. To split one repo's cost by pool, filter that tag to the repo and group by `paddock:pool`. The listener's own task, the listener's and the runners' logs, Parameter Store, the runner-config bucket and the tasks' public IPv4 addresses carry neither tag, so they show as cost of no repo.
 
 ## Licence
 
