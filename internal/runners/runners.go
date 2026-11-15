@@ -621,7 +621,7 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 		Cpu:                     aws.String(strconv.Itoa(s.Pool.VCPU * 1024)),
 		Memory:                  aws.String(strconv.Itoa(s.Pool.MemoryGB * 1024)),
 		RuntimePlatform: &ecstypes.RuntimePlatform{
-			CpuArchitecture:       ecstypes.CPUArchitectureX8664,
+			CpuArchitecture:       cpuArchitecture(s.Pool.Arch),
 			OperatingSystemFamily: ecstypes.OSFamilyLinux,
 		},
 		ExecutionRoleArn: aws.String(s.Launch.ExecutionRoleARN),
@@ -691,6 +691,15 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 	started = true
 	arn := aws.ToString(out.Tasks[0].TaskArn)
 	// The caller's logger carries the repo and the pool.
-	s.Log.Info("runner task started", "runner", runner, "task", arn[strings.LastIndex(arn, "/")+1:], "capacity", provider)
+	s.Log.Info("runner task started", "runner", runner, "task", arn[strings.LastIndex(arn, "/")+1:], "capacity", provider, "arch", string(cpuArchitecture(s.Pool.Arch)))
 	return nil
+}
+
+// cpuArchitecture is the Fargate architecture of a pool's runner tasks. The
+// list gives every pool an arch, x64 unless it sets arm64.
+func cpuArchitecture(a repos.Arch) ecstypes.CPUArchitecture {
+	if a == repos.ARM64 {
+		return ecstypes.CPUArchitectureArm64
+	}
+	return ecstypes.CPUArchitectureX8664
 }

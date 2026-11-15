@@ -15,7 +15,9 @@ import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { workflow, codeOnly } = loadWorkflow('.github/workflows/deploy.yml');
 const steps = stepsOf(workflow, 'deploy');
-const runnerSteps = stepsOf(workflow, 'runner-image');
+const planSteps = stepsOf(workflow, 'runner-plan');
+const buildSteps = stepsOf(workflow, 'runner-build');
+const indexSteps = stepsOf(workflow, 'runner-image');
 const indexOf = (id: string) => steps.indexOf(stepById(steps, id));
 
 describe('fitness: only main deploys, one deploy at a time, after a green gate (deploy.md)', () => {
@@ -27,8 +29,13 @@ describe('fitness: only main deploys, one deploy at a time, after a green gate (
 
   test('after a green gate, and only once the deploy role\'s secret is set', () => {
     assert.equal(workflow.jobs?.gate?.uses, './.github/workflows/gate.yml');
-    assert.deepEqual(workflow.jobs?.['runner-image']?.needs, ['gate', 'role']);
-    assert.equal(workflow.jobs?.['runner-image']?.if, "${{ needs.role.outputs.set == 'true' && !inputs.probe_only }}");
+    assert.deepEqual(workflow.jobs?.['runner-plan']?.needs, ['gate', 'role']);
+    assert.equal(workflow.jobs?.['runner-plan']?.if, "${{ needs.role.outputs.set == 'true' && !inputs.probe_only }}");
+    // Each later runner job waits on the plan, so a skipped plan skips them.
+    assert.deepEqual(workflow.jobs?.['runner-build']?.needs, ['runner-plan']);
+    assert.equal(workflow.jobs?.['runner-build']?.if, undefined);
+    assert.deepEqual(workflow.jobs?.['runner-image']?.needs, ['runner-plan', 'runner-build']);
+    assert.equal(workflow.jobs?.['runner-image']?.if, undefined);
     assert.deepEqual(workflow.jobs?.deploy?.needs, ['gate', 'role', 'runner-image']);
     // A probe-only run skips the runner's image, and must still probe; any
     // other run needs the runner's image built.
@@ -226,32 +233,113 @@ describe('fitness: the image tag hashes exactly what the image is built from (de
   });
 });
 
-describe('fitness: the runner\'s image is built on x64 under a tag of its own, from its Dockerfile alone (deploy.md)', () => {
-  test('on a GitHub-hosted x64 runner, for linux/amd64', () => {
-    assert.equal(workflow.jobs?.['runner-image']?.['runs-on'], 'ubuntu-24.04');
-    const image = stepById(runnerSteps, 'image');
+describe('fitness: the runner\'s image is built for x64 and arm64, each on a runner of that architecture, and handed on as one index (deploy.md)', () => {
+  test('a job per architecture, each on a GitHub-hosted runner of that architecture, never under emulation', () => {
+    const job = workflow.jobs?.['runner-build'];
+    assert.equal(job?.['runs-on'], '${{ matrix.runs-on }}');
+    assert.deepEqual(job?.strategy?.matrix, {
+      include: [
+        { arch: 'x64', 'runs-on': 'ubuntu-24.04', platform: 'linux/amd64' },
+        { arch: 'arm64', 'runs-on': 'ubuntu-24.04-arm', platform: 'linux/arm64' },
+      ],
+    });
+    const image = stepById(buildSteps, 'image');
     assert.equal(image.uses, './.github/actions/image');
     assert.equal(image.with?.dockerfile, 'runner/Dockerfile');
     assert.equal(image.with?.repo_name, 'paddock-runner');
-    assert.equal(image.with?.platform, 'linux/amd64');
-    assert.equal(image.with?.image_tag, '${{ steps.plan.outputs.image_tag }}');
+    assert.equal(image.with?.platform, '${{ matrix.platform }}');
+    assert.equal(image.with?.image_tag, '${{ needs.runner-plan.outputs.image_tag }}-${{ matrix.arch }}');
+    assert.equal(image.with?.cache_scope, 'runner-${{ matrix.arch }}');
+    assert.equal(image.with?.compression, 'zstd');
   });
 
   test('its tag hashes runner/, which holds the Dockerfile and nothing it copies from elsewhere', () => {
     const dockerfile = readFileSync(resolve(REPO_ROOT, 'runner/Dockerfile'), 'utf-8');
     assert.doesNotMatch(dockerfile, /^(ADD|COPY) (?!--from)/m, 'the runner\'s image copies nothing from the repo');
-    const run = stepById(runnerSteps, 'plan').run?.replace(/\\\n/g, ' ').replace(/\s+/g, ' ') ?? '';
+    const run = stepById(planSteps, 'plan').run?.replace(/\\\n/g, ' ').replace(/\s+/g, ' ') ?? '';
     assert.match(run, /git ls-tree -r HEAD -- runner \|/);
+    assert.deepEqual(workflow.jobs?.['runner-plan']?.outputs, { image_tag: '${{ steps.plan.outputs.image_tag }}' });
   });
 
   // A job output that holds a masked string is dropped, and the image URI
   // carries the account id, which the credentials step masks. The job hands
   // on the digest, and the deploy job builds the URI from its own registry.
-  test('hands the deploy job the digest alone, which it joins to its own registry', () => {
-    assert.deepEqual(workflow.jobs?.['runner-image']?.outputs, { digest: '${{ steps.digest.outputs.digest }}' });
+  test('hands the deploy job the index\'s digest alone, which it joins to its own registry', () => {
+    assert.deepEqual(workflow.jobs?.['runner-image']?.outputs, { digest: '${{ steps.index.outputs.digest }}' });
+    assert.equal(stepById(indexSteps, 'index').env?.TAG, '${{ needs.runner-plan.outputs.image_tag }}');
     const runner = stepById(steps, 'runner');
     assert.equal(runner.env?.DIGEST, '${{ needs.runner-image.outputs.digest }}');
     assert.match(runner.run ?? '', /paddock-runner@\$\{DIGEST\}/);
+  });
+
+  // Runs the index step as Actions runs it, with `aws` and `docker` replaced
+  // by stubs. `tags` maps a tag in the registry to its digest; a tag not in
+  // it is not found, unless `denied`, when every read is refused.
+  const runIndex = (tags: Record<string, string>, opts: { denied?: boolean; created?: string } = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'deploy-index-'));
+    try {
+      const calls = join(dir, 'calls');
+      const output = join(dir, 'output');
+      const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") echo "${digest}"; exit 0 ;;`).join('\n');
+      writeFileSync(join(dir, 'aws'), `#!/bin/bash
+echo "aws $*" >> "$CALLS"
+case "$1 $2" in
+  "ecr describe-images")
+    ${opts.denied ? 'echo "An error occurred (AccessDeniedException)" >&2; exit 254' : ''}
+    tag=""; for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; esac; done
+    if [ -f "$CREATED" ] && [ "$tag" = "$(cat "$CREATED")" ]; then echo "${opts.created ?? ''}"; exit 0; fi
+    case "$tag" in
+${table}
+    esac
+    echo "An error occurred (ImageNotFoundException)" >&2; exit 254 ;;
+  "sts get-caller-identity") echo the-account ;;
+  "ecr get-login-password") echo token ;;
+esac
+`, { mode: 0o755 });
+      writeFileSync(join(dir, 'docker'), `#!/bin/bash
+echo "docker $*" >> "$CALLS"
+if [ "$1 $2 $3" = "buildx imagetools create" ]; then t="$5"; echo "\${t##*:}" > "$CREATED"; fi
+cat > /dev/null
+`, { mode: 0o755 });
+      const result = spawnSync('bash', ['-e', '-c', stepById(indexSteps, 'index').run ?? ''], {
+        env: { PATH: `${dir}:${process.env.PATH}`, CALLS: calls, CREATED: join(dir, 'created'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
+        stdio: 'pipe',
+        input: '',
+      });
+      const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n') : [];
+      const out = existsSync(output) ? readFileSync(output, 'utf-8') : '';
+      return { status: result.status, lines, out, stderr: result.stderr.toString() };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const d = (c: string) => `sha256:${c.repeat(64)}`;
+
+  test('joins both architectures\' images under the plan\'s tag, and hands on the index\'s digest', () => {
+    const { status, lines, out, stderr } = runIndex({ 'abc-x64': d('1'), 'abc-arm64': d('2') }, { created: d('3') });
+    assert.equal(status, 0, stderr);
+    const create = lines.find((l) => l.startsWith('docker buildx imagetools create'));
+    assert.equal(
+      create,
+      `docker buildx imagetools create --tag the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner:abc the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner@${d('1')} the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner@${d('2')}`,
+    );
+    assert.equal(out, `digest=${d('3')}\n`);
+  });
+
+  test('reuses an index already under the tag, and joins nothing', () => {
+    const { status, lines, out, stderr } = runIndex({ abc: d('4'), 'abc-x64': d('1'), 'abc-arm64': d('2') });
+    assert.equal(status, 0, stderr);
+    assert.ok(!lines.some((l) => l.startsWith('docker')), lines.join('\n'));
+    assert.equal(out, `digest=${d('4')}\n`);
+  });
+
+  test('fails, handing on nothing, when an architecture\'s image is missing or the registry refuses a read', () => {
+    for (const [tags, opts] of [[{ 'abc-x64': d('1') }, {}], [{ 'abc-arm64': d('2') }, {}], [{ 'abc-x64': d('1'), 'abc-arm64': d('2') }, { denied: true }]] as const) {
+      const { status, lines, out } = runIndex(tags, opts);
+      assert.notEqual(status, 0, JSON.stringify(tags));
+      assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
+      assert.equal(out, '');
+    }
   });
 });
 

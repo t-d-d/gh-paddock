@@ -186,7 +186,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
 {"repos": [
   {"repo": "acme/widgets", "pools": [
     {"name": "test", "capacity": "spot"},
-    {"name": "dev", "capacity": "on-demand", "vcpu": 4, "memoryGb": 16, "maxRunners": 5, "maxJobMinutes": 60}
+    {"name": "dev", "capacity": "on-demand", "arch": "arm64", "vcpu": 4, "memoryGb": 16, "maxRunners": 5, "maxJobMinutes": 60}
   ]},
   {"repo": "acme/gadgets", "pools": [{"name": "test", "capacity": "spot"}]}
 ]}
@@ -194,6 +194,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
 
 - `repo` is `owner/name`. The App must be installed on the owner, which must be an org, and the repo must be private.
 - Each pool has a `name` of lowercase letters, digits and hyphens, starting with a letter, at most 20 characters, and a `capacity`, `spot` or `on-demand`. Spot suits a pool where a red run is cheap, such as tests. On-demand suits one where a job must not be cut off, such as a deploy.
+- A pool may set `arch`, `x64` or `arm64`, which defaults to `x64`. An arm64 vCPU on Fargate is a whole core and costs less than an x64 one, which is half a core, so an arm64 pool may need half the vCPUs for the same work. Move a job to an arm64 pool only once it runs on GitHub's arm runners.
 - A pool may set `vcpu` and `memoryGb`, which default to 2 and 8, as GitHub's runners for private repos, and the pair must be a Fargate task size. `maxRunners` defaults to 10 and may be up to 100. More jobs than that wait in GitHub. `maxJobMinutes`, the longest a job of the pool should run, defaults to 120.
 - Each pool gets a scale set and a runner group in the org, both named `paddock-<repo>-<pool>`, where `<repo>` is the repo's name in lowercase with any run of other characters as one hyphen and no hyphen at either end. A workflow's `runs-on` names it. Two repos of one org whose names fold to the same scale set cannot both be served, and the later entry is skipped. `acme/widgets`'s pools above are `paddock-widgets-test` and `paddock-widgets-dev`.
 - A pool's tasks only ever run that pool's jobs, so a repo's code and credentials never share a task with another repo's.
@@ -220,7 +221,7 @@ A pool is the boundary between runs, so give each set of credentials its own poo
     runs-on: ${{ github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork && vars.PADDOCK_TEST_RUNNER || 'ubuntu-24.04' }}
 ```
 
-Move only Linux x64 jobs that need no Docker daemon, no KVM and no Android SDK. A runner task is a Fargate task, with no Docker daemon and no `/dev/kvm`. The image is GitHub's runner image plus the AWS CLI, jq, zip, Python 3 and the libraries Chromium needs. Keep an arm job's fallback on arm.
+Move only Linux jobs that need no Docker daemon, no KVM and no Android SDK. A runner task is a Fargate task, with no Docker daemon and no `/dev/kvm`. The image is GitHub's runner image plus the AWS CLI, jq, zip, Python 3 and the libraries Chromium needs. Put an arm job on an arm64 pool, and keep its fallback on arm.
 
 #### The kill switch
 

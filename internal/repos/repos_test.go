@@ -30,7 +30,7 @@ func TestAPoolTakesGitHubsPrivateRunnerSizeTenRunnersAndTwoHourJobsByDefault(t *
 	if repo.Owner != "acme" || repo.Name != "widgets" {
 		t.Fatalf("repo %+v", repo)
 	}
-	want := Pool{Name: "test", Capacity: Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10, MaxJob: 2 * time.Hour}
+	want := Pool{Name: "test", Capacity: Spot, Arch: X64, VCPU: 2, MemoryGB: 8, MaxRunners: 10, MaxJob: 2 * time.Hour}
 	if len(repo.Pools) != 1 || repo.Pools[0] != want {
 		t.Fatalf("pools %+v, want %+v", repo.Pools, want)
 	}
@@ -38,13 +38,25 @@ func TestAPoolTakesGitHubsPrivateRunnerSizeTenRunnersAndTwoHourJobsByDefault(t *
 
 func TestAPoolSetsItsOwnCapacitySizeMaximumAndJobTime(t *testing.T) {
 	list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [
-		{"name": "dev", "capacity": "on-demand", "vcpu": 4, "memoryGb": 16, "maxRunners": 3, "maxJobMinutes": 45}]}]}`)
+		{"name": "dev", "capacity": "on-demand", "arch": "arm64", "vcpu": 4, "memoryGb": 16, "maxRunners": 3, "maxJobMinutes": 45}]}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Pool{Name: "dev", Capacity: OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 3, MaxJob: 45 * time.Minute}
+	want := Pool{Name: "dev", Capacity: OnDemand, Arch: ARM64, VCPU: 4, MemoryGB: 16, MaxRunners: 3, MaxJob: 45 * time.Minute}
 	if got := list.Repos[0].Pools[0]; got != want {
 		t.Fatalf("pool %+v, want %+v", got, want)
+	}
+}
+
+func TestAPoolNamesX64OrArm64AsItsArchitecture(t *testing.T) {
+	for raw, want := range map[string]Arch{`"x64"`: X64, `"arm64"`: ARM64} {
+		list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spot", "arch": ` + raw + `}]}]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(list.Repos) != 1 || list.Repos[0].Pools[0].Arch != want {
+			t.Fatalf("%s: repos %+v, skipped %v", raw, list.Repos, list.Skipped)
+		}
 	}
 }
 
@@ -64,6 +76,8 @@ func TestABadRepoIsSkippedWithItsReasonAndTheRestServed(t *testing.T) {
 		`{"repo": "acme/x", "pools": [{"name": "Test!", "capacity": "spot"}]}`:                                      "pool name",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot"}, {"name": "test", "capacity": "spot"}]}`: "twice",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "vcpu": 3}]}`:                            "size",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "arch": "amd64"}]}`:                      "arch",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "arch": ""}]}`:                           "arch",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "vcpu": 1, "memoryGb": 16}]}`:            "size",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": -1}]}`:                     "maxRunners",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": 101}]}`:                    "maxRunners",

@@ -24,10 +24,13 @@ running stops them all, and nobody watches the deploy as it happens.
 - The listener's image tag is a hash of exactly the files the listener's
   Dockerfile copies, and the Dockerfile. An unchanged listener reuses its
   image; the registry's tags are immutable.
-- The runner's image is built on a GitHub-hosted x64 runner, in a job of its
-  own, under a tag that hashes runner/, whose Dockerfile copies nothing from
-  the repo. That job hands the deploy job the image's digest alone, and the
-  stack takes the image as a second parameter, `RunnerImageUri`.
+- The runner's image is built in a job per architecture, x64 and arm64,
+  each on a GitHub-hosted runner of that architecture, under a tag that
+  hashes runner/ with the architecture after it. runner/'s Dockerfile copies
+  nothing from the repo. A job of its own joins the two under one image
+  index at the bare tag and hands the deploy job the index's digest alone.
+  The stack takes it as a second parameter, `RunnerImageUri`, so both
+  architectures roll back together as one image.
 - The listener's service stops the old task before it starts the new one
   (minimum healthy 0%, maximum 100%): GitHub allows one message session per
   scale set. Jobs wait in GitHub for the minute between.
@@ -55,7 +58,8 @@ running stops them all, and nobody watches the deploy as it happens.
 ## Examples
 
 - The `fitness: … (deploy.md)` suites in test/deploy-workflow.test.ts hold
-  the order, the rollback's conditions and both images' tags.
+  the order, the rollback's conditions, both images' tags, and the runner's
+  index of both architectures.
 - test/stack.test.ts holds the circuit breaker, the old task stopping first
   and the health check, and test/probe.test.ts the probe's judgment and
   exit code.
@@ -68,12 +72,12 @@ running stops them all, and nobody watches the deploy as it happens.
   probe-only run: the rollback would re-apply what is already running.
 - Do not start the new listener beside the old one: GitHub refuses the new
   one's sessions until the old one stops.
-- Do not build the runner's image under emulation on the arm64 deploy job:
-  it triples the build, and the runners are x64.
+- Do not build either architecture's runner image under emulation: it
+  triples the build. Each builds on a runner of its own architecture.
 - Do not let a deploy cancel one in progress: a cancelled apply can leave
   the stack mid-update.
 - Do not hash a file list by hand that drifts from the Dockerfile: a file
   copied but not hashed ships under an old tag.
 
 Judgment: whether the probe proves enough of the listener's work grows with the listener; the tests pin only what it checks today. A healthy task has reached GitHub with the App key, but the probe sees nothing of a runner task, so a broken runner image passes it.
-History: Set with the repo's scaffold, November 2026, under PRD #1. Modelled on gh-governor's deploy. The old task stopping first, the runner's image and the two-image rollback came with #16, settled in PRD #1.
+History: Set with the repo's scaffold, November 2026, under PRD #1. Modelled on gh-governor's deploy. The old task stopping first, the runner's image and the two-image rollback came with #16, settled in PRD #1. #70 built the runner's image for x64 and arm64 and joined them under one index.

@@ -166,12 +166,31 @@ describe('the gate', () => {
     assert.match(runs, /grep -q '"msg":"listener started"'/);
   });
 
-  test('fitness: the gate builds the runner\'s image on x64 and starts its runner (runner-image.md)', () => {
-    assert.equal(workflow.jobs?.['runner-image']?.['runs-on'], 'ubuntu-24.04');
-    const runs = stepsOf(workflow, 'runner-image').map((s) => s.run ?? '').join('\n');
-    assert.match(runs, /docker build --platform linux\/amd64 --file runner\/Dockerfile/);
+  // One job per architecture, each on a GitHub runner of that architecture:
+  // a build under emulation is slow, and proves less.
+  test('fitness: the gate builds the runner\'s image on x64 and on arm64, each natively, and starts each one\'s runner (runner-image.md)', () => {
+    const job = workflow.jobs?.['runner-image'];
+    assert.equal(job?.['runs-on'], '${{ matrix.runs-on }}');
+    assert.deepEqual(job?.strategy?.matrix, {
+      include: [
+        { arch: 'x64', 'runs-on': 'ubuntu-24.04', platform: 'linux/amd64', machine: 'x86_64' },
+        { arch: 'arm64', 'runs-on': 'ubuntu-24.04-arm', platform: 'linux/arm64', machine: 'aarch64' },
+      ],
+    });
+    // One architecture's failure must not cancel the other's answer.
+    assert.equal(job?.strategy?.['fail-fast'], false);
+    assert.equal(job?.name, 'runner-image (${{ matrix.arch }})');
+    const steps = stepsOf(workflow, 'runner-image');
+    const runs = steps.map((s) => s.run ?? '').join('\n');
+    assert.match(runs, /docker build --platform "\$PLATFORM" --file runner\/Dockerfile/);
     assert.match(runs, /--entrypoint \/home\/runner\/bin\/Runner\.Listener \S+ --version/);
     for (const tool of ['aws --version', 'jq --version', 'zip -v', 'python3 --version']) assert.ok(runs.includes(tool), tool);
+    // The image the job built is the architecture it was asked for.
+    assert.match(runs, /test "\$\(uname -m\)" = "\$MACHINE"/);
+    for (const step of steps.filter((s) => s.run)) {
+      if (/\$PLATFORM/.test(step.run ?? '')) assert.equal(step.env?.PLATFORM, '${{ matrix.platform }}');
+      if (/\$MACHINE/.test(step.run ?? '')) assert.equal(step.env?.MACHINE, '${{ matrix.machine }}');
+    }
   });
 
   // The entrypoint is written inline in the Dockerfile, so only a real
@@ -188,9 +207,16 @@ describe('fitness: this repo\'s workflows run on GitHub\'s runners, never the on
     assert.ok(workflows.length > 0);
     for (const { file, workflow: w } of workflows) {
       const jobs = w.jobs ?? {};
-      for (const [name, job] of Object.entries(jobs) as [string, { 'runs-on'?: unknown; uses?: string }][]) {
+      for (const [name, job] of Object.entries(jobs) as [string, { 'runs-on'?: unknown; uses?: string; strategy?: { matrix?: { include?: Record<string, unknown>[] } } }][]) {
         if (job.uses) continue;
-        assert.match(String(job['runs-on']), /^ubuntu-(latest|\d{2}\.\d{2}(-arm)?)$/, `${file} ${name} runs on ${JSON.stringify(job['runs-on'])}`);
+        // A matrix job's runner is each of its entries' runners, and every
+        // entry must name one.
+        const key = /^\$\{\{\s*matrix\.([\w-]+)\s*\}\}$/.exec(String(job['runs-on']))?.[1];
+        const runners = key ? (job.strategy?.matrix?.include ?? []).map((entry) => entry[key]) : [job['runs-on']];
+        assert.ok(runners.length > 0, `${file} ${name} names no runner`);
+        for (const runner of runners) {
+          assert.match(String(runner), /^ubuntu-(latest|\d{2}\.\d{2}(-arm)?)$/, `${file} ${name} runs on ${JSON.stringify(runner)}`);
+        }
       }
     }
   });

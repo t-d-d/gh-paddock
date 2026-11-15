@@ -11,9 +11,9 @@ pull request or a deploy.
 - The list is the String parameter `/paddock/repos`, written by the
   operator. No stack creates it, and no stack takes a repo as a parameter.
 - Its value is one JSON object: `{"repos": [{"repo": "owner/name", "pools":
-  [{"name": "test", "capacity": "spot"}]}]}`. A pool may also set `vcpu`,
-  `memoryGb`, `maxRunners` and `maxJobMinutes`; they default to 2, 8, 10
-  and 120.
+  [{"name": "test", "capacity": "spot"}]}]}`. A pool may also set `arch`,
+  `vcpu`, `memoryGb`, `maxRunners` and `maxJobMinutes`; they default to
+  `x64`, 2, 8, 10 and 120. `arch` is `x64` or `arm64` (runner-image.md).
 - The listener reads the list on start and every two minutes after, and
   serves what changed with no restart. A missing or empty list serves
   nothing. An entry that is not valid is logged and skipped, and the rest
@@ -48,4 +48,4 @@ pull request or a deploy.
   carry every repo.
 
 Judgment: the listener's logs name the repo a line is about, so the operator can act on it. A log line pasted into a public issue needs its repo cut first.
-History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16. #19 added each pool's `maxJobMinutes`. #20 had the listener re-read the list while it runs, keep the last good one when a read fails, and drain a removed pool, as PRD #1's journeys 1 and 6 ask.
+History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16. #19 added each pool's `maxJobMinutes`. #20 had the listener re-read the list while it runs, keep the last good one when a read fails, and drain a removed pool, as PRD #1's journeys 1 and 6 ask. #70 added each pool's `arch`.

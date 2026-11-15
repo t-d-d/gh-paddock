@@ -130,7 +130,7 @@ func (m *Manager) Apply(ctx context.Context, list repos.List) {
 				sp.pool.Settings.Set(p)
 				sp.pool.Pool = p
 				m.Log.Info("pool settings changed", "repo", repo.FullName(), "pool", p.Name, "capacity", string(p.Capacity),
-					"vcpu", p.VCPU, "memoryGb", p.MemoryGB, "maxRunners", p.MaxRunners, "maxJob", p.MaxJob.String())
+					"arch", string(p.Arch), "vcpu", p.VCPU, "memoryGb", p.MemoryGB, "maxRunners", p.MaxRunners, "maxJob", p.MaxJob.String())
 			}
 		}
 	}
