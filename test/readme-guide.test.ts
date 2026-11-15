@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadTemplate, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
+import { loadWorkflow } from './helpers/workflow.ts';
 
 const readme = readFileSync(resolve(REPO_ROOT, 'README.md'), 'utf8');
 const guideStart = readme.indexOf('## Deploying your own');
@@ -28,8 +29,22 @@ describe('the README\'s operator guide', () => {
     for (const name of names) assert.ok(guide.includes(`\`${name}\``), `the guide names the alarm ${name}`);
   });
 
-  test('names every parameter the operator writes, and the deploy\'s secret', () => {
-    for (const value of ['/paddock/github-app', '/paddock/alert-email', '/paddock/repos', 'AWS_DEPLOY_ROLE_ARN']) {
+  test('names every parameter the operator writes, and every secret the deploy reads', () => {
+    const tpl = loadTemplate('infra/paddock.cfn.yml');
+    const raw = readFileSync(resolve(REPO_ROOT, 'infra/paddock.cfn.yml'), 'utf8');
+    // The stack reads these at deploy, or grants the listener a read of one
+    // named parameter. The listener writes /paddock/runners/* itself, so a
+    // wildcard path is left out.
+    const parameters = new Set([
+      ...Object.values(tpl.Parameters ?? {})
+        .filter((p) => p.Type?.startsWith('AWS::SSM::Parameter::Value') && typeof p.Default === 'string')
+        .map((p) => p.Default as string),
+      ...[...raw.matchAll(/:parameter(\/paddock\/[a-z0-9-]+)(?![a-z0-9/-])/g)].map((m) => m[1]!),
+    ]);
+    const { codeOnly } = loadWorkflow('.github/workflows/deploy.yml');
+    const secrets = new Set([...codeOnly.matchAll(/secrets\.([A-Z0-9_]+)/g)].map((m) => m[1]!));
+    assert.ok(parameters.size > 0 && secrets.size > 0);
+    for (const value of [...parameters, ...secrets]) {
       assert.ok(guide.includes(`\`${value}\``), `the guide names ${value}`);
     }
   });

@@ -52,6 +52,7 @@ Everything in AWS lives in us-east-1. Run each `aws` command below with `--regio
 
 1. Fork this repo. Keep its name and `main` as its default branch. Only a run on `main` can deploy.
 2. In the fork, open the Actions tab and turn workflows on. GitHub turns them off in a new fork.
+3. Disable the heartbeat and config check workflows in the fork's Actions tab. They check this repo's own governor, which your fork does not have, so heartbeat would fail every hour.
 
 Until you set the deploy's secret below, a push to `main` runs the gate and skips the deploy. The fork's own workflows run on GitHub's runners, never on the runners they deploy, because a pull request from a fork of yours must never reach your AWS account.
 
@@ -125,7 +126,7 @@ The fork needs one secret and no repository variables. In the fork's settings, o
 
 ### Deploy
 
-Open the fork's Actions tab, choose the Deploy workflow and run it on `main`. From then on every green push to `main` deploys, and nothing else does.
+Open the fork's Actions tab, choose the Deploy workflow and run it on `main`. From then on every green push to `main` deploys, as does a run by hand on `main`, and nothing else does.
 
 The deploy runs the gate, builds the listener's image and the runner's into ECR, applies the main stack, `infra/paddock.cfn.yml`, and probes the listener. The probe passes only once the listener has reached GitHub with the App's key, so a wrong key or App ID fails the deploy. A red probe rolls both images back to the last good ones.
 
@@ -173,7 +174,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
    ```
 
 4. Run the workflow by hand from the scratch repo's Actions tab. A runner task starts on Fargate Spot within about a minute, runs the job and exits. Its log is in the log group `/paddock/runners`.
-5. When the job is green, take the repo off the list. Write the list without it, or `{"repos": []}`. The listener deletes the pool's scale set once its last task has stopped. Its runner group stays in the org; delete it by hand under Runner groups. Then delete the scratch repo.
+5. When the job is green, take the repo off the list. Write the list without it, or `{"repos": []}`. The listener deletes the pool's scale set once its last task has stopped, and logs `scale set deleted`. Its runner group stays in the org. Delete it by hand under Runner groups only after that line. The listener finds a removed pool's scale set by its runner group, so a group deleted first leaves the scale set behind. Then delete the scratch repo.
 
 ### Serve a real repo
 
@@ -192,14 +193,14 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
 ```
 
 - `repo` is `owner/name`. The App must be installed on the owner, which must be an org, and the repo must be private.
-- Each pool has a `name` of lowercase letters, digits and hyphens, at most 20 characters, and a `capacity`, `spot` or `on-demand`. Spot suits a pool where a red run is cheap, such as tests. On-demand suits one where a job must not be cut off, such as a deploy.
-- A pool may set `vcpu` and `memoryGb`, which default to 2 and 8, as GitHub's runners for private repos; the pair must be a Fargate task size. `maxRunners` defaults to 10 and may be up to 100: more jobs than that wait in GitHub. `maxJobMinutes`, the longest a job of the pool should run, defaults to 120.
-- Each pool gets a scale set and a runner group in the org, both named `paddock-<repo>-<pool>`, where `<repo>` is the repo's name in lowercase with any run of other characters as one hyphen. A workflow's `runs-on` names it. `acme/widgets`'s pools above are `paddock-widgets-test` and `paddock-widgets-dev`.
+- Each pool has a `name` of lowercase letters, digits and hyphens, starting with a letter, at most 20 characters, and a `capacity`, `spot` or `on-demand`. Spot suits a pool where a red run is cheap, such as tests. On-demand suits one where a job must not be cut off, such as a deploy.
+- A pool may set `vcpu` and `memoryGb`, which default to 2 and 8, as GitHub's runners for private repos, and the pair must be a Fargate task size. `maxRunners` defaults to 10 and may be up to 100. More jobs than that wait in GitHub. `maxJobMinutes`, the longest a job of the pool should run, defaults to 120.
+- Each pool gets a scale set and a runner group in the org, both named `paddock-<repo>-<pool>`, where `<repo>` is the repo's name in lowercase with any run of other characters as one hyphen and no hyphen at either end. A workflow's `runs-on` names it. Two repos of one org whose names fold to the same scale set cannot both be served, and the later entry is skipped. `acme/widgets`'s pools above are `paddock-widgets-test` and `paddock-widgets-dev`.
 - A pool's tasks only ever run that pool's jobs, so a repo's code and credentials never share a task with another repo's.
 
 An entry that is not valid, such as a pool with capacity `spto`, is logged as `repo list entry not valid` and skipped, and the rest of the list is served. Its repo stays as the last good list had it, so a typo never reads as a removal. A list that cannot be read or is not JSON leaves the last good list in force, or nothing at the listener's start, and changes nothing. Both raise `paddock-repo-list-unreadable` until the list reads clean. A missing or empty list serves nothing.
 
-A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops. Its runner group stays until you delete it.
+A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops. Its runner group stays until you delete it. Delete it only after the listener logs `scale set deleted`, or the scale set is left behind.
 
 #### The runner-label variables
 
@@ -213,11 +214,17 @@ jobs:
 
 Then add the repo to the list, wait for `pool ready`, and set each variable to its pool's scale set, such as `paddock-widgets-test`. The next push's jobs run on your runners.
 
+A pool is the boundary between runs, so give each set of credentials its own pool, such as a `test` pool for runs that use no environment, a `dev` pool for runs in the dev environment. A run that GitHub gives fewer secrets than the pool's other runs, such as Dependabot's or a fork pull request's, must stay on GitHub's runners, so leave it out of the variable:
+
+```yaml
+    runs-on: ${{ github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork && vars.PADDOCK_TEST_RUNNER || 'ubuntu-24.04' }}
+```
+
 Move only Linux x64 jobs that need no Docker daemon, no KVM and no Android SDK. A runner task is a Fargate task, with no Docker daemon and no `/dev/kvm`. The image is GitHub's runner image plus the AWS CLI, jq, zip, Python 3 and the libraries Chromium needs. Keep an arm job's fallback on arm.
 
 #### The kill switch
 
-To send a repo's jobs back to GitHub's runners, clear its runner-label variables. The next jobs it queues fall back to GitHub's runners, with no deploy and no change to the list. Jobs already queued on a pool stay there, so cancel and re-run them. Once gh-paddock is back, set the variables again. Use it when an alarm says jobs are waiting or the listener is down.
+To send a repo's jobs back to GitHub's runners, delete its runner-label variables. GitHub does not store a variable with an empty value. The next jobs it queues fall back to GitHub's runners, with no deploy and no change to the list. Jobs already queued on a pool stay there, so cancel and re-run them. Once gh-paddock is back, set the variables again. Use it when an alarm says jobs are waiting or the listener is down.
 
 #### Alarms
 
@@ -234,7 +241,7 @@ Each alarm emails the alert address when it fires and again when it clears.
 
 A deploy whose rollback fails after a red probe emails the same address, because jobs then queue with nothing to start them.
 
-#### Cost per repo
+### Cost per repo
 
 Of the tags the listener puts on every runner task it starts, two say whose cost it is. `paddock:repo` holds the repo as `owner/name`, and `paddock:pool` holds the pool's name. Cost Explorer can split the tasks' Fargate cost by either key once both are cost allocation tags. To turn them on:
 
@@ -244,7 +251,7 @@ Of the tags the listener puts on every runner task it starts, two say whose cost
 
 To read cost per repo, open Cost Explorer, filter Service to EC2 Container Service, which is how Cost Explorer names ECS. Group by the tag `paddock:repo`. To split one repo's cost by pool, filter that tag to the repo and group by `paddock:pool`. The listener's own task, the listener's and the runners' logs, Parameter Store, the runner-config bucket and the tasks' public IPv4 addresses carry neither tag, so they show as cost of no repo.
 
-#### Upgrading
+### Upgrading
 
 Merge this repo's `main` into your fork's `main`. The green push deploys it. While the new listener starts, queued jobs wait in GitHub for about a minute and running jobs carry on.
 
