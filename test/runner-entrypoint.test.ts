@@ -233,7 +233,10 @@ describe('fitness: a task exits only with no runner registered (remove-then-term
   });
 
   test('a stop passes to a runner that has no job yet, and the task exits once it has left', async () => {
-    const r = await runEntrypoint(url, [config('paddock-second')], { term: 'job', idle: 30 });
+    // A job process elsewhere on the machine, as on a CI runner, is not
+    // this task's runner's job.
+    const decoy = spawn('sleep', ['30'], { argv0: 'Runner.Worker', stdio: 'ignore' });
+    const r = await runEntrypoint(url, [config('paddock-second')], { term: 'job', idle: 30 }).finally(() => decoy.kill());
     assert.ok(r.log.includes('term'), `the idle runner was not told to stop: ${r.log.join(' | ')}`);
     assert.equal(r.code, 143);
     assert.ok(r.seconds < 10, `took ${r.seconds}s to stop`);

@@ -116,8 +116,31 @@ next_config() {
 # Fargate Spot gives two minutes' notice, so a job near its end finishes,
 # and the task then exits with no wait for another config. A job still
 # running when the notice ends dies with the task, and the listener re-runs
-# it once its workflow run completes. The runner runs each job in a process
-# named Runner.Worker; the brackets keep grep from matching its own line.
+# it once its workflow run completes.
+#
+# The runner runs each job in a process named Runner.Worker. job_running
+# looks for one among run.sh's descendants alone, so no other process on
+# the machine counts. The brackets keep grep from matching its own line.
+job_running() {
+  local -A parent=()
+  local d s p workers=()
+  for d in /proc/[0-9]*; do
+    s=$(cat "$d/stat" 2>/dev/null) || continue
+    s=${s##*) }
+    read -r _ p _ <<<"$s"
+    parent[${d#/proc/}]=$p
+    if grep -qs 'Runner[.]Worker' "$d/cmdline"; then workers+=("${d#/proc/}"); fi
+  done
+  for p in "${workers[@]}"; do
+    while [ -n "$p" ] && [ "$p" != 0 ]; do
+      [ "$p" = "$child" ] && return 0
+      [ "$p" = 1 ] && break
+      p=${parent[$p]:-}
+    done
+  done
+  return 1
+}
+
 child=""
 stopping=""
 stop() {
@@ -126,7 +149,7 @@ stop() {
   if [ -z "$child" ]; then
     exit 143
   fi
-  if grep -qs 'Runner[.]Worker' /proc/[0-9]*/cmdline; then
+  if job_running; then
     echo "paddock: stop held back from runner $runner while its job runs"
   else
     kill -TERM "$child" 2>/dev/null || true
