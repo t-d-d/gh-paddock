@@ -249,6 +249,33 @@ func (i *Installation) EnsureRunnerGroup(ctx context.Context, org, name string, 
 }
 
 func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (*runnerGroup, error) {
+	groups, err := i.runnerGroups(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		if g.Name == name {
+			return &g, nil
+		}
+	}
+	return nil, nil
+}
+
+// RunnerGroups names every runner group of org.
+func (i *Installation) RunnerGroups(ctx context.Context, org string) ([]string, error) {
+	groups, err := i.runnerGroups(ctx, "/orgs/"+url.PathEscape(org)+"/actions/runner-groups")
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(groups))
+	for _, g := range groups {
+		names = append(names, g.Name)
+	}
+	return names, nil
+}
+
+func (i *Installation) runnerGroups(ctx context.Context, base string) ([]runnerGroup, error) {
+	var all []runnerGroup
 	for page := 1; ; page++ {
 		var out struct {
 			Total  int           `json:"total_count"`
@@ -257,13 +284,9 @@ func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (
 		if err := i.do(ctx, http.MethodGet, fmt.Sprintf("%s?per_page=100&page=%d", base, page), nil, &out, http.StatusOK); err != nil {
 			return nil, err
 		}
-		for _, g := range out.Groups {
-			if g.Name == name {
-				return &g, nil
-			}
-		}
+		all = append(all, out.Groups...)
 		if len(out.Groups) < 100 {
-			return nil, nil
+			return all, nil
 		}
 	}
 }

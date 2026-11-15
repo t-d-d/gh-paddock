@@ -149,6 +149,7 @@ describe('the alarms', () => {
     ['FailedStartsAlarm', 'FailedStartsInARow', '{ $.msg = "failed start" && $.inARow >= 3 }'],
     ['TaskPastMaxJobAlarm', 'TasksPastMaxJob', '{ $.msg = "task past its pool\'s maximum job time" }'],
     ['SpotKillRateAlarm', 'SpotKillsOverLimit', '{ $.msg = "spot kills over their limit" }'],
+    ['RepoListUnreadableAlarm', 'RepoListUnreadable', '{ $.msg = "repo list unreadable" }'],
   ];
   for (const [id, metric, pattern] of cases) {
     test(`${id} counts the listener's "${msgOf(pattern)}" lines and pages the operator`, () => {
@@ -176,7 +177,7 @@ describe('the alarms', () => {
   });
 
   test('the other alarms fire on any line, and treat none as all is well', () => {
-    for (const id of ['JobWaitingAlarm', 'FailedStartsAlarm', 'TaskPastMaxJobAlarm', 'SpotKillRateAlarm']) {
+    for (const id of ['JobWaitingAlarm', 'FailedStartsAlarm', 'TaskPastMaxJobAlarm', 'SpotKillRateAlarm', 'RepoListUnreadableAlarm']) {
       const a = alarms[id]?.Properties;
       assert.equal(a?.Statistic, 'Sum', id);
       assert.equal(a?.ComparisonOperator, 'GreaterThanOrEqualToThreshold', id);

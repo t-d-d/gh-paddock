@@ -4,8 +4,10 @@
 // On start it reads the App key and checks it with GitHub before its first
 // heartbeat, so a bad key fails the deploy. It reads the repo list, makes
 // each pool's runner group and scale set, and runs one message session per
-// pool. A heartbeat follows each time GitHub answers. On SIGTERM it closes
-// its sessions and exits 0.
+// pool. It reads the list again every two minutes and serves what changed,
+// with no restart; a list it cannot read leaves the last good one in force
+// and raises an alarm. A heartbeat follows each time GitHub answers. On
+// SIGTERM it closes its sessions and exits 0.
 //
 //	listener               run until SIGTERM
 //	listener -healthcheck  exit 0 if the last beat is fresh: the
@@ -53,6 +55,13 @@ const (
 // pollLogEvery is how often the listener logs that GitHub answered it since
 // the last such line. The stack's listener-down alarm counts those lines.
 var pollLogEvery = time.Minute
+
+// listReadEvery is how often the listener reads the repo list again. A repo
+// added is served within one read and its setup, inside five minutes.
+var listReadEvery = 2 * time.Minute
+
+// logListUnreadable is the line the stack's unreadable-list alarm counts.
+const logListUnreadable = "repo list unreadable"
 
 func main() {
 	os.Exit(mainWith(connectAWS))
@@ -211,33 +220,53 @@ func listen(ctx context.Context, cfg config, connect connector, log *slog.Logger
 	beat()
 	log.Info("GitHub accepted the App key")
 
-	list := readList(ctx, c, cfg.reposParam, log)
-	pools := serve.Setup(ctx, gh, func(org string, id int64) (serve.ScaleSets, error) {
-		return c.ScaleSets(key, org, id)
-	}, list, log)
-	log.Info("serving", "pools", len(pools))
-
 	owner, _ := os.Hostname()
+	mgr := &serve.Manager{
+		App: gh,
+		NewScaleSets: func(org string, id int64) (serve.ScaleSets, error) {
+			return c.ScaleSets(key, org, id)
+		},
+		Serve: func(ctx context.Context, p serve.Pool) {
+			scaler := &runners.Scaler{
+				ECS: c.ECS(), SSM: c.SSM(), JIT: p.ScaleSets, Objects: c.Objects(), Presigner: c.Presigner(),
+				Actions: p.Installation, Metrics: c.Metrics(),
+				Launch: cfg.launch,
+				Repo:   p.Repo, Pool: p.Pool, Settings: p.Settings, ScaleSetID: p.ScaleSetID,
+				Log: log.With("repo", p.Repo.FullName(), "pool", p.Pool.Name),
+			}
+			open := func(ctx context.Context) (serve.Session, error) {
+				return p.ScaleSets.OpenSession(ctx, p.ScaleSetID, owner)
+			}
+			serve.Run(ctx, p, open, scaler, beat, log, serve.Backoff)
+		},
+		LiveTasks: func(ctx context.Context, scaleSetID int) (int, error) {
+			return runners.LiveTasks(ctx, c.ECS(), cfg.launch.Cluster, scaleSetID)
+		},
+		Log: log,
+	}
+	lists := listReader{c: c, name: cfg.reposParam, log: log}
+	if list, ok := lists.read(ctx); ok {
+		mgr.Apply(ctx, list)
+	}
+	log.Info("serving", "pools", mgr.Serving())
+
 	var wg sync.WaitGroup
 	wg.Go(func() { logPolling(ctx, &beats, log) })
-	for _, p := range pools {
-		scaler := &runners.Scaler{
-			ECS: c.ECS(), SSM: c.SSM(), JIT: p.ScaleSets, Objects: c.Objects(), Presigner: c.Presigner(),
-			Actions: p.Installation, Metrics: c.Metrics(),
-			Launch: cfg.launch,
-			Repo:   p.Repo, Pool: p.Pool, ScaleSetID: p.ScaleSetID,
-			Log: log.With("repo", p.Repo.FullName(), "pool", p.Pool.Name),
+	wg.Go(func() { idle(ctx, gh, mgr.Serving, beat, log) })
+	ticker := time.NewTicker(listReadEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			mgr.Wait()
+			wg.Wait()
+			return nil
+		case <-ticker.C:
 		}
-		open := func(ctx context.Context) (serve.Session, error) {
-			return p.ScaleSets.OpenSession(ctx, p.ScaleSetID, owner)
+		if list, ok := lists.read(ctx); ok {
+			mgr.Apply(ctx, list)
 		}
-		wg.Go(func() { serve.Run(ctx, p, open, scaler, beat, log, serve.Backoff) })
 	}
-	if len(pools) == 0 {
-		wg.Go(func() { idle(ctx, gh, beat, log) })
-	}
-	wg.Wait()
-	return nil
 }
 
 // logPolling logs, once each pollLogEvery, that GitHub answered the listener
@@ -259,29 +288,44 @@ func logPolling(ctx context.Context, beats *atomic.Int64, log *slog.Logger) {
 	}
 }
 
-// readList reads the repo list. A missing list serves nothing; so does one
-// that cannot be read or parsed, which is logged.
-func readList(ctx context.Context, c cloud, name string, log *slog.Logger) repos.List {
-	raw, found, err := c.Parameter(ctx, name)
+// listReader reads the repo list.
+type listReader struct {
+	c       cloud
+	name    string
+	log     *slog.Logger
+	missing bool
+}
+
+// read reads the list. ok is false when it cannot be read or parsed: that
+// is logged as the line the alarm counts, and the caller keeps the last
+// good list. A missing list is an empty one, and serves nothing.
+func (r *listReader) read(ctx context.Context) (list repos.List, ok bool) {
+	raw, found, err := r.c.Parameter(ctx, r.name)
 	if err != nil {
-		log.Error("could not read the repo list; serving nothing", "parameter", name, "error", err.Error())
-		return repos.List{}
+		if ctx.Err() == nil {
+			r.log.Error(logListUnreadable, "parameter", r.name, "error", err.Error())
+		}
+		return list, false
 	}
 	if !found {
-		log.Info("no repo list; serving nothing", "parameter", name)
-		return repos.List{}
+		if !r.missing {
+			r.log.Info("no repo list; serving nothing", "parameter", r.name)
+		}
+		r.missing = true
+		return list, true
 	}
-	list, err := repos.Parse(raw)
+	r.missing = false
+	list, err = repos.Parse(raw)
 	if err != nil {
-		log.Error("could not parse the repo list; serving nothing", "parameter", name, "error", err.Error())
-		return repos.List{}
+		r.log.Error(logListUnreadable, "parameter", r.name, "error", err.Error())
+		return list, false
 	}
-	return list
+	return list, true
 }
 
 // idle checks the App with GitHub each minute while no pool is served, so
 // the beat keeps meaning that GitHub answers.
-func idle(ctx context.Context, gh app, beat func(), log *slog.Logger) {
+func idle(ctx context.Context, gh app, serving func() int, beat func(), log *slog.Logger) {
 	ticker := time.NewTicker(idleCheckEvery)
 	defer ticker.Stop()
 	for {
@@ -289,6 +333,9 @@ func idle(ctx context.Context, gh app, beat func(), log *slog.Logger) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		if serving() > 0 {
+			continue
 		}
 		if err := gh.Check(ctx); err != nil {
 			if !errors.Is(err, context.Canceled) {

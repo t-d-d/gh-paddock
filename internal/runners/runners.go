@@ -128,14 +128,18 @@ type Launch struct {
 
 // Scaler keeps one pool's runner tasks matched to its assigned jobs.
 type Scaler struct {
-	ECS        ECS
-	SSM        SSM
-	JIT        JIT
-	Objects    Objects
-	Presigner  Presigner
-	Launch     Launch
-	Repo       repos.Repo
-	Pool       repos.Pool
+	ECS       ECS
+	SSM       SSM
+	JIT       JIT
+	Objects   Objects
+	Presigner Presigner
+	Launch    Launch
+	Repo      repos.Repo
+	Pool      repos.Pool
+	// Settings, if set, is the pool's settings as the list last gave them.
+	// Each Scale takes them into Pool first, so a change applies to the
+	// next task started.
+	Settings   *repos.Current
 	ScaleSetID int
 	Log        *slog.Logger
 	// Now is the clock; nil is time.Now.
@@ -186,7 +190,18 @@ func (s *Scaler) now() time.Time {
 	return time.Now()
 }
 
-func (s *Scaler) startedBy() string { return "paddock-" + strconv.Itoa(s.ScaleSetID) }
+func (s *Scaler) startedBy() string { return startedBy(s.ScaleSetID) }
+
+// startedBy marks the tasks started for a scale set, so each pool counts
+// its own.
+func startedBy(scaleSetID int) string { return "paddock-" + strconv.Itoa(scaleSetID) }
+
+// LiveTasks counts the tasks started for a scale set that have not been
+// asked to stop: a busy task, a waiting one, or one still starting.
+func LiveTasks(ctx context.Context, client ECS, cluster string, scaleSetID int) (int, error) {
+	arns, err := listTasks(ctx, client, cluster, startedBy(scaleSetID), ecstypes.DesiredStatusRunning)
+	return len(arns), err
+}
 
 func (s *Scaler) configDir() string { return ConfigPath + "/" + strconv.Itoa(s.ScaleSetID) }
 
@@ -205,6 +220,9 @@ func (s *Scaler) objectKey(firstRunner string) string {
 // changed, so it scales on the last counts: that replaces a task that
 // stopped before it took its job, or exited before it read its config.
 func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
+	if s.Settings != nil {
+		s.Pool = s.Settings.Get()
+	}
 	s.hear(msg)
 	if msg != nil && msg.Statistics != nil {
 		s.last = msg.Statistics
@@ -421,12 +439,16 @@ func (s *Scaler) tasksOf(ctx context.Context, status ecstypes.DesiredStatus) ([]
 
 // taskARNs lists the ARNs of the pool's tasks of one desired status.
 func (s *Scaler) taskARNs(ctx context.Context, status ecstypes.DesiredStatus) ([]string, error) {
+	return listTasks(ctx, s.ECS, s.Launch.Cluster, s.startedBy(), status)
+}
+
+func listTasks(ctx context.Context, client ECS, cluster, by string, status ecstypes.DesiredStatus) ([]string, error) {
 	var arns []string
 	var next *string
 	for {
-		out, err := s.ECS.ListTasks(ctx, &ecs.ListTasksInput{
-			Cluster:       aws.String(s.Launch.Cluster),
-			StartedBy:     aws.String(s.startedBy()),
+		out, err := client.ListTasks(ctx, &ecs.ListTasksInput{
+			Cluster:       aws.String(cluster),
+			StartedBy:     aws.String(by),
 			DesiredStatus: status,
 			NextToken:     next,
 		})
