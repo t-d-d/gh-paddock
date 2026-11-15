@@ -196,6 +196,15 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		reply(404, map[string]any{"message": "Not Found"})
+	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"):
+		for name, g := range f.groups {
+			if fmt.Sprint(g["id"]) == strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/") {
+				delete(f.groups, name)
+				w.WriteHeader(204)
+				return
+			}
+		}
+		reply(404, map[string]any{"message": "Not Found"})
 	case r.Method == "PUT" && strings.HasSuffix(r.URL.Path, "/repositories"):
 		var id int
 		fmt.Sscanf(strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"), "%d", &id)
@@ -353,5 +362,27 @@ func TestRunnerGroupsListsTheOrgsGroupsByName(t *testing.T) {
 	slices.Sort(names)
 	if want := []string{"Default", "paddock-gone-dev", "paddock-widgets-test"}; !slices.Equal(names, want) {
 		t.Fatalf("groups %v, want %v", names, want)
+	}
+}
+
+// A removed pool's runner group goes after its scale set. A group already
+// gone is no error.
+func TestDeleteRunnerGroupDeletesTheGroupByName(t *testing.T) {
+	f, app := newFake(t)
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.groups["paddock-gone-dev"] = map[string]any{"id": 5, "name": "paddock-gone-dev"}
+	f.groups["paddock-widgets-test"] = map[string]any{"id": 6, "name": "paddock-widgets-test"}
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.groups["paddock-gone-dev"]; ok || len(f.groups) != 1 {
+		t.Fatalf("groups %v", f.groups)
+	}
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatalf("a group already gone: %v", err)
 	}
 }

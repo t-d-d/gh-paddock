@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -200,7 +201,7 @@ func TestAChangedPoolSettingReachesTheServedPoolWithNoRestart(t *testing.T) {
 // config and exit by themselves. Its scale set goes once ECS shows none of
 // its tasks left; a task still running a job holds it.
 func TestARemovedPoolsScaleSetIsDeletedOnceItsTasksHaveFinished(t *testing.T) {
-	_, sets, app := acme()
+	inst, sets, app := acme()
 	var logs syncBuffer
 	m, served, live, clk := newManagerWith(app, sets, &logs)
 	t.Cleanup(served.stop)
@@ -237,6 +238,28 @@ func TestARemovedPoolsScaleSetIsDeletedOnceItsTasksHaveFinished(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `"msg":"scale set deleted"`) {
 		t.Fatalf("logs:\n%s", logs.String())
+	}
+	// Its runner group goes with it; the listed pool's stays.
+	if _, ok := inst.groups["paddock-widgets-dev"]; ok {
+		t.Fatal("the removed pool's runner group is left")
+	}
+	if _, ok := inst.groups["paddock-widgets-test"]; !ok {
+		t.Fatal("the listed pool lost its runner group")
+	}
+}
+
+// A runner group left with no scale set, as when its delete failed after
+// the scale set's, goes on a later read.
+func TestARemovedPoolsRunnerGroupLeftBehindGoesOnALaterRead(t *testing.T) {
+	inst, sets, app := acme()
+	var logs syncBuffer
+	inst.groups["paddock-gone-test"] = 8
+	m, served := newManager(app, sets, &logs)
+	t.Cleanup(served.stop)
+	m.Apply(served.ctx, widgetsList(testPool))
+	served.waitFor(t, 1)
+	if _, ok := inst.groups["paddock-gone-test"]; ok {
+		t.Fatal("the group with no scale set is left")
 	}
 }
 
@@ -352,5 +375,88 @@ func TestAScaleSetIsNotDeletedWhenItsTasksCannotBeCounted(t *testing.T) {
 	m.Apply(ctx, widgetsList(testPool))
 	if len(sets.deleted) != 0 {
 		t.Fatalf("deleted %v without a count", sets.deleted)
+	}
+}
+
+// Pools removed together stop together: each one's Serve is cancelled
+// before the manager waits for any, so one slow to close its session does
+// not hold the others' polling.
+func TestPoolsRemovedTogetherStopTogether(t *testing.T) {
+	_, sets, app := acme()
+	var logs syncBuffer
+	m, served := newManager(app, sets, &logs)
+	t.Cleanup(served.stop)
+	var mu sync.Mutex
+	ctxs := map[string]context.Context{}
+	var late []string
+	m.Serve = func(ctx context.Context, p Pool) {
+		name := p.Repo.ScaleSetName(p.Pool)
+		mu.Lock()
+		ctxs[name] = ctx
+		mu.Unlock()
+		<-ctx.Done()
+		mu.Lock()
+		others := maps.Clone(ctxs)
+		mu.Unlock()
+		for other, octx := range others {
+			select {
+			case <-octx.Done():
+			case <-time.After(time.Second):
+				mu.Lock()
+				late = append(late, other)
+				mu.Unlock()
+			}
+		}
+	}
+	ctx := served.ctx
+	m.Apply(ctx, widgetsList(testPool, devPool))
+	waitFor(t, "pools served", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(ctxs) == 2
+	})
+	m.Apply(ctx, repos.List{})
+	mu.Lock()
+	defer mu.Unlock()
+	if len(late) != 0 {
+		t.Fatalf("%v kept polling while another removed pool stopped", late)
+	}
+}
+
+// An org whose setup fails is reached afresh on the next read, as after the
+// App is reinstalled with a new installation id.
+func TestAnOrgThatFailsIsReachedAfreshOnTheNextRead(t *testing.T) {
+	inst, sets, app := acme()
+	var logs syncBuffer
+	m, served := newManager(app, sets, &logs)
+	t.Cleanup(served.stop)
+	var made int
+	m.NewScaleSets = func(string, int64) (ScaleSets, error) { made++; return sets, nil }
+	delete(inst.repos, "acme/widgets")
+	m.Apply(served.ctx, widgetsList(testPool))
+	inst.repos["acme/widgets"] = github.Repo{ID: 7, Private: true}
+	m.Apply(served.ctx, widgetsList(testPool))
+	served.waitFor(t, 1)
+	if made != 2 {
+		t.Fatalf("made the org's client %d times, want afresh after the failure", made)
+	}
+}
+
+// An org whose runner groups could not be listed is still swept on the
+// next read.
+func TestAnOrgWhoseGroupsFailedIsSweptOnTheNextRead(t *testing.T) {
+	inst, sets, app := acme()
+	var logs syncBuffer
+	m, served, _, clk := newManagerWith(app, sets, &logs)
+	t.Cleanup(served.stop)
+	m.Apply(served.ctx, widgetsList(testPool, devPool))
+	served.waitFor(t, 2)
+	inst.groupsErr = errors.New("GitHub answered 502")
+	m.Apply(served.ctx, widgetsList(testPool))
+	inst.groupsErr = nil
+	clk.advance(3 * time.Minute)
+	m.Apply(served.ctx, widgetsList(testPool))
+	if !slices.Equal(sets.deleted, []string{"paddock-widgets-dev"}) {
+		t.Fatalf("deleted %v", sets.deleted)
 	}
 }

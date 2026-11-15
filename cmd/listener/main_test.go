@@ -136,6 +136,8 @@ func (c *fakeCloud) RunnerGroups(context.Context, string) ([]string, error) {
 	return []string{"paddock-widgets-dev"}, nil
 }
 
+func (c *fakeCloud) DeleteRunnerGroup(context.Context, string, string) error { return nil }
+
 func (c *fakeCloud) DeleteRunnerScaleSet(_ context.Context, id int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

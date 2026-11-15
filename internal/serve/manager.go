@@ -98,11 +98,15 @@ func (m *Manager) Apply(ctx context.Context, list repos.List) {
 		}
 	}
 
+	removed := map[string]*servedPool{}
 	for key, sp := range m.served {
 		if want[key] || list.Holds(sp.pool.Repo.FullName()) {
 			continue
 		}
 		sp.cancel()
+		removed[key] = sp
+	}
+	for key, sp := range removed {
 		<-sp.done
 		delete(m.served, key)
 		m.stopped[key] = m.now()
@@ -141,7 +145,7 @@ func (m *Manager) Apply(ctx context.Context, list repos.List) {
 }
 
 // org is the App's installation and scale-set client on owner, kept for
-// later reads. One it cannot reach is tried again on the next.
+// later reads. One that fails a call is dropped and reached afresh.
 func (m *Manager) org(ctx context.Context, owner string) (*org, error) {
 	key := strings.ToLower(owner)
 	if o, ok := m.orgs[key]; ok {
@@ -170,6 +174,8 @@ func (m *Manager) add(ctx context.Context, repo repos.Repo) {
 	}
 	pools, err := setupRepo(ctx, o.inst, o.sets, repo)
 	if err != nil {
+		// The org's installation may be the stale one: reach it afresh.
+		delete(m.orgs, strings.ToLower(repo.Owner))
 		m.Log.Error("repo skipped", "repo", repo.FullName(), "error", err.Error())
 		return
 	}
@@ -198,9 +204,24 @@ func (m *Manager) sweep(ctx context.Context, want map[string]bool, list repos.Li
 		owner, name, _ := strings.Cut(full, "/")
 		held[owner] = append(held[owner], repos.Repo{Owner: owner, Name: name}.ScaleSetName(repos.Pool{}))
 	}
+	// Every org the list names, and every org reached before: one whose
+	// last repo left the list may still hold a removed pool.
+	owners := map[string]string{}
 	for key, o := range m.orgs {
+		owners[key] = o.name
+	}
+	for _, repo := range list.Repos {
+		owners[strings.ToLower(repo.Owner)] = repo.Owner
+	}
+	for key, owner := range owners {
+		o, err := m.org(ctx, owner)
+		if err != nil {
+			m.Log.Warn("could not reach an org to find removed pools", "org", owner, "error", err.Error())
+			continue
+		}
 		groups, err := o.inst.RunnerGroups(ctx, o.name)
 		if err != nil {
+			delete(m.orgs, key)
 			m.Log.Warn("could not list runner groups to find removed pools", "org", o.name, "error", err.Error())
 			continue
 		}
@@ -220,9 +241,13 @@ func (m *Manager) sweep(ctx context.Context, want map[string]bool, list repos.Li
 	}
 }
 
-// drain deletes a removed pool's scale set if none of its tasks is left.
+// drain deletes a removed pool's scale set, then its runner group, if none
+// of its tasks is left.
 func (m *Manager) drain(ctx context.Context, o *org, name string) {
 	key := poolKey(o.name, name)
+	if at, ok := m.stopped[key]; ok && m.now().Sub(at) < drainSettle {
+		return
+	}
 	log := m.Log.With("org", o.name, "scaleSet", name)
 	group, err := o.sets.GetRunnerGroupByName(ctx, name)
 	if err != nil {
@@ -235,13 +260,12 @@ func (m *Manager) drain(ctx context.Context, o *org, name string) {
 		return
 	}
 	if set == nil {
+		// Its scale set went on an earlier read, and its group did not.
 		delete(m.stopped, key)
+		m.deleteGroup(ctx, o, name, log)
 		return
 	}
 	log = log.With("scaleSetId", set.ID)
-	if at, ok := m.stopped[key]; ok && m.now().Sub(at) < drainSettle {
-		return
-	}
 	n, err := m.LiveTasks(ctx, set.ID)
 	if err != nil {
 		log.Warn("could not count a removed pool's tasks", "error", err.Error())
@@ -257,4 +281,15 @@ func (m *Manager) drain(ctx context.Context, o *org, name string) {
 	}
 	delete(m.stopped, key)
 	log.Info("scale set deleted")
+	m.deleteGroup(ctx, o, name, log)
+}
+
+// deleteGroup deletes a removed pool's runner group, once its scale set is
+// gone. One left is tried again on the next read.
+func (m *Manager) deleteGroup(ctx context.Context, o *org, name string, log *slog.Logger) {
+	if err := o.inst.DeleteRunnerGroup(ctx, o.name, name); err != nil {
+		log.Warn("could not delete a removed pool's runner group", "error", err.Error())
+		return
+	}
+	log.Info("runner group deleted")
 }

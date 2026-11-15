@@ -181,6 +181,9 @@ type task struct {
 	started bool
 	// warned is when it was last logged as past its pool's job time.
 	warned time.Time
+	// maxJob is its pool's maximum job time when it started; zero for a
+	// task started before the tag, which takes the pool's.
+	maxJob time.Duration
 }
 
 func (s *Scaler) now() time.Time {
@@ -576,6 +579,9 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 		{Key: aws.String("paddock:repo"), Value: aws.String(s.Repo.FullName())},
 		{Key: aws.String("paddock:pool"), Value: aws.String(s.Pool.Name)},
 		{Key: aws.String("paddock:runner"), Value: aws.String(runner)},
+	}
+	if s.Pool.MaxJob > 0 {
+		tags = append(tags, ecstypes.Tag{Key: aws.String(tagMaxJob), Value: aws.String(strconv.Itoa(int(s.Pool.MaxJob / time.Minute)))})
 	}
 	def, err := s.ECS.RegisterTaskDefinition(ctx, &ecs.RegisterTaskDefinitionInput{
 		Family:                  aws.String(TaskFamily),

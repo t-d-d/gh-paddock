@@ -20,8 +20,9 @@ import (
 )
 
 type fakeInstallation struct {
-	repos  map[string]github.Repo
-	groups map[string]int64 // runner group name -> repo it is open to
+	groupsErr error
+	repos     map[string]github.Repo
+	groups    map[string]int64 // runner group name -> repo it is open to
 }
 
 func (i *fakeInstallation) Repo(_ context.Context, owner, name string) (github.Repo, error) {
@@ -38,11 +39,19 @@ func (i *fakeInstallation) EnsureRunnerGroup(_ context.Context, _, name string, 
 }
 
 func (i *fakeInstallation) RunnerGroups(context.Context, string) ([]string, error) {
+	if i.groupsErr != nil {
+		return nil, i.groupsErr
+	}
 	var names []string
 	for name := range i.groups {
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+func (i *fakeInstallation) DeleteRunnerGroup(_ context.Context, _, name string) error {
+	delete(i.groups, name)
+	return nil
 }
 
 func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
