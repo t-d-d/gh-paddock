@@ -111,9 +111,13 @@ async function main(stack, sinceArg) {
     console.error('usage: cfn-failed-events.mjs <stack-name> <since, ISO 8601>');
     process.exit(2);
   }
-  const cfn = new CloudFormationClient({});
+  // The client is made inside the read, so report catches a failure to make
+  // it as it catches a failed read.
   await report({
-    read: () => readEventsSince((input) => cfn.send(new DescribeStackEventsCommand(input)), stack, since),
+    read: () => {
+      const cfn = new CloudFormationClient({});
+      return readEventsSince((input) => cfn.send(new DescribeStackEventsCommand(input)), stack, since);
+    },
     stack,
     since,
   });
