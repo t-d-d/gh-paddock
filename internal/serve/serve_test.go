@@ -49,11 +49,6 @@ func (i *fakeInstallation) RunnerGroups(context.Context, string) ([]string, erro
 	return names, nil
 }
 
-func (i *fakeInstallation) DeleteRunnerGroup(_ context.Context, _, name string) error {
-	delete(i.groups, name)
-	return nil
-}
-
 func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
 	return github.Run{}, nil
 }

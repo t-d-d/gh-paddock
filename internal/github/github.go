@@ -260,17 +260,6 @@ func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (
 	return found, err
 }
 
-// DeleteRunnerGroup deletes org's runner group named name. A group already
-// gone is no error.
-func (i *Installation) DeleteRunnerGroup(ctx context.Context, org, name string) error {
-	base := "/orgs/" + url.PathEscape(org) + "/actions/runner-groups"
-	group, err := i.findRunnerGroup(ctx, base, name)
-	if err != nil || group == nil {
-		return err
-	}
-	return i.do(ctx, http.MethodDelete, fmt.Sprintf("%s/%d", base, group.ID), nil, nil, http.StatusNoContent)
-}
-
 // RunnerGroups names every runner group of org.
 func (i *Installation) RunnerGroups(ctx context.Context, org string) ([]string, error) {
 	var names []string

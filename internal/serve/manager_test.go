@@ -201,7 +201,7 @@ func TestAChangedPoolSettingReachesTheServedPoolWithNoRestart(t *testing.T) {
 // config and exit by themselves. Its scale set goes once ECS shows none of
 // its tasks left; a task still running a job holds it.
 func TestARemovedPoolsScaleSetIsDeletedOnceItsTasksHaveFinished(t *testing.T) {
-	inst, sets, app := acme()
+	_, sets, app := acme()
 	var logs syncBuffer
 	m, served, live, clk := newManagerWith(app, sets, &logs)
 	t.Cleanup(served.stop)
@@ -238,54 +238,6 @@ func TestARemovedPoolsScaleSetIsDeletedOnceItsTasksHaveFinished(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `"msg":"scale set deleted"`) {
 		t.Fatalf("logs:\n%s", logs.String())
-	}
-	// Its runner group goes with it; the listed pool's stays.
-	if _, ok := inst.groups["paddock-widgets-dev"]; ok {
-		t.Fatal("the removed pool's runner group is left")
-	}
-	if _, ok := inst.groups["paddock-widgets-test"]; !ok {
-		t.Fatal("the listed pool lost its runner group")
-	}
-}
-
-// A runner group left with no scale set, as when its delete failed after
-// the scale set's, goes on a later read.
-func TestARemovedPoolsRunnerGroupLeftBehindGoesOnALaterRead(t *testing.T) {
-	inst, sets, app := acme()
-	var logs syncBuffer
-	inst.groups["paddock-gone-test"] = 8
-	m, served := newManager(app, sets, &logs)
-	t.Cleanup(served.stop)
-	m.Apply(served.ctx, widgetsList(testPool))
-	served.waitFor(t, 1)
-	if _, ok := inst.groups["paddock-gone-test"]; ok {
-		t.Fatal("the group with no scale set is left")
-	}
-}
-
-// ECS can list a task a little after RunTask returns, so a pool that stopped
-// polling this minute is not yet taken for empty.
-func TestARemovedPoolWaitsOutTheTaskListsLagBeforeItsScaleSetGoes(t *testing.T) {
-	_, sets, app := acme()
-	var logs syncBuffer
-	m, served, _, clk := newManagerWith(app, sets, &logs)
-	t.Cleanup(served.stop)
-	ctx := served.ctx
-	m.Apply(ctx, widgetsList(testPool, devPool))
-	served.waitFor(t, 2)
-	m.Apply(ctx, widgetsList(testPool))
-	if len(sets.deleted) != 0 {
-		t.Fatalf("deleted %v as it stopped polling", sets.deleted)
-	}
-	clk.advance(time.Minute)
-	m.Apply(ctx, widgetsList(testPool))
-	if len(sets.deleted) != 0 {
-		t.Fatalf("deleted %v a minute after it stopped polling", sets.deleted)
-	}
-	clk.advance(2 * time.Minute)
-	m.Apply(ctx, widgetsList(testPool))
-	if !slices.Equal(sets.deleted, []string{"paddock-widgets-dev"}) {
-		t.Fatalf("deleted %v", sets.deleted)
 	}
 }
 

@@ -25,7 +25,6 @@ import (
 type Installation interface {
 	Repo(ctx context.Context, owner, name string) (github.Repo, error)
 	RunnerGroups(ctx context.Context, org string) ([]string, error)
-	DeleteRunnerGroup(ctx context.Context, org, name string) error
 	EnsureRunnerGroup(ctx context.Context, org, name string, repoID int64) error
 	Run(ctx context.Context, owner, name string, runID int64) (github.Run, error)
 	RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]github.Job, error)

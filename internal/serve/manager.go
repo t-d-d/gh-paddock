@@ -241,8 +241,7 @@ func (m *Manager) sweep(ctx context.Context, want map[string]bool, list repos.Li
 	}
 }
 
-// drain deletes a removed pool's scale set, then its runner group, if none
-// of its tasks is left.
+// drain deletes a removed pool's scale set if none of its tasks is left.
 func (m *Manager) drain(ctx context.Context, o *org, name string) {
 	key := poolKey(o.name, name)
 	if at, ok := m.stopped[key]; ok && m.now().Sub(at) < drainSettle {
@@ -260,9 +259,7 @@ func (m *Manager) drain(ctx context.Context, o *org, name string) {
 		return
 	}
 	if set == nil {
-		// Its scale set went on an earlier read, and its group did not.
 		delete(m.stopped, key)
-		m.deleteGroup(ctx, o, name, log)
 		return
 	}
 	log = log.With("scaleSetId", set.ID)
@@ -281,15 +278,4 @@ func (m *Manager) drain(ctx context.Context, o *org, name string) {
 	}
 	delete(m.stopped, key)
 	log.Info("scale set deleted")
-	m.deleteGroup(ctx, o, name, log)
-}
-
-// deleteGroup deletes a removed pool's runner group, once its scale set is
-// gone. One left is tried again on the next read.
-func (m *Manager) deleteGroup(ctx context.Context, o *org, name string, log *slog.Logger) {
-	if err := o.inst.DeleteRunnerGroup(ctx, o.name, name); err != nil {
-		log.Warn("could not delete a removed pool's runner group", "error", err.Error())
-		return
-	}
-	log.Info("runner group deleted")
 }
