@@ -360,10 +360,7 @@ func TestAnAssignedJobStartsARunnerTaskOfThePoolsCapacityAndSize(t *testing.T) {
 		if vpc.AssignPublicIp != ecstypes.AssignPublicIpEnabled || len(vpc.Subnets) != 2 || vpc.SecurityGroups[0] != "sg-1" {
 			t.Fatalf("network %+v", vpc)
 		}
-		tags := map[string]string{}
-		for _, tag := range run.Tags {
-			tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
-		}
+		tags := tagMap(run.Tags)
 		if tags["paddock:repo"] != "acme/widgets" || tags["paddock:pool"] != "dev" || tags["paddock:runner"] != jit.calls[0] {
 			t.Fatalf("tags %v", tags)
 		}
@@ -378,6 +375,56 @@ func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
 	}
 	if got := aws.ToString(f.runs[0].CapacityProviderStrategy[0].CapacityProvider); got != "FARGATE_SPOT" {
 		t.Fatalf("capacity %s", got)
+	}
+}
+
+// tagMap reads tags as a map of key to value.
+func tagMap(tags []ecstypes.Tag) map[string]string {
+	m := map[string]string{}
+	for _, tag := range tags {
+		m[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+	}
+	return m
+}
+
+// Cost Explorer reads a repo's and a pool's runner cost from these two
+// tags, once the operator turns them on as cost allocation tags. A task
+// started without them shows as cost of no repo.
+func TestEveryRunnerTaskIsTaggedWithItsRepoAndPool(t *testing.T) {
+	pools := []repos.Pool{spotTest, {Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10}}
+	for _, pool := range pools {
+		t.Run("fitness: every runner task of a "+pool.Name+" pool is tagged with its repo and pool (pool-per-repo.md)", func(t *testing.T) {
+			f := newFakeAWS()
+			s, _ := newScaler(f, pool)
+			s.Repo = repos.Repo{Owner: "acme", Name: "gadgets"}
+			ctx := context.Background()
+			if err := s.Scale(ctx, assigned(3)); err != nil {
+				t.Fatal(err)
+			}
+			// The tasks finish, and the next jobs get new ones.
+			f.stopAll()
+			if err := s.Scale(ctx, assigned(2)); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.runs) != 5 {
+				t.Fatalf("started %d tasks, want 5", len(f.runs))
+			}
+			want := func(what string, tags []ecstypes.Tag) {
+				t.Helper()
+				got := tagMap(tags)
+				if got["paddock:repo"] != "acme/gadgets" || got["paddock:pool"] != pool.Name {
+					t.Fatalf("%s tagged %v, want paddock:repo acme/gadgets and paddock:pool %s", what, got, pool.Name)
+				}
+			}
+			for i, run := range f.runs {
+				want(fmt.Sprintf("task %d", i+1), run.Tags)
+				def := f.defs[aws.ToString(run.TaskDefinition)]
+				if def == nil {
+					t.Fatalf("task %d ran a definition that was not registered", i+1)
+				}
+				want(fmt.Sprintf("task %d's definition", i+1), def.Tags)
+			}
+		})
 	}
 }
 
