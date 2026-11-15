@@ -58,6 +58,22 @@ outputs:
 runs:
   using: composite
   steps:
+    # The compression lands inside buildx's output string, where a comma
+    # would add exporter options of its own, such as push=false.
+    - name: Check the compression
+      id: compression
+      shell: bash
+      env:
+        COMPRESSION: ${{ inputs.compression }}
+      run: |
+        case "$COMPRESSION" in
+          '' | gzip | zstd | estargz | uncompressed) ;;
+          *)
+            echo "::error::compression must be empty, gzip, zstd, estargz or uncompressed, not '${COMPRESSION}'"
+            exit 1
+            ;;
+        esac
+
     - name: Resolve registry (${{ inputs.repo_name }})
       id: registry
       shell: bash
