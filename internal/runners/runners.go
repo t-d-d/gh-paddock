@@ -29,7 +29,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -384,7 +383,7 @@ func (s *Scaler) logTimes(t *task, lt ecstypes.Task) {
 	}
 	t.timed = true
 	seconds := func(from, to *time.Time) float64 {
-		return math.Round(to.Sub(*from).Seconds()*10) / 10
+		return to.Sub(*from).Round(100 * time.Millisecond).Seconds()
 	}
 	s.Log.Info(logTaskTimes,
 		"task", shortARN(t.arn),

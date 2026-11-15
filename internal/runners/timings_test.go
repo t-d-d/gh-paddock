@@ -6,11 +6,14 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 )
 
 // setTimes gives every task ECS's timestamps for its start: created at
 // created, the pull from pull to pulled, and the container started at
-// running. A zero time leaves that timestamp unset.
+// running. A zero time leaves that timestamp unset. Each task's container
+// carries its image, as ECS describes it, so a line that named the image
+// would show.
 func (f *fakeAWS) setTimes(created, pull, pulled, running time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -25,6 +28,11 @@ func (f *fakeAWS) setTimes(created, pull, pulled, running time.Time) {
 		f.tasks[i].PullStartedAt = at(pull)
 		f.tasks[i].PullStoppedAt = at(pulled)
 		f.tasks[i].StartedAt = at(running)
+		f.tasks[i].Containers = []ecstypes.Container{{
+			Name:        aws.String("runner"),
+			Image:       aws.String("registry.example/runner@sha256:abc"),
+			ImageDigest: aws.String("sha256:abc"),
+		}}
 	}
 }
 
@@ -76,7 +84,7 @@ func TestEachRunnerTaskLogsItsStartTimesOnce(t *testing.T) {
 			if !strings.Contains(line, logTaskTimes) {
 				continue
 			}
-			if strings.Contains(line, "arn:") || strings.Contains(line, "registry.example") || strings.Contains(line, "sha256") {
+			if strings.Contains(line, "arn:") || strings.Contains(line, "123456789012") || strings.Contains(line, "registry.example") || strings.Contains(line, "sha256") {
 				t.Errorf("the line names an ARN or an image: %s", line)
 			}
 		}
