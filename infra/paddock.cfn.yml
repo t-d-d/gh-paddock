@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   gh-paddock: the listener that drives self-hosted GitHub Actions runners on
   Fargate. Stack paddock. The listener runs as one Fargate Spot service,
-  healthy while GitHub answers it, and starts single-use runner tasks in the
-  same cluster.
+  healthy while GitHub answers it, and starts runner tasks in the same
+  cluster, each running one job at a time.
 
 # Applied by .github/workflows/deploy.yml on a green push to main, after the
 # bootstrap stack. Every value the operator chooses is a parameter, never a
@@ -84,7 +84,8 @@ Resources:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
 
   # What the listener itself may do: read the App key and the repo list,
-  # write each runner's config, and start runner tasks. Only the listener
+  # write each runner's config, hand a running task its next one, and start
+  # runner tasks. Only the listener
   # holds these (docs/constraints/runner-isolation.md).
   ListenerTaskRole:
     Type: AWS::IAM::Role
@@ -152,6 +153,22 @@ Resources:
                 Effect: Allow
                 Action: ecs:DescribeTasks
                 Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/paddock/*'
+              # A running task's later configs, one object per task. The
+              # listener presigns each task's GET, so the URL can do no more
+              # than this role. Listing lets a GET of a config not yet
+              # written answer 404 rather than 403, which the task takes as
+              # refused.
+              - Sid: KeepLaterRunnerConfigs
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${RunnerConfigs.Arn}/*'
+              - Sid: SeeWhetherALaterConfigIsWritten
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RunnerConfigs.Arn
               - Sid: PassTheRunnersExecutionRole
                 Effect: Allow
                 Action: iam:PassRole
@@ -159,6 +176,51 @@ Resources:
                 Condition:
                   StringEquals:
                     iam:PassedToService: ecs-tasks.amazonaws.com
+
+  # A running task's next config: one object per task, which the task
+  # reads through a presigned URL that came in its first config. No role
+  # but the listener's reaches the bucket
+  # (docs/constraints/runner-isolation.md).
+  RunnerConfigs:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # A config is deleted once its runner registers; this catches any the
+      # listener lost track of, such as across a restart.
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-configs
+            Status: Enabled
+            ExpirationInDays: 1
+
+  RunnerConfigsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RunnerConfigs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RunnerConfigs.Arn
+              - !Sub '${RunnerConfigs.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
 
   RunnerLogs:
     Type: AWS::Logs::LogGroup
@@ -239,6 +301,8 @@ Resources:
               Value: !GetAtt RunnerExecutionRole.Arn
             - Name: PADDOCK_RUNNER_LOG_GROUP
               Value: !Ref RunnerLogs
+            - Name: PADDOCK_CONFIG_BUCKET
+              Value: !Ref RunnerConfigs
             - Name: AWS_REGION
               Value: !Ref AWS::Region
           # Healthy while GitHub answers: the first beat follows the App's

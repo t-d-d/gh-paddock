@@ -22,8 +22,10 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/google/uuid"
 
@@ -144,8 +146,22 @@ func (c *fakeCloud) OpenSession(context.Context, int, string) (serve.Session, er
 	return c.session, nil
 }
 
-func (c *fakeCloud) ECS() runners.ECS { return fakeECS{c} }
-func (c *fakeCloud) SSM() runners.SSM { return fakeSSM{} }
+func (c *fakeCloud) ECS() runners.ECS             { return fakeECS{c} }
+func (c *fakeCloud) SSM() runners.SSM             { return fakeSSM{} }
+func (c *fakeCloud) Objects() runners.Objects     { return fakeS3{} }
+func (c *fakeCloud) Presigner() runners.Presigner { return fakeS3{} }
+
+type fakeS3 struct{}
+
+func (fakeS3) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	return &s3.PutObjectOutput{}, nil
+}
+func (fakeS3) DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	return &s3.DeleteObjectOutput{}, nil
+}
+func (fakeS3) PresignGetObject(_ context.Context, in *s3.GetObjectInput, _ ...func(*s3.PresignOptions)) (*v4.PresignedHTTPRequest, error) {
+	return &v4.PresignedHTTPRequest{URL: "https://configs.s3.example/" + aws.ToString(in.Key)}, nil
+}
 
 type fakeECS struct{ c *fakeCloud }
 
@@ -217,6 +233,7 @@ func listenerEnv(path string) map[string]string {
 		"PADDOCK_RUNNER_LOG_GROUP":          "/paddock/runners",
 		"PADDOCK_RUNNER_SECURITY_GROUP":     "sg-1",
 		"PADDOCK_SUBNETS":                   "subnet-1,subnet-2",
+		"PADDOCK_CONFIG_BUCKET":             "paddock-runnerconfigs-abc",
 		"AWS_REGION":                        "us-east-1",
 	}
 }
@@ -458,5 +475,22 @@ func TestSubnetsAreReadWithoutSpacesOrEmptyEntries(t *testing.T) {
 	env["PADDOCK_SUBNETS"] = ","
 	if _, err := readConfig(envWith(env)); err == nil || !strings.Contains(err.Error(), "PADDOCK_SUBNETS") {
 		t.Fatalf("a list of no subnets was taken: %v", err)
+	}
+}
+
+// The bucket takes each running task's later configs; with none, no task
+// could be handed a second job, so the listener does not start.
+func TestTheListenerReadsTheRunnerConfigBucket(t *testing.T) {
+	env := listenerEnv("/tmp/unused")
+	cfg, err := readConfig(envWith(env))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.launch.Bucket != "paddock-runnerconfigs-abc" {
+		t.Fatalf("bucket %q", cfg.launch.Bucket)
+	}
+	delete(env, "PADDOCK_CONFIG_BUCKET")
+	if _, err := readConfig(envWith(env)); err == nil || !strings.Contains(err.Error(), "PADDOCK_CONFIG_BUCKET") {
+		t.Fatalf("started with no bucket: %v", err)
 	}
 }

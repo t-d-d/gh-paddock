@@ -86,6 +86,7 @@ func readConfig(getenv func(string) string) (config, error) {
 			LogGroup:         getenv("PADDOCK_RUNNER_LOG_GROUP"),
 			Region:           getenv("AWS_REGION"),
 			SecurityGroup:    getenv("PADDOCK_RUNNER_SECURITY_GROUP"),
+			Bucket:           getenv("PADDOCK_CONFIG_BUCKET"),
 		},
 	}
 	for _, subnet := range strings.Split(getenv("PADDOCK_SUBNETS"), ",") {
@@ -101,6 +102,7 @@ func readConfig(getenv func(string) string) (config, error) {
 		"PADDOCK_RUNNER_LOG_GROUP":          c.launch.LogGroup,
 		"PADDOCK_RUNNER_SECURITY_GROUP":     c.launch.SecurityGroup,
 		"PADDOCK_SUBNETS":                   strings.Join(c.launch.Subnets, ","),
+		"PADDOCK_CONFIG_BUCKET":             c.launch.Bucket,
 		"AWS_REGION":                        c.launch.Region,
 	} {
 		if v == "" {
@@ -129,6 +131,8 @@ type cloud interface {
 	ScaleSets(key github.AppKey, org string, installationID int64) (serve.ScaleSets, error)
 	ECS() runners.ECS
 	SSM() runners.SSM
+	Objects() runners.Objects
+	Presigner() runners.Presigner
 }
 
 type connector func(ctx context.Context, region string) (cloud, error)
@@ -209,8 +213,9 @@ func listen(ctx context.Context, cfg config, connect connector, log *slog.Logger
 	var wg sync.WaitGroup
 	for _, p := range pools {
 		scaler := &runners.Scaler{
-			ECS: c.ECS(), SSM: c.SSM(), JIT: p.ScaleSets, Launch: cfg.launch,
-			Repo: p.Repo, Pool: p.Pool, ScaleSetID: p.ScaleSetID,
+			ECS: c.ECS(), SSM: c.SSM(), JIT: p.ScaleSets, Objects: c.Objects(), Presigner: c.Presigner(),
+			Launch: cfg.launch,
+			Repo:   p.Repo, Pool: p.Pool, ScaleSetID: p.ScaleSetID,
 			Log: log.With("repo", p.Repo.FullName(), "pool", p.Pool.Name),
 		}
 		open := func(ctx context.Context) (serve.Session, error) {

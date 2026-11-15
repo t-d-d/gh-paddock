@@ -88,8 +88,8 @@ jobs:
           grep -q '"msg":"listener started"' "$RUNNER_TEMP/run.out"
 
   # The runner's image, as the deploy builds it: x64, on an x64 runner. It
-  # starts the runner far enough to print its version, and checks the tools
-  # the image adds are on the path.
+  # starts the runner far enough to print its version, checks the tools the
+  # image adds are on the path, and starts the entrypoint.
   runner-image:
     name: runner-image
     runs-on: ubuntu-24.04
@@ -103,3 +103,12 @@ jobs:
           docker run --rm --entrypoint /home/runner/bin/Runner.Listener paddock-runner:gate --version
           docker run --rm --entrypoint bash paddock-runner:gate -c \
             'set -e; aws --version; jq --version; zip -v >/dev/null; python3 --version; test "$(id -un)" = runner'
+      # The entrypoint is written inline in the Dockerfile. With no config it
+      # stops at once, which shows it landed whole and runs.
+      - name: Start the entrypoint with no config
+        run: |
+          if docker run --rm paddock-runner:gate >"$RUNNER_TEMP/entrypoint.out" 2>&1; then
+            echo "the entrypoint ran with no config"; exit 1
+          fi
+          cat "$RUNNER_TEMP/entrypoint.out"
+          grep -q "the task was given no config" "$RUNNER_TEMP/entrypoint.out"

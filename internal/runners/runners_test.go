@@ -1,7 +1,9 @@
 package runners
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,18 +15,23 @@ import (
 
 	"github.com/actions/scaleset"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecstypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 
 	"github.com/t-d-d/gh-paddock/internal/repos"
 )
 
-// fakeAWS is ECS and Parameter Store, in memory.
+// fakeAWS is ECS, Parameter Store and S3, in memory.
 type fakeAWS struct {
 	mu        sync.Mutex
 	tasks     []ecstypes.Task
+	objects   map[string]string
+	objPuts   []string
+	presigned []presign
 	defs      map[string]*ecs.RegisterTaskDefinitionInput
 	nextDef   int
 	deleted   []string
@@ -35,7 +42,62 @@ type fakeAWS struct {
 }
 
 func newFakeAWS() *fakeAWS {
-	return &fakeAWS{defs: map[string]*ecs.RegisterTaskDefinitionInput{}, params: map[string]ssmtypes.Parameter{}}
+	return &fakeAWS{defs: map[string]*ecs.RegisterTaskDefinitionInput{}, params: map[string]ssmtypes.Parameter{}, objects: map[string]string{}}
+}
+
+type presign struct {
+	bucket, key string
+	expires     time.Duration
+}
+
+func (f *fakeAWS) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var body bytes.Buffer
+	if _, err := io.Copy(&body, in.Body); err != nil {
+		return nil, err
+	}
+	key := aws.ToString(in.Bucket) + "/" + aws.ToString(in.Key)
+	f.objects[key] = body.String()
+	f.objPuts = append(f.objPuts, key)
+	return &s3.PutObjectOutput{}, nil
+}
+
+func (f *fakeAWS) DeleteObject(_ context.Context, in *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects, aws.ToString(in.Bucket)+"/"+aws.ToString(in.Key))
+	return &s3.DeleteObjectOutput{}, nil
+}
+
+func (f *fakeAWS) PresignGetObject(_ context.Context, in *s3.GetObjectInput, opts ...func(*s3.PresignOptions)) (*v4.PresignedHTTPRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var o s3.PresignOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	f.presigned = append(f.presigned, presign{aws.ToString(in.Bucket), aws.ToString(in.Key), o.Expires})
+	return &v4.PresignedHTTPRequest{URL: "https://" + aws.ToString(in.Bucket) + ".s3.example/" + aws.ToString(in.Key) + "?X-Amz-Signature=sig", Method: "GET"}, nil
+}
+
+// object reads a task's later config, as its URL would.
+func (f *fakeAWS) object(t *testing.T, key string) (later struct{ Runner, JITConfig string }, ok bool) {
+	t.Helper()
+	f.mu.Lock()
+	raw, ok := f.objects[key]
+	f.mu.Unlock()
+	if !ok {
+		return later, false
+	}
+	var v struct {
+		Runner    string `json:"runner"`
+		JITConfig string `json:"jitconfig"`
+	}
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		t.Fatalf("object %s: %v", key, err)
+	}
+	return struct{ Runner, JITConfig string }{v.Runner, v.JITConfig}, true
 }
 
 func (f *fakeAWS) ListTasks(_ context.Context, in *ecs.ListTasksInput, _ ...func(*ecs.Options)) (*ecs.ListTasksOutput, error) {
@@ -99,6 +161,7 @@ func (f *fakeAWS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ec
 		StartedBy:     in.StartedBy,
 		DesiredStatus: aws.String("RUNNING"),
 		LastStatus:    aws.String("PROVISIONING"),
+		CreatedAt:     aws.Time(time.Now()),
 		Tags:          in.Tags,
 	}
 	f.tasks = append(f.tasks, task)
@@ -166,10 +229,11 @@ func (j *fakeJIT) GenerateJitRunnerConfig(_ context.Context, s *scaleset.RunnerS
 func newScaler(f *fakeAWS, pool repos.Pool) (*Scaler, *fakeJIT) {
 	jit := &fakeJIT{}
 	return &Scaler{
-		ECS: f, SSM: f, JIT: jit,
+		ECS: f, SSM: f, JIT: jit, Objects: f, Presigner: f,
 		Launch: Launch{
 			Cluster: "paddock", Image: "registry.example/runner@sha256:abc", ExecutionRoleARN: "arn:aws:iam::123456789012:role/runner-exec",
 			LogGroup: "/paddock/runners", Region: "us-east-1", Subnets: []string{"subnet-1", "subnet-2"}, SecurityGroup: "sg-1",
+			Bucket: "configs",
 		},
 		Repo:       repos.Repo{Owner: "acme", Name: "widgets"},
 		Pool:       pool,
@@ -258,22 +322,38 @@ func TestARunnerTaskGetsOnlyItsOwnConfig(t *testing.T) {
 				t.Errorf("execution role %q", aws.ToString(def.ExecutionRoleArn))
 			}
 			c := def.ContainerDefinitions[0]
-			if len(c.Secrets) != 1 || aws.ToString(c.Secrets[0].Name) != "ACTIONS_RUNNER_INPUT_JITCONFIG" {
+			if len(c.Secrets) != 1 || aws.ToString(c.Secrets[0].Name) != "PADDOCK_CONFIG" {
 				t.Fatalf("secrets %+v", c.Secrets)
 			}
 			put := f.paramPuts[i]
 			if aws.ToString(c.Secrets[0].ValueFrom) != aws.ToString(put.Name) {
 				t.Errorf("task %d reads %q, its config is in %q", i, aws.ToString(c.Secrets[0].ValueFrom), aws.ToString(put.Name))
 			}
-			if put.Type != ssmtypes.ParameterTypeSecureString || aws.ToString(put.Value) != "jit-for-"+jit.calls[i] {
+			if put.Type != ssmtypes.ParameterTypeSecureString {
 				t.Errorf("parameter %d is %s", i, put.Type)
+			}
+			var first struct{ Runner, JITConfig, URL string }
+			if err := json.Unmarshal([]byte(aws.ToString(put.Value)), &first); err != nil {
+				t.Fatalf("parameter %d: %v", i, err)
+			}
+			if first.Runner != jit.calls[i] || first.JITConfig != "jit-for-"+jit.calls[i] {
+				t.Errorf("parameter %d holds runner %q, config %q", i, first.Runner, first.JITConfig)
+			}
+			// The URL comes beside the first config, signed once for this
+			// task's own object, for a little over the warm limit.
+			sign := f.presigned[i]
+			if sign.bucket != "configs" || sign.key != "5/"+jit.calls[i] || first.URL != "https://configs.s3.example/5/"+jit.calls[i]+"?X-Amz-Signature=sig" {
+				t.Errorf("task %d's URL %q, signed for %+v", i, first.URL, sign)
+			}
+			if sign.expires <= WarmLimit || sign.expires > WarmLimit+10*time.Minute {
+				t.Errorf("URL signed for %s, warm limit %s", sign.expires, WarmLimit)
 			}
 			if !strings.HasPrefix(aws.ToString(put.Name), "/paddock/runners/5/") {
 				t.Errorf("parameter %q", aws.ToString(put.Name))
 			}
 			for _, e := range c.Environment {
-				if strings.Contains(aws.ToString(e.Value), "jit-for-") {
-					t.Errorf("the JIT config is in the task's plain environment")
+				if strings.Contains(aws.ToString(e.Value), "jit-for-") || strings.Contains(aws.ToString(e.Value), "s3.example") {
+					t.Errorf("the JIT config or the URL is in the task's plain environment")
 				}
 			}
 			if aws.ToString(c.Image) != s.Launch.Image {
@@ -282,6 +362,9 @@ func TestARunnerTaskGetsOnlyItsOwnConfig(t *testing.T) {
 		}
 		if len(f.deleted) != 2 {
 			t.Fatalf("deleted %d of 2 one-off task definitions", len(f.deleted))
+		}
+		if len(f.presigned) != 2 {
+			t.Fatalf("signed %d URLs for 2 tasks", len(f.presigned))
 		}
 	})
 }

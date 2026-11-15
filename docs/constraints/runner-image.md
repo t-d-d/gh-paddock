@@ -16,9 +16,11 @@ latest release, so the image must keep up.
   Chromium needs.
 - It copies nothing from the repo and runs as the `runner` user. Its
   entrypoint runs a runner for each config the task is handed: `run.sh`
-  reads the config and runs one job. Before each runner it wipes the last
-  job's checkout and temporary directories and keeps the caches
-  (pool-per-repo.md). It exits when no config comes or its URL is refused
+  reads the config and runs one job. After each job the entrypoint waits up
+  to 30 seconds for a new config. It wipes the last job's checkout and
+  temporary directories and keeps the caches (pool-per-repo.md), then runs
+  a runner for each new one. A config it has run counts as none. It exits
+  when no new config comes in the 30 seconds, or its URL is refused
   (runner-isolation.md).
 - Every runner task runs x64.
 - Dependabot watches the image's base weekly, with the week's cooldown every
@@ -31,6 +33,9 @@ latest release, so the image must keep up.
 - `fitness: every pool runs one x64 image, FROM GitHub's runner image, which Dependabot keeps current (runner-image.md)`
   in test/runner-image.test.ts, and the gate's runner-image job in
   test/gate-workflow.test.ts.
+- The entrypoint is written inline in runner/Dockerfile, and
+  test/runner-entrypoint.test.ts runs it against a fake `run.sh` and a
+  local config URL.
 
 ## Do not
 
@@ -40,4 +45,4 @@ latest release, so the image must keep up.
   and a single-use runner would lose its job.
 
 Judgment: no offline check sees how far the image is behind GitHub's latest runner release. A Dependabot pull request left unmerged for three weeks is the warning.
-History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed.
+History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed. #54 had it wait 30 seconds after each job and exit by itself.
