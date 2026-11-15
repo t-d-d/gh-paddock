@@ -30,7 +30,9 @@
 # the main stack with both images, and probe the listener
 # (scripts/probe.mjs): the service runs the new image and a task of it
 # reports healthy, which it does only once GitHub has accepted the App key.
-# A red probe is a red deploy.
+# A red probe is a red deploy. A failed apply of either stack, or of the
+# rollback, prints the stack's failed events since it started
+# (scripts/cfn-failed-events.mjs) to the log, then fails.
 #
 # Two layers roll back (docs/constraints/deploy.md). A new task that never
 # turns healthy trips the service's circuit breaker: ECS returns to the last
@@ -212,6 +214,7 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           REPO_ID: ${{ github.repository_id }}
         run: |
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           aws cloudformation deploy \
             --stack-name paddock-bootstrap \
             --template-file infra/bootstrap.cfn.yml \
@@ -221,7 +224,8 @@ jobs:
               "GitHubOwner=${OWNER}" \
               "GitHubOwnerId=${OWNER_ID}" \
               "GitHubRepo=${REPO}" \
-              "GitHubRepoId=${REPO_ID}"
+              "GitHubRepoId=${REPO_ID}" \
+            || { status=$?; node scripts/cfn-failed-events.mjs paddock-bootstrap "$SINCE"; exit "$status"; }
 
       - name: Plan the image tag
         id: plan
@@ -340,6 +344,7 @@ jobs:
           VPC_ID: ${{ steps.network.outputs.vpc_id }}
           SUBNET_IDS: ${{ steps.network.outputs.subnet_ids }}
         run: |
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           aws cloudformation deploy \
             --stack-name paddock \
             --template-file infra/paddock.cfn.yml \
@@ -349,7 +354,8 @@ jobs:
               "ImageUri=${IMAGE_URI}" \
               "RunnerImageUri=${RUNNER_IMAGE_URI}" \
               "VpcId=${VPC_ID}" \
-              "SubnetIds=${SUBNET_IDS}"
+              "SubnetIds=${SUBNET_IDS}" \
+            || { status=$?; node scripts/cfn-failed-events.mjs paddock "$SINCE"; exit "$status"; }
 
       # Exits 0 once the service runs the image just applied and a task of it
       # reports healthy; on a probe-only run, the image the stack runs.
@@ -373,6 +379,7 @@ jobs:
         run: |
           ROLLBACK_RUNNER_IMAGE_URI="${PREVIOUS_RUNNER_IMAGE_URI:-$RUNNER_IMAGE_URI}"
           echo "::error::the probe failed; rolling the stack back to ${PREVIOUS_IMAGE_URI##*@}, and the runner to ${ROLLBACK_RUNNER_IMAGE_URI##*@}, the images it ran before this deploy"
+          SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           aws cloudformation deploy \
             --stack-name paddock \
             --template-file infra/paddock.cfn.yml \
@@ -380,7 +387,8 @@ jobs:
             --no-fail-on-empty-changeset \
             --parameter-overrides \
               "ImageUri=${PREVIOUS_IMAGE_URI}" \
-              "RunnerImageUri=${ROLLBACK_RUNNER_IMAGE_URI}"
+              "RunnerImageUri=${ROLLBACK_RUNNER_IMAGE_URI}" \
+            || { status=$?; node scripts/cfn-failed-events.mjs paddock "$SINCE"; exit "$status"; }
 
       - name: Probe the listener on the image it rolled back to
         id: reprobe

@@ -6,8 +6,10 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
@@ -144,6 +146,61 @@ describe('fitness: a red probe rolls the stack back to both images it ran before
     );
     assert.match(page.run ?? '', /--stack-name paddock --logical-resource-id AlertsTopic/);
     assert.match(page.run ?? '', /aws sns publish/);
+  });
+});
+
+// A failed apply's reason sits in the stack's events, which only someone
+// with AWS credentials can read. The step prints them to the log, after the
+// credentials step, which masks the account id an ARN in a reason may carry.
+describe('a failed apply prints the stack\'s failed events, then fails', () => {
+  const applies: Array<[string, string]> = [['bootstrap', 'paddock-bootstrap'], ['apply', 'paddock'], ['rollback', 'paddock']];
+
+  // Runs the step as Actions runs it, with `aws` and `node` replaced by
+  // stubs that record their arguments, and `aws` exiting `awsStatus`.
+  const runStep = (id: string, awsStatus: number) => {
+    const dir = mkdtempSync(join(tmpdir(), 'deploy-apply-'));
+    try {
+      const calls = join(dir, 'calls');
+      writeFileSync(join(dir, 'aws'), `#!/bin/sh\necho "aws $*" >> "$CALLS"\nexit ${awsStatus}\n`, { mode: 0o755 });
+      writeFileSync(join(dir, 'node'), '#!/bin/sh\necho "node $*" >> "$CALLS"\n', { mode: 0o755 });
+      const started = Math.floor(Date.now() / 1000) * 1000;
+      const result = spawnSync('bash', ['-e', '-c', stepById(steps, id).run ?? ''], {
+        env: { PATH: `${dir}:${process.env.PATH}`, CALLS: calls },
+        stdio: 'pipe',
+      });
+      const ended = Date.now();
+      const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n') : [];
+      return { status: result.status, lines, started, ended };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  for (const [id, stack] of applies) {
+    test(`${id}: a green apply prints nothing more`, () => {
+      const { status, lines } = runStep(id, 0);
+      assert.equal(status, 0);
+      assert.equal(lines.length, 1, lines.join('\n'));
+      assert.match(lines[0]!, new RegExp(`^aws cloudformation deploy --stack-name ${stack} `));
+    });
+
+    test(`${id}: a failed apply prints ${stack}'s failed events since it started, then fails with the apply's code`, () => {
+      const { status, lines, started, ended } = runStep(id, 255);
+      assert.equal(status, 255);
+      assert.equal(lines.length, 2, lines.join('\n'));
+      assert.match(lines[0]!, new RegExp(`^aws cloudformation deploy --stack-name ${stack} `));
+      const printed = new RegExp(`^node scripts/cfn-failed-events\\.mjs ${stack} (\\S+)$`).exec(lines[1]!);
+      assert.ok(printed, lines[1]);
+      const since = Date.parse(printed[1]!);
+      assert.ok(since >= started && since <= ended, `the apply started at ${printed[1]}`);
+    });
+  }
+
+  test('each runs after the credentials step and the scripts\' install', () => {
+    const credentials = steps.findIndex((s) => s.uses?.startsWith('aws-actions/configure-aws-credentials@'));
+    const install = steps.findIndex((s) => /^npm ci\b/.test(s.run ?? ''));
+    assert.ok(credentials >= 0 && install > credentials);
+    for (const [id] of applies) assert.ok(indexOf(id) > install, `${id} runs before the install`);
   });
 });
 

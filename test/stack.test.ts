@@ -41,6 +41,12 @@ describe('the listener service', () => {
     assert.equal(service.Properties?.DeploymentConfiguration?.MaximumPercent, 100);
   });
 
+  // ECS turns rebalancing on by default, and refuses to update a service
+  // that has it on and a maximum of 100% or less.
+  test('turns off zone rebalancing, which ECS refuses beside a maximum of 100%', () => {
+    assert.equal(service.Properties?.AvailabilityZoneRebalancing, 'DISABLED');
+  });
+
   test('gives the listener two minutes, Fargate Spot\'s notice, to close its sessions on SIGTERM', () => {
     assert.equal(container?.StopTimeout, 120);
   });
