@@ -25,9 +25,13 @@ const entrypoint = inline?.[2] ?? '';
 const fakeRun = `#!/bin/bash
 set -eu
 echo "run $ACTIONS_RUNNER_INPUT_JITCONFIG" >> "$FAKE_LOG"
+# FAKE_HOLD plays a job that runs that long, in a process named as the
+# runner's job process is; FAKE_IDLE a runner registered with no job yet.
+trap 'echo "term" >> "$FAKE_LOG"; exit 143' TERM
 if [ -n "\${FAKE_HOLD:-}" ]; then
-  trap 'echo "term" >> "$FAKE_LOG"; exit 143' TERM
-  sleep "$FAKE_HOLD" & wait $!
+  (exec -a Runner.Worker sleep "$FAKE_HOLD") & wait $!
+elif [ -n "\${FAKE_IDLE:-}" ]; then
+  sleep "$FAKE_IDLE" & wait $!
 fi
 for f in _work/widgets/widgets/checkout.txt _work/_temp/temp.txt _work/_actions/a/action.yml tmp/job.txt \\
          _work/_tool/node/cached .npm/cached go/pkg/mod/cached .runner; do
@@ -69,7 +73,7 @@ class ConfigURL {
 
 type Run = { code: number | null; log: string[]; seconds: number; root: string };
 
-async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: number; exit?: number; term?: 'job' | 'wait'; hold?: number } = {}): Promise<Run> {
+async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: number; exit?: number; term?: 'job' | 'wait'; hold?: number; idle?: number } = {}): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), 'paddock-entrypoint-'));
   const home = join(root, 'home');
   mkdirSync(join(root, 'tmp'), { recursive: true });
@@ -97,6 +101,7 @@ async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: nu
         FAKE_URL_HOST: url.host,
         FAKE_EXIT: String(opts.exit ?? 0),
         FAKE_HOLD: opts.hold ? String(opts.hold) : '',
+        FAKE_IDLE: opts.idle ? String(opts.idle) : '',
         PADDOCK_CONFIG_WAIT: String(opts.wait ?? 2),
         PADDOCK_CONFIG: JSON.stringify({ runner: 'paddock-first', jitconfig: 'jit-first', url: url.url }),
       },
@@ -224,6 +229,14 @@ describe('fitness: a task exits only with no runner registered (remove-then-term
     assert.ok(r.log.includes('end'), `the job did not finish: ${r.log.join(' | ')}`);
     assert.equal(r.code, 143);
     assert.deepEqual(runs(r), ['run jit-first']);
+    assert.equal(url.requests.length, 0);
+  });
+
+  test('a stop passes to a runner that has no job yet, and the task exits once it has left', async () => {
+    const r = await runEntrypoint(url, [config('paddock-second')], { term: 'job', idle: 30 });
+    assert.ok(r.log.includes('term'), `the idle runner was not told to stop: ${r.log.join(' | ')}`);
+    assert.equal(r.code, 143);
+    assert.ok(r.seconds < 10, `took ${r.seconds}s to stop`);
     assert.equal(url.requests.length, 0);
   });
 

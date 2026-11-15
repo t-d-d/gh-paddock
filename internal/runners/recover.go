@@ -2,6 +2,8 @@ package runners
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -91,13 +93,18 @@ type recovery struct {
 	// runner request, from when they were queued.
 	waiting    map[int64]time.Time
 	waitLogged time.Time
+	// unheardSince is when GitHub's counts first showed more jobs waiting
+	// than messages named, as after a restart: GitHub sends no message
+	// again for a job already assigned.
+	unheardSince time.Time
 }
 
 type owedRun struct {
 	runner     string
 	runID      int64
-	stoppingAt time.Time
-	killed     bool // logged as killed, so counted once
+	stoppingAt time.Time // when Spot's warning began
+	stoppedAt  time.Time // when the task stopped, at the warning's end or sooner
+	killed     bool      // logged as killed, so counted once
 }
 
 // readTask is what a live task's tags say of it.
@@ -157,6 +164,12 @@ func (s *Scaler) replaceFailedStarts(ctx context.Context, live []ecstypes.Task) 
 		}
 		if ref != nil {
 			if err := s.JIT.RemoveRunner(ctx, int64(ref.ID)); err != nil {
+				if errors.Is(err, scaleset.JobStillRunningError) {
+					// The runner took its job, though no message said so.
+					t.started = true
+					s.Log.Info("a runner thought never to have taken its job is running one; its task is left", "runner", t.runner)
+					continue
+				}
 				s.Log.Warn("could not remove a runner that never took its job; its task is left", "runner", t.runner, "error", err.Error())
 				continue
 			}
@@ -252,6 +265,18 @@ func (s *Scaler) watchWaits(now time.Time) {
 			long++
 		}
 	}
+	unheard := 0
+	if s.last != nil {
+		unheard = s.last.TotalAssignedJobs - s.last.TotalRunningJobs - len(s.waiting)
+	}
+	switch {
+	case unheard <= 0:
+		s.unheardSince = time.Time{}
+	case s.unheardSince.IsZero():
+		s.unheardSince = now
+	case now.Sub(s.unheardSince) >= JobWaitLimit:
+		long += unheard
+	}
 	if long > 0 && now.Sub(s.waitLogged) >= logEvery {
 		s.waitLogged = now
 		s.Log.Warn(logJobWaiting, "jobs", long)
@@ -271,22 +296,21 @@ func (s *Scaler) checkReclaims(ctx context.Context, now time.Time) {
 	if s.owed == nil {
 		s.owed, s.seenStopped = map[string]*owedRun{}, map[string]bool{}
 	}
-	if stopped, err := s.tasksOf(ctx, ecstypes.DesiredStatusStopped); err != nil {
+	if stopped, listed, err := s.newlyStopped(ctx); err != nil {
 		s.Log.Warn("could not read the pool's stopped tasks", "error", err.Error())
 	} else {
-		listed := map[string]bool{}
 		for _, t := range stopped {
-			arn := aws.ToString(t.TaskArn)
-			listed[arn] = true
-			if s.seenStopped[arn] {
+			// A task in its warning is listed as stopped before it stops:
+			// it is read again once it has.
+			if t.StoppedAt == nil {
 				continue
 			}
-			s.seenStopped[arn] = true
+			s.seenStopped[aws.ToString(t.TaskArn)] = true
 			runner, runID, ok := splitTag(tagOf(t, tagJob))
 			if t.StopCode != ecstypes.TaskStopCodeSpotInterruption || !ok || t.StoppingAt == nil {
 				continue
 			}
-			s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt}
+			s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
 		}
 		for arn := range s.seenStopped {
 			if !listed[arn] {
@@ -301,12 +325,36 @@ func (s *Scaler) checkReclaims(ctx context.Context, now time.Time) {
 	}
 }
 
+// newlyStopped lists the pool's stopped tasks, and describes only those not
+// read before. It returns those it described and every ARN ECS listed.
+func (s *Scaler) newlyStopped(ctx context.Context) ([]ecstypes.Task, map[string]bool, error) {
+	arns, err := s.taskARNs(ctx, ecstypes.DesiredStatusStopped)
+	if err != nil {
+		return nil, nil, err
+	}
+	listed := map[string]bool{}
+	var unseen []string
+	for _, arn := range arns {
+		listed[arn] = true
+		if !s.seenStopped[arn] {
+			unseen = append(unseen, arn)
+		}
+	}
+	tasks, err := s.describeTasks(ctx, unseen)
+	return tasks, listed, err
+}
+
 // settle re-runs a reclaimed task's job once its run completes, if the job
-// was killed. It is done once the run's latest attempt no longer holds the
+// was killed: it failed, and GitHub marked it ended after its task stopped. It is done once the run's latest attempt no longer holds the
 // job's runner: someone, or this listener, has re-run it.
 func (s *Scaler) settle(ctx context.Context, o *owedRun) bool {
 	log := s.Log.With("runner", o.runner, "run", o.runID)
 	run, err := s.Actions.Run(ctx, s.Repo.Owner, s.Repo.Name, o.runID)
+	if status := (*github.StatusError)(nil); errors.As(err, &status) && status.Status == http.StatusNotFound {
+		// The run was deleted: there is no job left to re-run.
+		log.Info("a reclaimed job's run is gone")
+		return true
+	}
 	if err != nil {
 		log.Warn("could not read a reclaimed job's run", "error", err.Error())
 		return false
@@ -323,12 +371,14 @@ func (s *Scaler) settle(ctx context.Context, o *owedRun) bool {
 		if j.RunnerName != o.runner {
 			continue
 		}
+		// A job that ends by itself, green, red or cancelled, ends before
+		// its task stops; a killed one is marked ended only after.
 		switch {
 		case j.CompletedAt.Before(o.stoppingAt):
 			// The task was waiting, its job done, when Spot took it.
 			return true
-		case j.Conclusion == "success":
-			log.Info(logInsideWarning, "job", j.ID)
+		case j.Conclusion == "success" || !j.CompletedAt.After(o.stoppedAt):
+			log.Info(logInsideWarning, "job", j.ID, "conclusion", j.Conclusion)
 			return true
 		}
 		if !o.killed {

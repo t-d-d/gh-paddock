@@ -20,8 +20,9 @@ when nothing is registered on it means no job is ever lost to a stop.
   record that config made, then stops the task, and the job gets a new
   task. If GitHub will not remove the record, the runner may have just
   taken its job, and the task is left. Every other task ends itself.
-- On SIGTERM a waiting task exits at once. A task whose runner has a job
-  holds the signal back from it, so a job near its end finishes inside
+- On SIGTERM a waiting task exits at once, and a runner with no job yet is
+  told to stop and leaves GitHub. A task whose runner has a job holds the
+  signal back from it, so a job near its end finishes inside
   Fargate Spot's two minutes. A job still running when Spot stops the task
   dies with it, and the listener re-runs that job once its run completes.
 - A config written to a task that exits without starting its runner is made

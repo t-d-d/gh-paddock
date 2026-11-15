@@ -12,7 +12,8 @@ pull request or a deploy.
   operator. No stack creates it, and no stack takes a repo as a parameter.
 - Its value is one JSON object: `{"repos": [{"repo": "owner/name", "pools":
   [{"name": "test", "capacity": "spot"}]}]}`. A pool may also set `vcpu`,
-  `memoryGb` and `maxRunners`; they default to 2, 8 and 10.
+  `memoryGb`, `maxRunners` and `maxJobMinutes`; they default to 2, 8, 10
+  and 120.
 - The listener reads the list on start. A missing or empty list serves
   nothing. A list it cannot read or parse serves nothing and is logged. An
   entry that is not valid is logged and skipped, and the rest are served.
@@ -31,4 +32,4 @@ pull request or a deploy.
   carry every repo.
 
 Judgment: the listener's logs name the repo a line is about, so the operator can act on it. A log line pasted into a public issue needs its repo cut first.
-History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16.
+History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16. #19 added each pool's `maxJobMinutes`.

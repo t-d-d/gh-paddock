@@ -43,6 +43,8 @@ type fakeAWS struct {
 	// <runner>" and "stop <first runner>".
 	events  []string
 	stopped []string
+	// described is every task ARN asked of DescribeTasks, in order.
+	described []string
 }
 
 func newFakeAWS() *fakeAWS {
@@ -123,6 +125,7 @@ func (f *fakeAWS) DescribeTasks(_ context.Context, in *ecs.DescribeTasksInput, _
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []ecstypes.Task
+	f.described = append(f.described, in.Tasks...)
 	for _, arn := range in.Tasks {
 		for _, t := range f.tasks {
 			if aws.ToString(t.TaskArn) == arn {
@@ -266,7 +269,10 @@ type fakeJIT struct {
 	calls        []string
 	removed      []string
 	refuseRemove bool
-	aws          *fakeAWS // where removals are logged beside the stops
+	// jobRunning refuses each removal as GitHub does a busy runner's.
+	jobRunning  bool
+	removeTries int
+	aws         *fakeAWS // where removals are logged beside the stops
 }
 
 func (j *fakeJIT) GetRunnerByName(_ context.Context, name string) (*scaleset.RunnerReference, error) {
@@ -279,6 +285,10 @@ func (j *fakeJIT) GetRunnerByName(_ context.Context, name string) (*scaleset.Run
 }
 
 func (j *fakeJIT) RemoveRunner(_ context.Context, id int64) error {
+	j.removeTries++
+	if j.jobRunning {
+		return fmt.Errorf("remove runner: %w", scaleset.JobStillRunningError)
+	}
 	if j.refuseRemove {
 		return errors.New("the runner is running a job")
 	}

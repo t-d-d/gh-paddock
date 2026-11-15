@@ -22,9 +22,11 @@ latest release, so the image must keep up.
   a runner for each new one. A config it has run counts as none. It exits
   when no new config comes in the 30 seconds, or its URL is refused
   (runner-isolation.md).
-- On SIGTERM a waiting entrypoint exits at once. One whose runner has a job
-  never passes the signal on: the job runs until it ends or the task is
-  killed, and the task then exits with no wait for another config. The
+- On SIGTERM a waiting entrypoint exits at once, and one whose runner has
+  no job yet passes the signal on, so the runner leaves GitHub. One whose
+  runner has a job never passes the signal on: the job runs until it ends
+  or the task is killed, and the task then exits with no wait for another
+  config. The
   task definition gives the container 120 seconds to stop, Fargate Spot's
   notice (remove-then-terminate.md).
 - Every runner task runs x64.

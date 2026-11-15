@@ -45,6 +45,9 @@ func (l *logs) lines(msg string) []map[string]any {
 type fakeActions struct {
 	runs   map[int64]*fakeRun
 	reruns []int64
+	// gone are runs deleted from GitHub, which it answers 404.
+	gone  map[int64]bool
+	reads int
 }
 
 type fakeRun struct {
@@ -53,6 +56,10 @@ type fakeRun struct {
 }
 
 func (a *fakeActions) Run(_ context.Context, owner, name string, id int64) (github.Run, error) {
+	a.reads++
+	if a.gone[id] {
+		return github.Run{}, &github.StatusError{Method: "GET", Path: fmt.Sprintf("/repos/%s/%s/actions/runs/%d", owner, name, id), Status: 404, Message: "Not Found"}
+	}
 	r, ok := a.runs[id]
 	if !ok || owner != "acme" || name != "widgets" {
 		return github.Run{}, fmt.Errorf("no run %s/%s %d", owner, name, id)
@@ -113,6 +120,22 @@ func startedRun(assignedJobs int, runner string, runID int64) *scaleset.RunnerSc
 	msg := assigned(assignedJobs)
 	msg.JobStartedMessages = append(msg.JobStartedMessages, &scaleset.JobStarted{RunnerName: runner, JobMessageBase: scaleset.JobMessageBase{WorkflowRunID: runID}})
 	return msg
+}
+
+// GitHub refuses to remove a runner whose job is running: the runner took
+// its job, though no message said so, so it is asked no more.
+func TestARunnerGitHubSaysIsRunningAJobIsNotAskedToBeRemovedAgain(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if jit.removeTries != 1 || len(f.stopped) != 0 {
+		t.Fatalf("tried %d removals, stopped %v", jit.removeTries, f.stopped)
+	}
 }
 
 func TestAStartWhoseRunnerNeverTakesItsJobIsReplaced(t *testing.T) {
@@ -232,7 +255,8 @@ func TestARestartedListenerStopsNoTaskWhoseRunnerTookItsJob(t *testing.T) {
 }
 
 // spotKilled is a task the pool ran, whose runner was running run 5's job
-// when Spot reclaimed it at `at`.
+// when Spot reclaimed it at `at`. The task stopped two minutes on, at the
+// end of the warning.
 func spotKilled(f *fakeAWS, runner string, at time.Time) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -243,6 +267,7 @@ func spotKilled(f *fakeAWS, runner string, at time.Time) {
 		LastStatus:    aws.String("STOPPED"),
 		StopCode:      ecstypes.TaskStopCodeSpotInterruption,
 		StoppingAt:    aws.Time(at),
+		StoppedAt:     aws.Time(at.Add(2 * time.Minute)),
 		CreatedAt:     aws.Time(at.Add(-time.Hour)),
 		Tags: []ecstypes.Tag{
 			{Key: aws.String("paddock:runner"), Value: aws.String("paddock-first")},
@@ -260,7 +285,7 @@ func TestAJobSpotKilledIsReRunOnceItsRunCompletes(t *testing.T) {
 	at := c.now().Add(-time.Minute)
 	spotKilled(f, "paddock-killed", at)
 	actions.runs[5].attempts[0] = append(actions.runs[5].attempts[0],
-		github.Job{ID: 72, RunnerName: "paddock-killed", Conclusion: "failure", CompletedAt: at.Add(2 * time.Minute)})
+		github.Job{ID: 72, RunnerName: "paddock-killed", Conclusion: "failure", CompletedAt: at.Add(3 * time.Minute)})
 
 	mustScale(t, s, assigned(0))
 	if len(actions.reruns) != 0 {
@@ -290,7 +315,7 @@ func TestARestartedListenerReRunsAKilledJobOnceAndNeverTwice(t *testing.T) {
 	f, s, _, c, _ := recovering(t)
 	at := c.now().Add(-time.Minute)
 	actions := &fakeActions{runs: map[int64]*fakeRun{5: {status: "completed", attempts: [][]github.Job{{
-		{ID: 72, RunnerName: "paddock-killed", Conclusion: "cancelled", CompletedAt: at.Add(time.Minute)},
+		{ID: 72, RunnerName: "paddock-killed", Conclusion: "cancelled", CompletedAt: at.Add(3 * time.Minute)},
 	}}}}}
 	spotKilled(f, "paddock-killed", at)
 
@@ -313,6 +338,40 @@ func TestARestartedListenerReRunsAKilledJobOnceAndNeverTwice(t *testing.T) {
 	}
 }
 
+// A run deleted from GitHub has no job left to re-run.
+func TestAReclaimedJobWhoseRunIsDeletedIsOwedNoMore(t *testing.T) {
+	f, s, _, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}, gone: map[int64]bool{5: true}}
+	s.Actions = actions
+	spotKilled(f, "paddock-killed", c.now().Add(-time.Minute))
+	mustScale(t, s, assigned(0))
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if actions.reads != 1 || len(actions.reruns) != 0 {
+		t.Fatalf("read the deleted run %d times, re-ran %v", actions.reads, actions.reruns)
+	}
+}
+
+// A stopped task already read is not described again each minute.
+func TestAStoppedTaskIsDescribedOnce(t *testing.T) {
+	f, s, _, c, _ := recovering(t)
+	s.Actions = &fakeActions{runs: map[int64]*fakeRun{5: {status: "in_progress", attempts: [][]github.Job{{}}}}}
+	spotKilled(f, "paddock-killed", c.now().Add(-time.Minute))
+	arn := aws.ToString(f.tasks[0].TaskArn)
+	mustScale(t, s, assigned(0))
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	n := 0
+	for _, d := range f.described {
+		if d == arn {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("described the stopped task %d times", n)
+	}
+}
+
 func TestAJobThatFinishesInsideTheWarningIsCountedAndNotReRun(t *testing.T) {
 	f, s, _, c, l := recovering(t)
 	at := c.now().Add(-time.Minute)
@@ -327,6 +386,27 @@ func TestAJobThatFinishesInsideTheWarningIsCountedAndNotReRun(t *testing.T) {
 	}
 	if len(l.lines("job finished inside the warning")) != 1 {
 		t.Fatalf("log %s", l.buf.String())
+	}
+}
+
+// A job that ends by itself inside the warning, red or cancelled, ends
+// before its task stops: it was not killed, and is not re-run.
+func TestAJobThatFailsByItselfInsideTheWarningIsNotReRun(t *testing.T) {
+	for _, conclusion := range []string{"failure", "cancelled"} {
+		f, s, _, c, l := recovering(t)
+		at := c.now().Add(-time.Minute)
+		actions := &fakeActions{runs: map[int64]*fakeRun{5: {status: "completed", attempts: [][]github.Job{{
+			{ID: 72, RunnerName: "paddock-killed", Conclusion: conclusion, CompletedAt: at.Add(time.Minute)},
+		}}}}}
+		s.Actions = actions
+		spotKilled(f, "paddock-killed", at)
+		mustScale(t, s, assigned(0))
+		if len(actions.reruns) != 0 || len(l.lines("job killed by a Spot reclaim")) != 0 {
+			t.Errorf("%s: re-ran %v; log %s", conclusion, actions.reruns, l.buf.String())
+		}
+		if len(l.lines("job finished inside the warning")) != 1 {
+			t.Errorf("%s: not counted as finished inside the warning", conclusion)
+		}
 	}
 }
 
@@ -377,6 +457,25 @@ func TestAJobWaitingFiveMinutesForARunnerIsLogged(t *testing.T) {
 	mustScale(t, s, nil)
 	if got := l.lines("job waiting for a runner"); len(got) != 1 {
 		t.Fatalf("logged a started job as waiting: %v", got)
+	}
+}
+
+// GitHub sends no message again for a job already assigned, so a listener
+// that restarts times the jobs GitHub's counts show waiting from its start.
+func TestAJobWaitingAcrossARestartIsStillLogged(t *testing.T) {
+	_, s, _, c, l := recovering(t)
+	mustScale(t, s, &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3, TotalRunningJobs: 2}})
+	c.add(JobWaitLimit + time.Second)
+	mustScale(t, s, nil)
+	if got := l.lines("job waiting for a runner"); len(got) != 1 || got[0]["jobs"] != 1.0 {
+		t.Fatalf("logged %v", got)
+	}
+	// Once GitHub's counts show none waiting, nothing is logged.
+	mustScale(t, s, &scaleset.RunnerScaleSetMessage{Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 3, TotalRunningJobs: 3}})
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if got := l.lines("job waiting for a runner"); len(got) != 1 {
+		t.Fatalf("logged %v after the job started", got)
 	}
 }
 
@@ -439,5 +538,34 @@ func TestARunnerTaskGetsSpotsFullWarningToStop(t *testing.T) {
 	def := f.defs[aws.ToString(f.runs[0].TaskDefinition)]
 	if got := aws.ToInt32(def.ContainerDefinitions[0].StopTimeout); got != 120 {
 		t.Fatalf("stop timeout %d", got)
+	}
+}
+
+// ECS lists a task as stopped from the start of its warning, before it has
+// stopped. It is read again once it has, so its job's end can be weighed
+// against its stop.
+func TestATaskStillInItsWarningIsReadAgainOnceItStops(t *testing.T) {
+	f, s, _, c, _ := recovering(t)
+	at := c.now().Add(-time.Minute)
+	actions := &fakeActions{runs: map[int64]*fakeRun{5: {status: "completed", attempts: [][]github.Job{{
+		{ID: 72, RunnerName: "paddock-killed", Conclusion: "failure", CompletedAt: at.Add(3 * time.Minute)},
+	}}}}}
+	s.Actions = actions
+	spotKilled(f, "paddock-killed", at)
+	f.mu.Lock()
+	stopped := f.tasks[len(f.tasks)-1].StoppedAt
+	f.tasks[len(f.tasks)-1].StoppedAt = nil
+	f.mu.Unlock()
+	mustScale(t, s, assigned(0))
+	if len(actions.reruns) != 0 {
+		t.Fatal("weighed a job against a task that had not stopped")
+	}
+	f.mu.Lock()
+	f.tasks[len(f.tasks)-1].StoppedAt = stopped
+	f.mu.Unlock()
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if len(actions.reruns) != 1 {
+		t.Fatalf("re-ran %v once the task stopped", actions.reruns)
 	}
 }

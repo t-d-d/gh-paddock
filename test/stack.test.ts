@@ -185,6 +185,16 @@ describe('the alarms', () => {
     }
   });
 
+  // The listener logs the rate a little over an hour apart, so an hour can
+  // pass with no line while the rate stays over its limit: the alarm looks
+  // back two hours and fires on one line, so it does not flap.
+  test('the Spot-kill alarm holds through an hour with no line', () => {
+    const a = alarms.SpotKillRateAlarm?.Properties;
+    assert.equal(a?.Period, 3600);
+    assert.equal(a?.EvaluationPeriods, 2);
+    assert.equal(a?.DatapointsToAlarm, 1);
+  });
+
   test('each pool\'s finished, Spot-killed, warned and re-run jobs are counted by repo and pool', () => {
     for (const [metric, msg] of [
       ['JobsFinished', 'job finished'],

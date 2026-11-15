@@ -412,6 +412,15 @@ func (s *Scaler) newRunner(ctx context.Context) (name, jit string, err error) {
 // tasksOf lists the pool's tasks of one desired status, with their tags.
 // ECS shows a stopped task for about an hour.
 func (s *Scaler) tasksOf(ctx context.Context, status ecstypes.DesiredStatus) ([]ecstypes.Task, error) {
+	arns, err := s.taskARNs(ctx, status)
+	if err != nil {
+		return nil, err
+	}
+	return s.describeTasks(ctx, arns)
+}
+
+// taskARNs lists the ARNs of the pool's tasks of one desired status.
+func (s *Scaler) taskARNs(ctx context.Context, status ecstypes.DesiredStatus) ([]string, error) {
 	var arns []string
 	var next *string
 	for {
@@ -426,9 +435,13 @@ func (s *Scaler) tasksOf(ctx context.Context, status ecstypes.DesiredStatus) ([]
 		}
 		arns = append(arns, out.TaskArns...)
 		if next = out.NextToken; next == nil {
-			break
+			return arns, nil
 		}
 	}
+}
+
+// describeTasks describes tasks by their ARNs, with their tags.
+func (s *Scaler) describeTasks(ctx context.Context, arns []string) ([]ecstypes.Task, error) {
 	var tasks []ecstypes.Task
 	for len(arns) > 0 {
 		batch := arns[:min(len(arns), 100)]

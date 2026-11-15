@@ -111,11 +111,13 @@ next_config() {
 
 # ECS stops a task with SIGTERM to this script alone, which as process 1
 # ignores any signal it has no handler for. A waiting task, with no runner
-# registered, exits at once. A runner whose job is running never sees the
-# signal: Fargate Spot gives two minutes' notice, so a job near its end
-# finishes, and the task then exits with no wait for another config. A job
-# still running when the notice ends dies with the task, and the listener
-# re-runs it once its workflow run completes.
+# registered, exits at once. A runner with no job yet is told to stop, and
+# leaves GitHub. A runner whose job is running never sees the signal:
+# Fargate Spot gives two minutes' notice, so a job near its end finishes,
+# and the task then exits with no wait for another config. A job still
+# running when the notice ends dies with the task, and the listener re-runs
+# it once its workflow run completes. The runner runs each job in a process
+# named Runner.Worker; the brackets keep grep from matching its own line.
 child=""
 stopping=""
 stop() {
@@ -124,7 +126,11 @@ stop() {
   if [ -z "$child" ]; then
     exit 143
   fi
-  echo "paddock: stop held back from runner $runner while its job runs"
+  if grep -qs 'Runner[.]Worker' /proc/[0-9]*/cmdline; then
+    echo "paddock: stop held back from runner $runner while its job runs"
+  else
+    kill -TERM "$child" 2>/dev/null || true
+  fi
 }
 trap stop TERM INT
 
@@ -145,7 +151,7 @@ while :; do
   child=""
   [ -z "$stopping" ] || exit 143
   ((code == 0)) || exit "$code"
-next_config || exit 0
+  next_config || exit 0
 done
 PADDOCK_ENTRYPOINT
 RUN chmod 755 /home/runner/paddock-entrypoint
