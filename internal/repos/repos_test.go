@@ -135,3 +135,44 @@ func TestTwoPoolsThatWouldShareAScaleSetName(t *testing.T) {
 		}
 	})
 }
+
+// A typo in one entry must not read as the repo's removal: the listener
+// holds a repo whose entry it skipped where it was, and drains nothing of it.
+func TestASkippedEntryHoldsItsRepo(t *testing.T) {
+	list, err := Parse(`{"repos": [
+		{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spto"}]},
+		{"repo": "Acme/Gadgets", "pools": []},
+		{"repo": "not a repo", "pools": [{"name": "test", "capacity": "spot"}]},
+		{"repo": "acme/served", "pools": [{"name": "test", "capacity": "spot"}]}
+	]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Repos) != 1 || list.Repos[0].Name != "served" {
+		t.Fatalf("serving %+v", list.Repos)
+	}
+	for _, name := range []string{"acme/widgets", "acme/gadgets", "ACME/Widgets"} {
+		if !list.Holds(name) {
+			t.Errorf("the list does not hold %s", name)
+		}
+	}
+	if list.Holds("acme/served") || list.Holds("acme/other") {
+		t.Error("the list holds a repo whose entry it did not skip")
+	}
+}
+
+func TestAPoolsSettingsChangeUnderOneReaderAndOneWriter(t *testing.T) {
+	c := NewCurrent(Pool{Name: "test", Capacity: Spot, MaxRunners: 10})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 1000 {
+			_ = c.Get()
+		}
+	}()
+	c.Set(Pool{Name: "test", Capacity: OnDemand, MaxRunners: 3})
+	<-done
+	if got := c.Get(); got.Capacity != OnDemand || got.MaxRunners != 3 {
+		t.Fatalf("settings %+v", got)
+	}
+}

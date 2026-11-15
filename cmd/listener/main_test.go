@@ -77,10 +77,23 @@ type fakeCloud struct {
 	repos    map[string]github.Repo
 	session  *fakeSession
 	runs     []*ecs.RunTaskInput
-	mu       sync.Mutex
+	// deletedSets are the scale sets deleted, by id.
+	deletedSets []int
+	mu          sync.Mutex
+}
+
+// setList replaces the repo list, or makes it unreadable, while the
+// listener runs.
+func (c *fakeCloud) setList(raw string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.params["/paddock/repos"] = raw
+	c.paramErr = err
 }
 
 func (c *fakeCloud) Parameter(_ context.Context, name string) (string, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if name == "/paddock/repos" && c.paramErr != nil {
 		return "", false, c.paramErr
 	}
@@ -118,6 +131,17 @@ func (c *fakeCloud) Repo(_ context.Context, owner, name string) (github.Repo, er
 }
 
 func (c *fakeCloud) EnsureRunnerGroup(context.Context, string, string, int64) error { return nil }
+
+func (c *fakeCloud) RunnerGroups(context.Context, string) ([]string, error) {
+	return []string{"paddock-widgets-dev"}, nil
+}
+
+func (c *fakeCloud) DeleteRunnerScaleSet(_ context.Context, id int) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deletedSets = append(c.deletedSets, id)
+	return nil
+}
 
 func (c *fakeCloud) ScaleSets(github.AppKey, string, int64) (serve.ScaleSets, error) { return c, nil }
 
@@ -345,12 +369,20 @@ func TestABadAppKeyFailsBeforeAnyBeat(t *testing.T) {
 
 func runUntilBeat(t *testing.T, c *fakeCloud) (cancel func() (int, string)) {
 	t.Helper()
+	stop, _ := runLive(t, c)
+	return stop
+}
+
+// runLive runs the listener until its first beat, and gives its log as it
+// grows.
+func runLive(t *testing.T, c *fakeCloud) (cancel func() (int, string), logs *syncBuffer) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "heartbeat")
 	ctx, stop := context.WithCancel(context.Background())
-	var out syncBuffer
+	out := &syncBuffer{}
 	var errOut bytes.Buffer
 	done := make(chan int, 1)
-	go func() { done <- run(ctx, nil, envWith(listenerEnv(path)), &out, &errOut, connectTo(c)) }()
+	go func() { done <- run(ctx, nil, envWith(listenerEnv(path)), out, &errOut, connectTo(c)) }()
 	deadline := time.Now().Add(5 * time.Second)
 	for heartbeat.Check(path, time.Minute, time.Now()) != nil {
 		if time.Now().After(deadline) {
@@ -368,7 +400,7 @@ func runUntilBeat(t *testing.T, c *fakeCloud) (cancel func() (int, string)) {
 			t.Fatal("the listener did not stop on cancel")
 			return -1, ""
 		}
-	}
+	}, out
 }
 
 // With no list the listener serves nothing, but it still checks the App
@@ -407,17 +439,81 @@ func TestTheListenerLogsThatItPollsOncePerIntervalWhileGitHubAnswers(t *testing.
 	}
 }
 
-func TestAnUnreadableListServesNothingAndSaysSo(t *testing.T) {
+// A list the listener cannot read or parse at its start serves nothing, and
+// logs the line the stack's alarm counts.
+func TestAnUnreadableListAtTheStartServesNothingAndRaisesTheAlarm(t *testing.T) {
 	for name, c := range map[string]*fakeCloud{
 		"unreadable": {params: map[string]string{"/paddock/github-app": appKey}, paramErr: errors.New("AccessDenied")},
 		"not JSON":   {params: map[string]string{"/paddock/github-app": appKey, "/paddock/repos": "{"}},
 	} {
 		stop := runUntilBeat(t, c)
 		code, logs := stop()
-		if code != 0 || !strings.Contains(logs, "serving nothing") {
+		if code != 0 || !strings.Contains(logs, `"msg":"repo list unreadable"`) || strings.Contains(logs, `"msg":"pool ready"`) {
 			t.Errorf("%s: exit %d, logs:\n%s", name, code, logs)
 		}
 	}
+}
+
+func waitForLog(t *testing.T, logs *syncBuffer, want string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for strings.Count(logs.String(), want) < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("logs never said %s %d times:\n%s", want, n, logs.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// The listener re-reads the list while it runs: a repo added is served
+// with no restart, and a list that later cannot be read keeps the last
+// good one in force, raises the alarm, and deletes nothing.
+func TestTheListIsReReadAndAnUnreadableOneKeepsTheLastGood(t *testing.T) {
+	t.Run("fitness: a failed read of the list adds, changes and deletes nothing (served-repos.md)", func(t *testing.T) {
+		was := listReadEvery
+		listReadEvery = 10 * time.Millisecond
+		t.Cleanup(func() { listReadEvery = was })
+		session := &fakeSession{messages: make(chan *scaleset.RunnerScaleSetMessage), closed: make(chan struct{})}
+		c := &fakeCloud{
+			params:  map[string]string{"/paddock/github-app": appKey},
+			repos:   map[string]github.Repo{"acme/widgets": {ID: 7, Private: true}},
+			session: session,
+		}
+		stop, logs := runLive(t, c)
+		c.setList(`{"repos": [{"repo": "acme/widgets", "pools": [{"name": "dev", "capacity": "on-demand"}]}]}`, nil)
+		waitForLog(t, logs, `"msg":"pool ready"`, 1)
+
+		c.setList("", errors.New("ThrottlingException"))
+		waitForLog(t, logs, `"msg":"repo list unreadable"`, 3)
+		c.setList("{", nil)
+		waitForLog(t, logs, `"msg":"repo list unreadable"`, 6)
+
+		// The pool still serves: a job on it starts a task.
+		session.messages <- &scaleset.RunnerScaleSetMessage{MessageID: 1, Statistics: &scaleset.RunnerScaleSetStatistic{TotalAssignedJobs: 1}}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			c.mu.Lock()
+			n := len(c.runs)
+			c.mu.Unlock()
+			if n == 1 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the pool no longer serves after a failed read:\n%s", logs.String())
+			}
+			time.Sleep(time.Millisecond)
+		}
+		code, out := stop()
+		if code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		if strings.Contains(out, "pool removed") || len(c.deletedSets) != 0 {
+			t.Fatalf("a failed read removed a pool or deleted %v:\n%s", c.deletedSets, out)
+		}
+		if n := strings.Count(out, `"msg":"pool ready"`); n != 1 {
+			t.Fatalf("the pool was set up %d times", n)
+		}
+	})
 }
 
 // End to end, offline: a listed repo's pool gets a scale set, its session's
@@ -536,5 +632,23 @@ func TestTheListenerReadsTheRunnerConfigBucket(t *testing.T) {
 	delete(env, "PADDOCK_CONFIG_BUCKET")
 	if _, err := readConfig(envWith(env)); err == nil || !strings.Contains(err.Error(), "PADDOCK_CONFIG_BUCKET") {
 		t.Fatalf("started with no bucket: %v", err)
+	}
+}
+
+// An invalid entry is held as the last good list had it, and raises the
+// same alarm as an unreadable list, so the operator's typo does not sit
+// unnoticed.
+func TestAnInvalidEntryRaisesTheListAlarm(t *testing.T) {
+	c := &fakeCloud{params: map[string]string{
+		"/paddock/github-app": appKey,
+		"/paddock/repos":      `{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spto"}]}]}`,
+	}}
+	stop := runUntilBeat(t, c)
+	code, logs := stop()
+	if code != 0 || !strings.Contains(logs, `"msg":"repo list entry not valid"`) || !strings.Contains(logs, "entry 0") {
+		t.Fatalf("exit %d, logs:\n%s", code, logs)
+	}
+	if strings.Contains(logs, `"msg":"repo skipped: its entry in the list is not valid"`) {
+		t.Fatalf("the invalid entry is logged twice:\n%s", logs)
 	}
 }

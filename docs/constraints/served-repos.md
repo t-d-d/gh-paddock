@@ -14,22 +14,38 @@ pull request or a deploy.
   [{"name": "test", "capacity": "spot"}]}]}`. A pool may also set `vcpu`,
   `memoryGb`, `maxRunners` and `maxJobMinutes`; they default to 2, 8, 10
   and 120.
-- The listener reads the list on start. A missing or empty list serves
-  nothing. A list it cannot read or parse serves nothing and is logged. An
-  entry that is not valid is logged and skipped, and the rest are served.
+- The listener reads the list on start and every two minutes after, and
+  serves what changed with no restart. A missing or empty list serves
+  nothing. An entry that is not valid is logged and skipped, and the rest
+  are served; a repo whose entry is skipped stays as the last good list had
+  it, and the entry raises the same alarm as an unreadable list.
+- A list the listener cannot read or parse leaves the last good one in
+  force, or nothing at the start, and raises an alarm through
+  `AlertsTopic`. A failed read adds, changes and deletes nothing.
+- A pool gone from the list stops polling at once, so its waiting tasks get
+  no further config and exit by themselves (remove-then-terminate.md). Its
+  scale set is deleted once no task of the pool is left. The listener finds
+  a removed pool's scale set by its runner group, so a restart loses
+  nothing.
+- A changed pool setting applies to the next task the pool starts. Tasks
+  already running keep the settings they started with.
 - Tests use fake repos, such as `acme/widgets`.
 
 ## Examples
 
 - `fitness: served repos are configuration in the CI account, never a file here (served-repos.md)`
   in test/stack.test.ts, and the public-repo scan.
+- The Go subtest `fitness: a failed read of the list adds, changes and deletes nothing (served-repos.md)`
+  in cmd/listener, and the manager's tests in internal/serve.
 
 ## Do not
 
 - Do not put the list in a stack parameter resolved at deploy: a change to it
   would then need a deploy.
+- Do not take a failed read, or a skipped entry, for an empty list: every
+  scale set it served would be deleted.
 - Do not log the list whole: a log line pasted into a public issue would
   carry every repo.
 
 Judgment: the listener's logs name the repo a line is about, so the operator can act on it. A log line pasted into a public issue needs its repo cut first.
-History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16. #19 added each pool's `maxJobMinutes`.
+History: Settled with the owner in PRD #1, extending public-repo.md, and written by #16. #19 added each pool's `maxJobMinutes`. #20 had the listener re-read the list while it runs, keep the last good one when a read fails, and drain a removed pool, as PRD #1's journeys 1 and 6 ask.

@@ -24,6 +24,7 @@ import (
 // RerunJob re-run a job a Spot reclaim killed.
 type Installation interface {
 	Repo(ctx context.Context, owner, name string) (github.Repo, error)
+	RunnerGroups(ctx context.Context, org string) ([]string, error)
 	EnsureRunnerGroup(ctx context.Context, org, name string, repoID int64) error
 	Run(ctx context.Context, owner, name string, runID int64) (github.Run, error)
 	RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]github.Job, error)
@@ -47,6 +48,7 @@ type ScaleSets interface {
 	GetRunnerScaleSet(ctx context.Context, groupID int, name string) (*scaleset.RunnerScaleSet, error)
 	CreateRunnerScaleSet(ctx context.Context, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
 	UpdateRunnerScaleSet(ctx context.Context, id int, set *scaleset.RunnerScaleSet) (*scaleset.RunnerScaleSet, error)
+	DeleteRunnerScaleSet(ctx context.Context, id int) error
 	GenerateJitRunnerConfig(ctx context.Context, setting *scaleset.RunnerScaleSetJitRunnerSetting, scaleSetID int) (*scaleset.RunnerScaleSetJitRunnerConfig, error)
 	GetRunnerByName(ctx context.Context, name string) (*scaleset.RunnerReference, error)
 	RemoveRunner(ctx context.Context, runnerID int64) error
@@ -56,55 +58,14 @@ type ScaleSets interface {
 // Pool is a pool the listener serves: its repo, its settings, its scale set,
 // and the scale-set client and App installation of its org.
 type Pool struct {
-	Repo         repos.Repo
-	Pool         repos.Pool
+	Repo repos.Repo
+	Pool repos.Pool
+	// Settings is the pool's settings as the list last gave them, which
+	// change while it is served. Nil keeps Pool's.
+	Settings     *repos.Current
 	ScaleSetID   int
 	ScaleSets    ScaleSets
 	Installation Installation
-}
-
-// Setup makes each listed repo's pools ready on GitHub: for each pool a
-// runner group open to that repo alone, with public repos off, and a scale
-// set in it. A repo it cannot serve is logged and skipped, and the rest are
-// served. It returns the pools to serve.
-func Setup(ctx context.Context, app App, newScaleSets func(org string, installationID int64) (ScaleSets, error), list repos.List, log *slog.Logger) []Pool {
-	for _, err := range list.Skipped {
-		log.Error("repo skipped: its entry in the list is not valid", "error", err.Error())
-	}
-	type org struct {
-		inst Installation
-		sets ScaleSets
-		err  error
-	}
-	orgs := map[string]*org{}
-	var pools []Pool
-	for _, repo := range list.Repos {
-		o, ok := orgs[repo.Owner]
-		if !ok {
-			o = &org{}
-			var id int64
-			o.inst, id, o.err = app.Installation(ctx, repo.Owner)
-			if o.err == nil {
-				o.sets, o.err = newScaleSets(repo.Owner, id)
-			}
-			orgs[repo.Owner] = o
-		}
-		if o.err != nil {
-			log.Error("repo skipped", "repo", repo.FullName(), "error", o.err.Error())
-			continue
-		}
-		served, err := setupRepo(ctx, o.inst, o.sets, repo)
-		if err != nil {
-			log.Error("repo skipped", "repo", repo.FullName(), "error", err.Error())
-			continue
-		}
-		for _, p := range served {
-			log.Info("pool ready", "repo", repo.FullName(), "pool", p.Pool.Name, "scaleSet", repo.ScaleSetName(p.Pool),
-				"scaleSetId", p.ScaleSetID, "capacity", string(p.Pool.Capacity), "maxRunners", p.Pool.MaxRunners)
-		}
-		pools = append(pools, served...)
-	}
-	return pools
 }
 
 func setupRepo(ctx context.Context, inst Installation, sets ScaleSets, repo repos.Repo) ([]Pool, error) {
@@ -147,10 +108,12 @@ func setupRepo(ctx context.Context, inst Installation, sets ScaleSets, repo repo
 	return pools, nil
 }
 
-// beating passes each successful poll to beat: GitHub answered.
+// beating passes each successful poll to beat: GitHub answered. Each poll
+// tells GitHub the pool's maximum as its settings give it now.
 type beating struct {
 	s    Session
 	beat func()
+	max  func() int
 }
 
 func (b beating) DeleteMessage(ctx context.Context, id int) error { return b.s.DeleteMessage(ctx, id) }
@@ -162,6 +125,9 @@ func (b beating) AcquireJobs(ctx context.Context, ids []int64) ([]int64, error) 
 func (b beating) Session() scaleset.RunnerScaleSetSession { return b.s.Session() }
 
 func (b beating) GetMessage(ctx context.Context, last, max int) (*scaleset.RunnerScaleSetMessage, error) {
+	if b.max != nil {
+		max = b.max()
+	}
 	msg, err := b.s.GetMessage(ctx, last, max)
 	if err == nil {
 		b.beat()
@@ -266,6 +232,9 @@ func (a acquiring) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessag
 
 func runSession(ctx context.Context, pool Pool, session Session, scaler listener.Scaler, beat func(), log *slog.Logger) error {
 	client := beating{s: session, beat: beat}
+	if pool.Settings != nil {
+		client.max = func() int { return pool.Settings.Get().MaxRunners }
+	}
 	l, err := listener.New(client, listener.Config{
 		ScaleSetID: pool.ScaleSetID,
 		MaxRunners: pool.Pool.MaxRunners,

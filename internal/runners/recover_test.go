@@ -569,3 +569,28 @@ func TestATaskStillInItsWarningIsReadAgainOnceItStops(t *testing.T) {
 		t.Fatalf("re-ran %v once the task stopped", actions.reruns)
 	}
 }
+
+// A task keeps the maximum job time it started under, through a tag a
+// restarted listener reads back: a pool's later change applies to its next
+// tasks only.
+func TestATaskKeepsTheMaximumJobTimeItStartedUnder(t *testing.T) {
+	f, s, jit, c, l := recovering(t)
+	s.Pool.MaxJob = 2 * time.Hour
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	mustScale(t, s, startedRun(1, jit.calls[0], 5))
+	s.Pool.MaxJob = 30 * time.Minute
+	c.add(time.Hour + WarmLimit)
+	mustScale(t, s, nil)
+	// And as a restarted listener reads it.
+	s.tasks = nil
+	mustScale(t, s, nil)
+	if got := l.lines("task past its pool's maximum job time"); len(got) != 0 {
+		t.Fatalf("logged a task inside the time it started under: %v", got)
+	}
+	c.add(time.Hour + time.Second)
+	mustScale(t, s, nil)
+	if got := l.lines("task past its pool's maximum job time"); len(got) != 1 || got[0]["maxJob"] != "2h0m0s" {
+		t.Fatalf("log %s", l.buf.String())
+	}
+}

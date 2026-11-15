@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -330,5 +331,27 @@ func TestAKilledJobIsFoundInItsRunsAttemptAndReRun(t *testing.T) {
 	}
 	if len(f.reruns) != 1 || f.reruns[0] != "72" {
 		t.Fatalf("re-ran %v", f.reruns)
+	}
+}
+
+// A listener that restarts while a removed pool drains finds its scale set
+// again by its runner group, so it lists every runner group of the org.
+func TestRunnerGroupsListsTheOrgsGroupsByName(t *testing.T) {
+	f, app := newFake(t)
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Default", "paddock-widgets-test", "paddock-gone-dev"} {
+		f.groups[name] = map[string]any{"id": len(f.groups) + 1, "name": name}
+	}
+	names, err := inst.RunnerGroups(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(names)
+	if want := []string{"Default", "paddock-gone-dev", "paddock-widgets-test"}; !slices.Equal(names, want) {
+		t.Fatalf("groups %v, want %v", names, want)
 	}
 }

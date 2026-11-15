@@ -142,6 +142,7 @@ describe('the alarms', () => {
     .map((f) => readFileSync(resolve(REPO_ROOT, f), 'utf-8')).join('\n');
   const logged = (msg: string) => goSource.includes(`"${msg}"`);
   const msgOf = (pattern: string) => /\$\.msg = "([^"]+)"/.exec(pattern)?.[1] ?? '';
+  const msgsOf = (pattern: string) => [...pattern.matchAll(/\$\.msg = "([^"]+)"/g)].map((m) => m[1] ?? "");
 
   const cases: [alarm: string, metric: string, pattern: string][] = [
     ['ListenerDownAlarm', 'ListenerPolls', '{ $.msg = "listener polling" }'],
@@ -149,6 +150,7 @@ describe('the alarms', () => {
     ['FailedStartsAlarm', 'FailedStartsInARow', '{ $.msg = "failed start" && $.inARow >= 3 }'],
     ['TaskPastMaxJobAlarm', 'TasksPastMaxJob', '{ $.msg = "task past its pool\'s maximum job time" }'],
     ['SpotKillRateAlarm', 'SpotKillsOverLimit', '{ $.msg = "spot kills over their limit" }'],
+    ['RepoListUnreadableAlarm', 'RepoListUnreadable', '{ $.msg = "repo list unreadable" || $.msg = "repo list entry not valid" }'],
   ];
   for (const [id, metric, pattern] of cases) {
     test(`${id} counts the listener's "${msgOf(pattern)}" lines and pages the operator`, () => {
@@ -162,7 +164,7 @@ describe('the alarms', () => {
       assert.equal(filter?.LogGroupName, '${ListenerLogs}');
       assert.equal(filter?.FilterPattern, pattern);
       assert.equal(filter?.MetricTransformations?.[0]?.MetricNamespace, 'paddock');
-      assert.ok(logged(msgOf(pattern)), `the listener never logs "${msgOf(pattern)}"`);
+      for (const msg of msgsOf(pattern)) assert.ok(logged(msg), `the listener never logs "${msg}"`);
     });
   }
 
@@ -176,7 +178,7 @@ describe('the alarms', () => {
   });
 
   test('the other alarms fire on any line, and treat none as all is well', () => {
-    for (const id of ['JobWaitingAlarm', 'FailedStartsAlarm', 'TaskPastMaxJobAlarm', 'SpotKillRateAlarm']) {
+    for (const id of ['JobWaitingAlarm', 'FailedStartsAlarm', 'TaskPastMaxJobAlarm', 'SpotKillRateAlarm', 'RepoListUnreadableAlarm']) {
       const a = alarms[id]?.Properties;
       assert.equal(a?.Statistic, 'Sum', id);
       assert.equal(a?.ComparisonOperator, 'GreaterThanOrEqualToThreshold', id);

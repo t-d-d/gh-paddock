@@ -20,8 +20,9 @@ import (
 )
 
 type fakeInstallation struct {
-	repos  map[string]github.Repo
-	groups map[string]int64 // runner group name -> repo it is open to
+	groupsErr error
+	repos     map[string]github.Repo
+	groups    map[string]int64 // runner group name -> repo it is open to
 }
 
 func (i *fakeInstallation) Repo(_ context.Context, owner, name string) (github.Repo, error) {
@@ -35,6 +36,17 @@ func (i *fakeInstallation) Repo(_ context.Context, owner, name string) (github.R
 func (i *fakeInstallation) EnsureRunnerGroup(_ context.Context, _, name string, repoID int64) error {
 	i.groups[name] = repoID
 	return nil
+}
+
+func (i *fakeInstallation) RunnerGroups(context.Context, string) ([]string, error) {
+	if i.groupsErr != nil {
+		return nil, i.groupsErr
+	}
+	var names []string
+	for name := range i.groups {
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
@@ -58,9 +70,21 @@ func (a *fakeApp) Installation(_ context.Context, org string) (Installation, int
 }
 
 type fakeScaleSets struct {
-	inst   *fakeInstallation
-	sets   map[string]*scaleset.RunnerScaleSet
-	nextID int
+	inst    *fakeInstallation
+	sets    map[string]*scaleset.RunnerScaleSet
+	nextID  int
+	deleted []string
+}
+
+func (f *fakeScaleSets) DeleteRunnerScaleSet(_ context.Context, id int) error {
+	for name, set := range f.sets {
+		if set.ID == id {
+			delete(f.sets, name)
+			f.deleted = append(f.deleted, name)
+			return nil
+		}
+	}
+	return fmt.Errorf("no scale set %d", id)
 }
 
 func (f *fakeScaleSets) GetRunnerGroupByName(_ context.Context, name string) (*scaleset.RunnerGroup, error) {
@@ -114,11 +138,11 @@ func TestEachPoolOfAServedRepoGetsAScaleSetAndARunnerGroupOpenToItAlone(t *testi
 		{Name: "test", Capacity: repos.Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10},
 		{Name: "dev", Capacity: repos.OnDemand, VCPU: 2, MemoryGB: 8, MaxRunners: 2},
 	}}}}
-	var logs bytes.Buffer
-	pools := Setup(context.Background(), app, func(string, int64) (ScaleSets, error) { return sets, nil }, list, logger(&logs))
-	if len(pools) != 2 {
-		t.Fatalf("serving %d pools; logs:\n%s", len(pools), logs.String())
-	}
+	var logs syncBuffer
+	m, served := newManager(app, sets, &logs)
+	m.Apply(served.ctx, list)
+	t.Cleanup(served.stop)
+	pools := served.waitFor(t, 2)
 	for _, name := range []string{"paddock-widgets-test", "paddock-widgets-dev"} {
 		if inst.groups[name] != 7 {
 			t.Errorf("runner group %s is open to %d", name, inst.groups[name])
@@ -131,17 +155,27 @@ func TestEachPoolOfAServedRepoGetsAScaleSetAndARunnerGroupOpenToItAlone(t *testi
 			t.Errorf("scale set %+v", set)
 		}
 	}
-	if pools[1].Pool.Name != "dev" || pools[1].ScaleSetID == pools[0].ScaleSetID {
+	if pools["paddock-widgets-dev"].ScaleSetID == pools["paddock-widgets-test"].ScaleSetID {
 		t.Errorf("pools %+v", pools)
 	}
 	// Each pool carries its org's installation, which re-runs a job a Spot
-	// reclaim killed.
-	if pools[0].Installation != inst || pools[1].Installation != inst {
-		t.Errorf("pools carry installations %v, %v", pools[0].Installation, pools[1].Installation)
+	// reclaim killed, and its settings.
+	for name, p := range pools {
+		if p.Installation != inst {
+			t.Errorf("%s carries installation %v", name, p.Installation)
+		}
+		if p.Settings == nil || p.Settings.Get() != p.Pool {
+			t.Errorf("%s carries settings %v", name, p.Settings)
+		}
 	}
-	// Setup again finds both sets and creates none.
+	// A second manager, as after a restart, finds both sets and creates
+	// none.
 	before := sets.nextID
-	if again := Setup(context.Background(), app, func(string, int64) (ScaleSets, error) { return sets, nil }, list, logger(&logs)); len(again) != 2 || sets.nextID != before {
+	again, served2 := newManager(app, sets, &logs)
+	again.Apply(served2.ctx, list)
+	t.Cleanup(served2.stop)
+	served2.waitFor(t, 2)
+	if sets.nextID != before {
 		t.Fatalf("a second setup made %d more sets", sets.nextID-before)
 	}
 }
@@ -161,14 +195,16 @@ func TestARepoThatCannotBeServedIsLoggedAndSkipped(t *testing.T) {
 			{Owner: "acme", Name: "open", Pools: pool},
 			{Owner: "acme", Name: "widgets", Pools: pool},
 		},
-		Skipped: []error{errors.New("entry 9: repo x/y has no pools")},
 	}
-	var logs bytes.Buffer
-	pools := Setup(context.Background(), app, func(string, int64) (ScaleSets, error) { return sets, nil }, list, logger(&logs))
-	if len(pools) != 1 || pools[0].Repo.Name != "widgets" {
+	var logs syncBuffer
+	m, served := newManager(app, sets, &logs)
+	m.Apply(served.ctx, list)
+	t.Cleanup(served.stop)
+	pools := served.waitFor(t, 1)
+	if _, ok := pools["paddock-widgets-test"]; !ok || m.Serving() != 1 {
 		t.Fatalf("serving %+v", pools)
 	}
-	for _, want := range []string{"elsewhere/thing", "not installed", "acme/gone", "acme/open", "public", "entry 9"} {
+	for _, want := range []string{"elsewhere/thing", "not installed", "acme/gone", "acme/open", "public"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the logs do not say %q:\n%s", want, logs.String())
 		}
@@ -447,4 +483,32 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A pool's maximum can change while it is served: each poll tells GitHub
+// the maximum its settings give at that moment.
+func TestEachPollCarriesThePoolsMaximumAsItsSettingsGiveItNow(t *testing.T) {
+	session := &fakeSession{id: uuid.New(), messages: make(chan *scaleset.RunnerScaleSetMessage)}
+	scaler := &recordingScaler{}
+	var logs syncBuffer
+	settings := repos.NewCurrent(repos.Pool{Name: "test", MaxRunners: 4})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, Pool{Repo: repos.Repo{Owner: "acme", Name: "widgets"}, Pool: settings.Get(), Settings: settings, ScaleSetID: 5},
+			func(context.Context) (Session, error) { return session, nil }, scaler, func() {}, slog.New(slog.NewJSONHandler(&logs, nil)), func(int) time.Duration { return time.Millisecond })
+		close(done)
+	}()
+	session.messages <- nil
+	waitFor(t, "a poll", func() bool { return scaler.count() >= 1 })
+	settings.Set(repos.Pool{Name: "test", MaxRunners: 2})
+	session.messages <- nil
+	session.messages <- nil
+	cancel()
+	<-done
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if first, last := session.max[0], session.max[len(session.max)-1]; first != 4 || last != 2 {
+		t.Fatalf("polls told GitHub maximums %v, want 4 first and 2 last", session.max)
+	}
 }

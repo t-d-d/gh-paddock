@@ -249,21 +249,45 @@ func (i *Installation) EnsureRunnerGroup(ctx context.Context, org, name string, 
 }
 
 func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (*runnerGroup, error) {
+	var found *runnerGroup
+	err := i.eachRunnerGroup(ctx, base, func(g runnerGroup) bool {
+		if g.Name == name {
+			found = &g
+			return false
+		}
+		return true
+	})
+	return found, err
+}
+
+// RunnerGroups names every runner group of org.
+func (i *Installation) RunnerGroups(ctx context.Context, org string) ([]string, error) {
+	var names []string
+	err := i.eachRunnerGroup(ctx, "/orgs/"+url.PathEscape(org)+"/actions/runner-groups", func(g runnerGroup) bool {
+		names = append(names, g.Name)
+		return true
+	})
+	return names, err
+}
+
+// eachRunnerGroup calls more with each of the org's runner groups, a page at
+// a time, until more returns false.
+func (i *Installation) eachRunnerGroup(ctx context.Context, base string, more func(runnerGroup) bool) error {
 	for page := 1; ; page++ {
 		var out struct {
 			Total  int           `json:"total_count"`
 			Groups []runnerGroup `json:"runner_groups"`
 		}
 		if err := i.do(ctx, http.MethodGet, fmt.Sprintf("%s?per_page=100&page=%d", base, page), nil, &out, http.StatusOK); err != nil {
-			return nil, err
+			return err
 		}
 		for _, g := range out.Groups {
-			if g.Name == name {
-				return &g, nil
+			if !more(g) {
+				return nil
 			}
 		}
 		if len(out.Groups) < 100 {
-			return nil, nil
+			return nil
 		}
 	}
 }

@@ -599,3 +599,55 @@ func TestAFreshConfigIsKeptThoughNoTaskShowsYet(t *testing.T) {
 		t.Fatal("a config written a moment ago was deleted")
 	}
 }
+
+// The listener sets a pool's settings when the list changes; the next task
+// the scaler starts takes them, and the tasks already running keep theirs.
+func TestAChangedPoolSettingAppliesToTheNextTaskStarted(t *testing.T) {
+	f := newFakeAWS()
+	s, _ := newScaler(f, spotTest)
+	s.Settings = repos.NewCurrent(spotTest)
+	if err := s.Scale(context.Background(), assigned(1)); err != nil {
+		t.Fatal(err)
+	}
+	s.Settings.Set(repos.Pool{Name: "test", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 2, MaxJob: time.Hour})
+	if err := s.Scale(context.Background(), assigned(5)); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.runs) != 2 {
+		t.Fatalf("started %d tasks, the new maximum is 2", len(f.runs))
+	}
+	if got := aws.ToString(f.runs[0].CapacityProviderStrategy[0].CapacityProvider); got != "FARGATE_SPOT" {
+		t.Errorf("the first task's capacity %s", got)
+	}
+	run := f.runs[1]
+	if got := aws.ToString(run.CapacityProviderStrategy[0].CapacityProvider); got != "FARGATE" {
+		t.Errorf("the next task's capacity %s", got)
+	}
+	if def := f.defs[aws.ToString(run.TaskDefinition)]; aws.ToString(def.Cpu) != "4096" || aws.ToString(def.Memory) != "16384" {
+		t.Errorf("the next task's size %s/%s", aws.ToString(def.Cpu), aws.ToString(def.Memory))
+	}
+	if s.Pool.MaxJob != time.Hour {
+		t.Errorf("the pool's maximum job time %s", s.Pool.MaxJob)
+	}
+}
+
+// A removed pool's scale set goes once no task of it runs, so the listener
+// counts a scale set's live tasks the way the scaler finds them.
+func TestLiveTasksCountsAScaleSetsRunningTasks(t *testing.T) {
+	f := newFakeAWS()
+	s, _ := newScaler(f, spotTest)
+	if err := s.Scale(context.Background(), assigned(2)); err != nil {
+		t.Fatal(err)
+	}
+	n, err := LiveTasks(context.Background(), f, "paddock", 5)
+	if err != nil || n != 2 {
+		t.Fatalf("%d live tasks, %v", n, err)
+	}
+	if n, _ := LiveTasks(context.Background(), f, "paddock", 6); n != 0 {
+		t.Fatalf("another scale set has %d live tasks", n)
+	}
+	f.stopAll()
+	if n, _ := LiveTasks(context.Background(), f, "paddock", 5); n != 0 {
+		t.Fatalf("%d live tasks after all stopped", n)
+	}
+}

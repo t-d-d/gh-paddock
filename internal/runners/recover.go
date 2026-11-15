@@ -55,6 +55,9 @@ const spotKillLimit = 1.0 / 200
 const (
 	tagHanded = "paddock:handed"
 	tagJob    = "paddock:job"
+	// tagMaxJob is the pool's maximum job time, in minutes, when the task
+	// started: a later change to the pool applies to its next tasks only.
+	tagMaxJob = "paddock:maxJobMinutes"
 )
 
 const (
@@ -120,6 +123,9 @@ func (s *Scaler) readTask(lt ecstypes.Task) *task {
 	}
 	if runner, _, ok := splitTag(tagOf(lt, tagJob)); ok && runner == t.runner {
 		t.started = true
+	}
+	if mins, err := strconv.Atoi(tagOf(lt, tagMaxJob)); err == nil && mins > 0 {
+		t.maxJob = time.Duration(mins) * time.Minute
 	}
 	return t
 }
@@ -206,13 +212,17 @@ func (s *Scaler) replaceFailedStarts(ctx context.Context, live []ecstypes.Task) 
 // finds stops a task.
 func (s *Scaler) watch(ctx context.Context) {
 	now := s.now()
-	maxJob := s.Pool.MaxJob
-	if maxJob == 0 {
-		maxJob = defaultMaxJob
-	}
 	// A task is handed configs for WarmLimit, 30 minutes, after its start,
-	// and its last job may then run the pool's maximum.
+	// and its last job may then run the pool's maximum as it was when the
+	// task started.
 	for _, t := range s.tasks {
+		maxJob := t.maxJob
+		if maxJob == 0 {
+			maxJob = s.Pool.MaxJob
+		}
+		if maxJob == 0 {
+			maxJob = defaultMaxJob
+		}
 		if age := now.Sub(t.created); age > WarmLimit+maxJob && now.Sub(t.warned) >= logEvery {
 			t.warned = now
 			s.Log.Warn(logTaskPastMaxJob, "task", shortARN(t.arn), "runner", t.runner,

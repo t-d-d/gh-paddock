@@ -438,6 +438,16 @@ Resources:
           MetricName: SpotKillsOverLimit
           MetricValue: '1'
 
+  RepoListUnreadableFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ListenerLogs
+      FilterPattern: '{ $.msg = "repo list unreadable" || $.msg = "repo list entry not valid" }'
+      MetricTransformations:
+        - MetricNamespace: paddock
+          MetricName: RepoListUnreadable
+          MetricValue: '1'
+
   # Each pool's job counts, by repo and pool. The listener reads the first
   # two back over 30 days for the Spot-kill rate.
   JobsFinishedFilter:
@@ -603,6 +613,31 @@ Resources:
       Period: 3600
       EvaluationPeriods: 2
       DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # The listener reads the list every two minutes and logs each read that
+  # fails, and each invalid entry, so a list still broken keeps a line in
+  # every five minutes.
+  RepoListUnreadableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: paddock-repo-list-unreadable
+      AlarmDescription: >-
+        The listener cannot read or parse the repo list, /paddock/repos,
+        or an entry in it is not valid. It keeps serving the last list it
+        read, or the repo of the invalid entry as it was, until the list
+        reads clean. Its log gives the error.
+      Namespace: paddock
+      MetricName: RepoListUnreadable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching

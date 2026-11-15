@@ -18,8 +18,11 @@ package repos
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -78,6 +81,55 @@ func (r Repo) ScaleSetName(p Pool) string {
 type List struct {
 	Repos   []Repo
 	Skipped []error
+	// held are the repos, lowercased owner/name, whose entries were
+	// skipped.
+	held map[string]bool
+}
+
+// Holds says whether the list skipped an entry for repo, owner/name in any
+// case. The listener leaves such a repo as the last good list had it, so a
+// typo in its entry never reads as its removal.
+func (l List) Holds(repo string) bool { return l.held[strings.ToLower(repo)] }
+
+// Held is every repo, lowercased owner/name, that Holds is true of.
+func (l List) Held() []string {
+	return slices.Sorted(maps.Keys(l.held))
+}
+
+func (l *List) skip(repo string, err error) {
+	l.Skipped = append(l.Skipped, err)
+	if repo == "" {
+		return
+	}
+	if l.held == nil {
+		l.held = map[string]bool{}
+	}
+	l.held[strings.ToLower(repo)] = true
+}
+
+// Current is a served pool's settings as the list last gave them. The
+// listener sets it when the list changes, and the pool's scaler and session
+// read it, each from its own goroutine.
+type Current struct {
+	mu   sync.Mutex
+	pool Pool
+}
+
+// NewCurrent holds p.
+func NewCurrent(p Pool) *Current { return &Current{pool: p} }
+
+// Get is the pool's settings now.
+func (c *Current) Get() Pool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pool
+}
+
+// Set replaces the pool's settings.
+func (c *Current) Set(p Pool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.pool = p
 }
 
 type document struct {
@@ -118,17 +170,18 @@ func Parse(raw string) (List, error) {
 	for i, entry := range doc.Repos {
 		m := repoPattern.FindStringSubmatch(entry.Repo)
 		if m == nil {
-			list.Skipped = append(list.Skipped, fmt.Errorf("entry %d: repo %q is not owner/name", i, entry.Repo))
+			list.skip("", fmt.Errorf("entry %d: repo %q is not owner/name", i, entry.Repo))
 			continue
 		}
 		repo := Repo{Owner: m[1], Name: m[2]}
 		key := strings.ToLower(repo.FullName())
 		if seen[key] {
+			// The first entry serves it; this one holds nothing.
 			list.Skipped = append(list.Skipped, fmt.Errorf("entry %d: repo %s is listed twice", i, repo.FullName()))
 			continue
 		}
 		if len(entry.Pools) == 0 {
-			list.Skipped = append(list.Skipped, fmt.Errorf("entry %d: repo %s has no pools", i, repo.FullName()))
+			list.skip(repo.FullName(), fmt.Errorf("entry %d: repo %s has no pools", i, repo.FullName()))
 			continue
 		}
 		var problem error
@@ -157,7 +210,7 @@ func Parse(raw string) (List, error) {
 			problem = sharedScaleSet(repo, scaleSets)
 		}
 		if problem != nil {
-			list.Skipped = append(list.Skipped, fmt.Errorf("entry %d: repo %s: %w", i, repo.FullName(), problem))
+			list.skip(repo.FullName(), fmt.Errorf("entry %d: repo %s: %w", i, repo.FullName(), problem))
 			continue
 		}
 		owner := strings.ToLower(repo.Owner)
