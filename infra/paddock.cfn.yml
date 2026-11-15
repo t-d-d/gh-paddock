@@ -273,6 +273,10 @@ Resources:
       CapacityProviderStrategy:
         - CapacityProvider: FARGATE_SPOT
           Weight: 1
+      # ECS turns rebalancing across zones on by default, and refuses to
+      # update a service that has it on and a maximum of 100% or less. With
+      # one task there is nothing to rebalance.
+      AvailabilityZoneRebalancing: DISABLED
       DeploymentConfiguration:
         # The old task stops, closing its sessions, before the new one
         # starts: GitHub allows one message session per scale set
