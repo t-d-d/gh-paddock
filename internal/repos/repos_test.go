@@ -3,6 +3,7 @@ package repos
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAnEmptyOrMissingListServesNothing(t *testing.T) {
@@ -17,7 +18,7 @@ func TestAnEmptyOrMissingListServesNothing(t *testing.T) {
 	}
 }
 
-func TestAPoolTakesGitHubsPrivateRunnerSizeAndTenRunnersByDefault(t *testing.T) {
+func TestAPoolTakesGitHubsPrivateRunnerSizeTenRunnersAndTwoHourJobsByDefault(t *testing.T) {
 	list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spot"}]}]}`)
 	if err != nil {
 		t.Fatal(err)
@@ -29,19 +30,19 @@ func TestAPoolTakesGitHubsPrivateRunnerSizeAndTenRunnersByDefault(t *testing.T) 
 	if repo.Owner != "acme" || repo.Name != "widgets" {
 		t.Fatalf("repo %+v", repo)
 	}
-	want := Pool{Name: "test", Capacity: Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10}
+	want := Pool{Name: "test", Capacity: Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10, MaxJob: 2 * time.Hour}
 	if len(repo.Pools) != 1 || repo.Pools[0] != want {
 		t.Fatalf("pools %+v, want %+v", repo.Pools, want)
 	}
 }
 
-func TestAPoolSetsItsOwnCapacitySizeAndMaximum(t *testing.T) {
+func TestAPoolSetsItsOwnCapacitySizeMaximumAndJobTime(t *testing.T) {
 	list, err := Parse(`{"repos": [{"repo": "acme/widgets", "pools": [
-		{"name": "dev", "capacity": "on-demand", "vcpu": 4, "memoryGb": 16, "maxRunners": 3}]}]}`)
+		{"name": "dev", "capacity": "on-demand", "vcpu": 4, "memoryGb": 16, "maxRunners": 3, "maxJobMinutes": 45}]}]}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Pool{Name: "dev", Capacity: OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 3}
+	want := Pool{Name: "dev", Capacity: OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 3, MaxJob: 45 * time.Minute}
 	if got := list.Repos[0].Pools[0]; got != want {
 		t.Fatalf("pool %+v, want %+v", got, want)
 	}
@@ -66,6 +67,8 @@ func TestABadRepoIsSkippedWithItsReasonAndTheRestServed(t *testing.T) {
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "vcpu": 1, "memoryGb": 16}]}`:            "size",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": -1}]}`:                     "maxRunners",
 		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxRunners": 101}]}`:                    "maxRunners",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxJobMinutes": 0}]}`:                   "maxJobMinutes",
+		`{"repo": "acme/x", "pools": [{"name": "test", "capacity": "spot", "maxJobMinutes": 7201}]}`:                "maxJobMinutes",
 	}
 	for entry, reason := range cases {
 		list, err := Parse(`{"repos": [` + entry + `, {"repo": "acme/good", "pools": [{"name": "test", "capacity": "spot"}]}]}`)

@@ -1,7 +1,8 @@
 // Package github is the listener's GitHub App: the REST calls the scale-set
 // client does not make. It checks the App's key, finds the App's
 // installation on an org, reads a repo, and keeps each pool's runner group
-// open to its one repo with public repos off.
+// open to its one repo with public repos off. It re-runs a job a Spot
+// reclaim killed, once the job's workflow run completes.
 //
 // It holds the App key, which only the listener does
 // (docs/constraints/runner-isolation.md), and never prints it.
@@ -265,4 +266,54 @@ func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (
 			return nil, nil
 		}
 	}
+}
+
+// Run is what the listener needs of a workflow run: whether it has
+// completed, and its latest attempt.
+type Run struct {
+	Status  string `json:"status"`
+	Attempt int    `json:"run_attempt"`
+}
+
+// Run reads a workflow run of owner/name.
+func (i *Installation) Run(ctx context.Context, owner, name string, runID int64) (Run, error) {
+	var out Run
+	path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d", url.PathEscape(owner), url.PathEscape(name), runID)
+	err := i.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK)
+	return out, err
+}
+
+// Job is one job of a workflow run's attempt.
+type Job struct {
+	ID          int64     `json:"id"`
+	RunnerName  string    `json:"runner_name"`
+	Conclusion  string    `json:"conclusion"`
+	CompletedAt time.Time `json:"completed_at"`
+}
+
+// RunJobs reads every job of one attempt of a workflow run.
+func (i *Installation) RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]Job, error) {
+	base := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/attempts/%d/jobs", url.PathEscape(owner), url.PathEscape(name), runID, attempt)
+	var jobs []Job
+	for page := 1; ; page++ {
+		var out struct {
+			Total int   `json:"total_count"`
+			Jobs  []Job `json:"jobs"`
+		}
+		if err := i.do(ctx, http.MethodGet, fmt.Sprintf("%s?per_page=100&page=%d", base, page), nil, &out, http.StatusOK); err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, out.Jobs...)
+		if len(out.Jobs) == 0 || len(jobs) >= out.Total {
+			return jobs, nil
+		}
+	}
+}
+
+// RerunJob re-runs one job of a completed workflow run, as a new attempt.
+// It needs the App's Actions write permission, which is held for this
+// alone (docs/constraints/runner-isolation.md).
+func (i *Installation) RerunJob(ctx context.Context, owner, name string, jobID int64) error {
+	path := fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/rerun", url.PathEscape(owner), url.PathEscape(name), jobID)
+	return i.do(ctx, http.MethodPost, path, map[string]any{}, nil, http.StatusCreated)
 }

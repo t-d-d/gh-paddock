@@ -110,16 +110,21 @@ next_config() {
 }
 
 # ECS stops a task with SIGTERM to this script alone, which as process 1
-# ignores any signal it has no handler for. The signal goes on to run.sh,
-# whose own trap stops the runner, and the task exits once run.sh has.
+# ignores any signal it has no handler for. A waiting task, with no runner
+# registered, exits at once. A runner whose job is running never sees the
+# signal: Fargate Spot gives two minutes' notice, so a job near its end
+# finishes, and the task then exits with no wait for another config. A job
+# still running when the notice ends dies with the task, and the listener
+# re-runs it once its workflow run completes.
 child=""
+stopping=""
 stop() {
   trap - TERM INT
-  if [ -n "$child" ]; then
-    kill -TERM "$child" 2>/dev/null || true
-    wait "$child" || true
+  stopping=1
+  if [ -z "$child" ]; then
+    exit 143
   fi
-  exit 143
+  echo "paddock: stop held back from runner $runner while its job runs"
 }
 trap stop TERM INT
 
@@ -132,9 +137,15 @@ while :; do
   child=$!
   code=0
   wait "$child" || code=$?
+  # A trapped signal cuts the wait short: wait again for the job itself.
+  while [ -n "$stopping" ] && kill -0 "$child" 2>/dev/null; do
+    code=0
+    wait "$child" || code=$?
+  done
   child=""
+  [ -z "$stopping" ] || exit 143
   ((code == 0)) || exit "$code"
-  next_config || exit 0
+next_config || exit 0
 done
 PADDOCK_ENTRYPOINT
 RUN chmod 755 /home/runner/paddock-entrypoint

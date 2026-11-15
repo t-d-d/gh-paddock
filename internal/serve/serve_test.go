@@ -37,6 +37,14 @@ func (i *fakeInstallation) EnsureRunnerGroup(_ context.Context, _, name string, 
 	return nil
 }
 
+func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
+	return github.Run{}, nil
+}
+func (i *fakeInstallation) RunJobs(context.Context, string, string, int64, int) ([]github.Job, error) {
+	return nil, nil
+}
+func (i *fakeInstallation) RerunJob(context.Context, string, string, int64) error { return nil }
+
 type fakeApp struct {
 	orgs map[string]*fakeInstallation
 }
@@ -85,6 +93,11 @@ func (f *fakeScaleSets) GenerateJitRunnerConfig(context.Context, *scaleset.Runne
 	return nil, errors.New("not in this test")
 }
 
+func (f *fakeScaleSets) GetRunnerByName(context.Context, string) (*scaleset.RunnerReference, error) {
+	return nil, nil
+}
+func (f *fakeScaleSets) RemoveRunner(context.Context, int64) error { return nil }
+
 func (f *fakeScaleSets) OpenSession(context.Context, int, string) (Session, error) {
 	return nil, errors.New("not in this test")
 }
@@ -120,6 +133,11 @@ func TestEachPoolOfAServedRepoGetsAScaleSetAndARunnerGroupOpenToItAlone(t *testi
 	}
 	if pools[1].Pool.Name != "dev" || pools[1].ScaleSetID == pools[0].ScaleSetID {
 		t.Errorf("pools %+v", pools)
+	}
+	// Each pool carries its org's installation, which re-runs a job a Spot
+	// reclaim killed.
+	if pools[0].Installation != inst || pools[1].Installation != inst {
+		t.Errorf("pools carry installations %v, %v", pools[0].Installation, pools[1].Installation)
 	}
 	// Setup again finds both sets and creates none.
 	before := sets.nextID

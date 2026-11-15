@@ -22,6 +22,11 @@ latest release, so the image must keep up.
   a runner for each new one. A config it has run counts as none. It exits
   when no new config comes in the 30 seconds, or its URL is refused
   (runner-isolation.md).
+- On SIGTERM a waiting entrypoint exits at once. One whose runner has a job
+  never passes the signal on: the job runs until it ends or the task is
+  killed, and the task then exits with no wait for another config. The
+  task definition gives the container 120 seconds to stop, Fargate Spot's
+  notice (remove-then-terminate.md).
 - Every runner task runs x64.
 - Dependabot watches the image's base weekly, with the week's cooldown every
   update gets.
@@ -45,4 +50,4 @@ latest release, so the image must keep up.
   and a single-use runner would lose its job.
 
 Judgment: no offline check sees how far the image is behind GitHub's latest runner release. A Dependabot pull request left unmerged for three weeks is the warning.
-History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed. #54 had it wait 30 seconds after each job and exit by itself.
+History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed. #54 had it wait 30 seconds after each job and exit by itself. #19 had it hold SIGTERM back from a running job.

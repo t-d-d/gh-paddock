@@ -28,7 +28,7 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 | `cmd/listener/` | The listener, in Go, and its Dockerfile |
 | `internal/` | The listener's packages |
 | `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes |
-| `infra/paddock.cfn.yml` | The listener's service, what it needs to start runner tasks, its alarm and the alerts topic |
+| `infra/paddock.cfn.yml` | The listener's service, what it needs to start runner tasks, its alarms and the alerts topic |
 | `runner/` | The runner's image, built FROM GitHub's runner image |
 | `scripts/` | The deploy's probe and stack guard, and the public-repo scan |
 | `test/` | Tests of the stacks, the workflows and the scripts |
@@ -45,7 +45,7 @@ The deploy needs an AWS account that holds gh-paddock alone, in us-east-1, with 
 2. Put its `DeployRoleArn` output in the repository secret `AWS_DEPLOY_ROLE_ARN`.
 3. Write the alert address to the Parameter Store parameter `/paddock/alert-email`, as a String, not a SecureString.
 4. Write the GitHub App's key to the Parameter Store parameter `/paddock/github-app`, as a SecureString under the account's default key. Its value is one JSON object: `appId`, a JSON number, and `privateKey`, the PKCS#1 PEM GitHub gives you, with its line breaks as `\n` escapes. `jq -n --argjson id <app id> --rawfile key <key file> '{appId: $id, privateKey: $key}'` builds it. No stack creates this parameter, and only the listener reads it.
-5. List the repos to serve in the Parameter Store parameter `/paddock/repos`, as a String: `{"repos": [{"repo": "owner/name", "pools": [{"name": "test", "capacity": "spot"}, {"name": "dev", "capacity": "on-demand"}]}]}`. A pool may also set `vcpu`, `memoryGb` and `maxRunners`, which default to 2, 8 and 10. The App must be installed on each repo's org, and each repo must be private. The listener reads the list when it starts, so restart its task after a change. Each pool's workflows run on `runs-on: paddock-<repo>-<pool>`.
+5. List the repos to serve in the Parameter Store parameter `/paddock/repos`, as a String: `{"repos": [{"repo": "owner/name", "pools": [{"name": "test", "capacity": "spot"}, {"name": "dev", "capacity": "on-demand"}]}]}`. A pool may also set `vcpu`, `memoryGb`, `maxRunners` and `maxJobMinutes`, which default to 2, 8, 10 and 120. A task still running 30 minutes past its pool's `maxJobMinutes` raises an alarm. The App must be installed on each repo's org, and each repo must be private. The listener reads the list when it starts, so restart its task after a change. Each pool's workflows run on `runs-on: paddock-<repo>-<pool>`.
 
 From then on every green merge to main deploys. The operator guide comes with v1.
 

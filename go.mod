@@ -6,6 +6,7 @@ require (
 	github.com/actions/scaleset v0.5.0
 	github.com/aws/aws-sdk-go-v2 v1.48.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.18
+	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.76.0
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.105.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.83.0

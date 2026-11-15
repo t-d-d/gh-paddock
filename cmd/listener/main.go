@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,6 +49,10 @@ const (
 	// more, before the listener counts as stopped.
 	beatMaxAge = scaleset.MessagePollTimeout + time.Minute
 )
+
+// pollLogEvery is how often the listener logs that GitHub answered it since
+// the last such line. The stack's listener-down alarm counts those lines.
+var pollLogEvery = time.Minute
 
 func main() {
 	os.Exit(mainWith(connectAWS))
@@ -133,6 +138,7 @@ type cloud interface {
 	SSM() runners.SSM
 	Objects() runners.Objects
 	Presigner() runners.Presigner
+	Metrics() runners.Metrics
 }
 
 type connector func(ctx context.Context, region string) (cloud, error)
@@ -195,7 +201,9 @@ func listen(ctx context.Context, cfg config, connect connector, log *slog.Logger
 	if err := gh.Check(ctx); err != nil {
 		return fmt.Errorf("GitHub refused the App key: %w", err)
 	}
+	var beats atomic.Int64
 	beat := func() {
+		beats.Add(1)
 		if err := heartbeat.Beat(cfg.heartbeatFile, time.Now()); err != nil {
 			log.Error("heartbeat failed", "error", err.Error())
 		}
@@ -211,9 +219,11 @@ func listen(ctx context.Context, cfg config, connect connector, log *slog.Logger
 
 	owner, _ := os.Hostname()
 	var wg sync.WaitGroup
+	wg.Go(func() { logPolling(ctx, &beats, log) })
 	for _, p := range pools {
 		scaler := &runners.Scaler{
 			ECS: c.ECS(), SSM: c.SSM(), JIT: p.ScaleSets, Objects: c.Objects(), Presigner: c.Presigner(),
+			Actions: p.Installation, Metrics: c.Metrics(),
 			Launch: cfg.launch,
 			Repo:   p.Repo, Pool: p.Pool, ScaleSetID: p.ScaleSetID,
 			Log: log.With("repo", p.Repo.FullName(), "pool", p.Pool.Name),
@@ -228,6 +238,25 @@ func listen(ctx context.Context, cfg config, connect connector, log *slog.Logger
 	}
 	wg.Wait()
 	return nil
+}
+
+// logPolling logs, once each pollLogEvery, that GitHub answered the listener
+// since the last such line.
+func logPolling(ctx context.Context, beats *atomic.Int64, log *slog.Logger) {
+	ticker := time.NewTicker(pollLogEvery)
+	defer ticker.Stop()
+	var last int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if n := beats.Load(); n != last {
+			last = n
+			log.Info("listener polling")
+		}
+	}
 }
 
 // readList reads the repo list. A missing list serves nothing; so does one
