@@ -8,10 +8,10 @@
 # runner more than 30 days behind its latest release once updates are off,
 # and the scale set turns them off.
 #
-# It copies nothing from the repo, so the deploy's tag hashes runner/ alone.
-# The listener's task definition for each runner injects its config as
-# ACTIONS_RUNNER_INPUT_JITCONFIG, which run.sh reads, runs one job, and
-# exits.
+# It copies nothing from the repo, so the deploy's tag hashes runner/ alone:
+# the entrypoint below is written inline. The listener's task definition for
+# each task injects its first config as PADDOCK_CONFIG, and the entrypoint
+# runs a runner for it and for each later config the task is handed.
 FROM ghcr.io/actions/actions-runner:2.338.2
 
 USER root
@@ -36,5 +36,85 @@ RUN set -eux; \
     rm -rf /tmp/aws /tmp/awscli.zip; \
     aws --version
 
+# Runs a runner for each config the task is handed
+# (docs/constraints/runner-image.md). PADDOCK_CONFIG, injected by ECS from
+# the task's own parameter, holds the first runner's name and just-in-time
+# config, and a presigned URL to the one object that holds the task's later
+# configs. After each job it waits up to 30 seconds for a new config, wipes
+# the last job's checkout and temporary files, keeping the caches, and runs
+# the next. It exits when no new config comes, or the URL is refused.
+RUN cat > /home/runner/paddock-entrypoint <<'PADDOCK_ENTRYPOINT'
+#!/bin/bash
+set -euo pipefail
+
+wait_for=${PADDOCK_CONFIG_WAIT:-30}
+first=${PADDOCK_CONFIG:?the task was given no config}
+# The URL reads the task's later configs: keep it out of every runner's
+# environment.
+unset PADDOCK_CONFIG PADDOCK_CONFIG_WAIT
+url=$(jq -er .url <<<"$first")
+runner=$(jq -er .runner <<<"$first")
+jit=$(jq -er .jitconfig <<<"$first")
+unset first
+ran=" $runner "
+
+# The checkout, the job's temporary files, downloaded actions and the last
+# runner's own registration go. The tool cache and the home caches stay
+# (docs/constraints/pool-per-repo.md). A job can leave files only root may
+# delete, so sudo, which the base image gives the runner user, deletes what
+# rm cannot. If that fails too, the task exits before any runner starts.
+wipe() {
+  local paths=("$HOME/.runner" "$HOME/.credentials" "$HOME/.credentials_rsaparams")
+  if [ -d "$HOME/_work" ]; then
+    mapfile -t -O "${#paths[@]}" paths < <(find "$HOME/_work" -mindepth 1 -maxdepth 1 ! -name _tool)
+  fi
+  mapfile -t -O "${#paths[@]}" paths < <(find "${TMPDIR:-/tmp}" -mindepth 1 -maxdepth 1)
+  rm -rf -- "${paths[@]}" 2>/dev/null || sudo -n rm -rf -- "${paths[@]}"
+}
+
+# Polls the URL for a config with a runner not yet run. A missing object is
+# no config yet, and so is a server error or a network failure; any other
+# refusal ends the wait.
+next_config() {
+  local deadline=$((SECONDS + wait_for)) body code name
+  body=$(mktemp)
+  while ((SECONDS < deadline)); do
+    code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 5 "$url" 2>/dev/null) || code=000
+    case $code in
+      200)
+        name=$(jq -r '.runner // empty' "$body" 2>/dev/null) || name=""
+        if [ -n "$name" ] && [[ $ran != *" $name "* ]]; then
+          jit=$(jq -er .jitconfig "$body")
+          runner=$name
+          ran="$ran$name "
+          rm -f "$body"
+          return 0
+        fi
+        ;;
+      000 | 404 | 5??) ;;
+      *)
+        echo "paddock: the config URL was refused ($code)"
+        rm -f "$body"
+        return 1
+        ;;
+    esac
+    sleep 1
+  done
+  rm -f "$body"
+  echo "paddock: no new config in ${wait_for}s"
+  return 1
+}
+
+while :; do
+  wipe
+  echo "paddock: starting runner $runner"
+  # run.sh registers the runner, runs one job, and leaves GitHub before it
+  # returns, so the task never waits or exits with a runner registered.
+  ACTIONS_RUNNER_INPUT_JITCONFIG=$jit "$HOME/run.sh" || exit $?
+  next_config || exit 0
+done
+PADDOCK_ENTRYPOINT
+RUN chmod 755 /home/runner/paddock-entrypoint
+
 USER runner
-CMD ["/home/runner/run.sh"]
+CMD ["/home/runner/paddock-entrypoint"]

@@ -71,6 +71,7 @@ describe('the listener service', () => {
       PADDOCK_RUNNER_IMAGE: '${RunnerImageUri}',
       PADDOCK_RUNNER_EXECUTION_ROLE_ARN: '${RunnerExecutionRole.Arn}',
       PADDOCK_RUNNER_LOG_GROUP: '${RunnerLogs}',
+      PADDOCK_CONFIG_BUCKET: '${RunnerConfigs}',
       AWS_REGION: '${AWS::Region}',
     });
   });
@@ -193,6 +194,39 @@ describe('fitness: only the listener reads the App key and starts tasks, and a r
     assert.deepEqual(statements.flatMap(resourcesOf), [parameter('/paddock/runners/*')]);
   });
 
+  test('the listener writes, reads, deletes and lists the runner-config bucket, and no other bucket', () => {
+    const s3 = listener.filter((s) => actionsOf(s).some((a) => a.startsWith('s3:')));
+    const grants = s3.map((s) => [actionsOf(s).sort(), resourcesOf(s)]);
+    assert.deepEqual(grants, [
+      [['s3:DeleteObject', 's3:GetObject', 's3:PutObject'], ['${RunnerConfigs.Arn}/*']],
+      [['s3:ListBucket'], ['${RunnerConfigs.Arn}']],
+    ]);
+  });
+
+  test('no other role reaches a bucket: a running task reaches its own object through its URL alone', () => {
+    for (const [id] of Object.entries(roles)) {
+      if (id === 'ListenerTaskRole') continue;
+      for (const s of statementsOf(id)) assert.ok(!actionsOf(s).some((a) => a.startsWith('s3:')), `${id} reaches S3`);
+    }
+  });
+
+  test('the runner-config bucket blocks public access, expires objects after a day, and takes TLS alone', () => {
+    const bucket = onlyResource(tpl, 'AWS::S3::Bucket');
+    assert.equal(tpl.Resources.RunnerConfigs, bucket);
+    assert.deepEqual(bucket.Properties?.PublicAccessBlockConfiguration, {
+      BlockPublicAcls: true,
+      BlockPublicPolicy: true,
+      IgnorePublicAcls: true,
+      RestrictPublicBuckets: true,
+    });
+    const rules = bucket.Properties?.LifecycleConfiguration?.Rules ?? [];
+    assert.ok(rules.some((r: { Status?: string; ExpirationInDays?: number; Prefix?: string }) =>
+      r.Status === 'Enabled' && r.ExpirationInDays === 1 && !r.Prefix), JSON.stringify(rules));
+    const policy = onlyResource(tpl, 'AWS::S3::BucketPolicy');
+    const deny = (policy.Properties?.PolicyDocument?.Statement ?? []).find((s: Statement) => s.Effect === 'Deny');
+    assert.deepEqual(deny?.Condition, { Bool: { 'aws:SecureTransport': 'false' } });
+  });
+
   test('the stack defines no runner task definition or task role: the listener registers each runner\'s own', () => {
     assert.deepEqual(resourcesOfType(tpl, 'AWS::ECS::TaskDefinition').map(([id]) => id), ['ListenerTaskDefinition']);
     assert.deepEqual(Object.keys(roles).sort(), ['ListenerExecutionRole', 'ListenerTaskRole', 'RunnerExecutionRole']);
@@ -248,5 +282,15 @@ describe('fitness: served repos are configuration in the CI account, never a fil
   // trust; the main stack takes no repo at all.
   test('the main stack takes no repo as a parameter', () => {
     for (const name of Object.keys(tpl.Parameters ?? {})) assert.doesNotMatch(name, /repo/i, name);
+  });
+});
+
+// A task ends itself once its runner has left GitHub and no new config
+// comes, so the listener has no task to stop.
+describe('fitness: the listener stops no task (remove-then-terminate.md)', () => {
+  test('no role may stop a task', () => {
+    for (const [id] of Object.entries(roles)) {
+      for (const s of statementsOf(id)) assert.ok(!actionsOf(s).includes('ecs:StopTask'), `${id} can stop a task`);
+    }
   });
 });

@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 
@@ -23,6 +24,7 @@ import (
 type awsCloud struct {
 	ssm *ssm.Client
 	ecs *ecs.Client
+	s3  *s3.Client
 }
 
 func connectAWS(ctx context.Context, region string) (cloud, error) {
@@ -30,7 +32,7 @@ func connectAWS(ctx context.Context, region string) (cloud, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &awsCloud{ssm: ssm.NewFromConfig(cfg), ecs: ecs.NewFromConfig(cfg)}, nil
+	return &awsCloud{ssm: ssm.NewFromConfig(cfg), ecs: ecs.NewFromConfig(cfg), s3: s3.NewFromConfig(cfg)}, nil
 }
 
 func (a *awsCloud) Parameter(ctx context.Context, name string) (string, bool, error) {
@@ -71,6 +73,12 @@ func (a *awsCloud) ScaleSets(key github.AppKey, org string, installationID int64
 
 func (a *awsCloud) ECS() runners.ECS { return a.ecs }
 func (a *awsCloud) SSM() runners.SSM { return a.ssm }
+
+func (a *awsCloud) Objects() runners.Objects { return a.s3 }
+
+// Presigner signs with the listener's own credentials, so a task's URL
+// lasts no longer than they do.
+func (a *awsCloud) Presigner() runners.Presigner { return s3.NewPresignClient(a.s3) }
 
 // githubApp gives the App's installation as serve wants it.
 type githubApp struct{ *github.App }

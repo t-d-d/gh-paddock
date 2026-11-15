@@ -173,6 +173,14 @@ describe('the gate', () => {
     assert.match(runs, /--entrypoint \/home\/runner\/bin\/Runner\.Listener \S+ --version/);
     for (const tool of ['aws --version', 'jq --version', 'zip -v', 'python3 --version']) assert.ok(runs.includes(tool), tool);
   });
+
+  // The entrypoint is written inline in the Dockerfile, so only a real
+  // build shows it landed whole and runs: started with no config, it says so.
+  test('the gate starts the image\'s own entrypoint, which refuses to run with no config', () => {
+    const runs = stepsOf(workflow, 'runner-image').map((s) => s.run ?? '').join('\n');
+    assert.match(runs, /docker run --rm paddock-runner:gate >"\$RUNNER_TEMP\/entrypoint\.out" 2>&1/);
+    assert.match(runs, /grep -q "the task was given no config" "\$RUNNER_TEMP\/entrypoint\.out"/);
+  });
 });
 
 describe('fitness: this repo\'s workflows run on GitHub\'s runners, never the ones it deploys (public-repo.md)', () => {

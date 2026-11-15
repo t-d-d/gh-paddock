@@ -17,7 +17,7 @@ The name comes from the paddock where racehorses are kept warm before a race.
 
 ## Status
 
-Under construction. The [v1 PRD](https://github.com/t-d-d/gh-paddock/issues/1) sets the scope: test and dev pools on Fargate Spot. Today the listener serves each listed repo's pools: it makes a scale set and a runner group per pool, polls GitHub for the pool's jobs, and starts a single-use Fargate runner task per job, up to the pool's maximum. Each runner runs one job and its task exits. A deploy probes the listener and rolls both images back when the probe fails.
+Under construction. The [v1 PRD](https://github.com/t-d-d/gh-paddock/issues/1) sets the scope: test and dev pools on Fargate Spot. Today the listener serves each listed repo's pools: it makes a scale set and a runner group per pool, polls GitHub for the pool's jobs, and finds a runner for each job, up to the pool's maximum. A task runs one job per runner. When a job finishes, its task waits up to 30 seconds and takes the pool's next assigned job if one comes. Otherwise it exits, and a later job gets a new task. A deploy probes the listener and rolls both images back when the probe fails.
 
 Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHub's runners.
 
