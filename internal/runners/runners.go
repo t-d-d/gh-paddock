@@ -69,6 +69,10 @@ const urlLife = WarmLimit + 5*time.Minute
 // which follows the finish; the margin leaves it time to read the config.
 const handWithin = 25 * time.Second
 
+// logTaskTimes is the line that gives how long Fargate took to start a
+// task: to place it, to pull its image, and to start its container.
+const logTaskTimes = "runner task start times"
+
 // heardFor is how long the scaler keeps what a message said of a runner, for
 // a task that ListTasks has yet to show.
 const heardFor = 2 * time.Minute
@@ -184,6 +188,9 @@ type task struct {
 	// maxJob is its pool's maximum job time when it started; zero for a
 	// task started before the tag, which takes the pool's.
 	maxJob time.Duration
+	// timed is whether its start times have been logged. A restart loses
+	// it, so a live task may be logged again.
+	timed bool
 }
 
 func (s *Scaler) now() time.Time {
@@ -328,10 +335,12 @@ func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 	for _, lt := range live {
 		arn := aws.ToString(lt.TaskArn)
 		seen[arn] = true
-		if _, ok := s.tasks[arn]; ok {
-			continue
+		t, ok := s.tasks[arn]
+		if !ok {
+			t = s.readTask(lt)
+			s.tasks[arn] = t
 		}
-		s.tasks[arn] = s.readTask(lt)
+		s.logTimes(t, lt)
 	}
 	for arn, t := range s.tasks {
 		if !seen[arn] {
@@ -361,6 +370,28 @@ func (s *Scaler) track(ctx context.Context, live []ecstypes.Task) {
 			t.done = at
 		}
 	}
+}
+
+// logTimes logs, once its container has started, how long Fargate took to
+// place a task, pull its image and start its container. ECS keeps these
+// times in its task description alone, which only the owner can read. The
+// line names the task by its id and its first runner, never by an ARN or
+// the image (docs/constraints/public-repo.md).
+func (s *Scaler) logTimes(t *task, lt ecstypes.Task) {
+	if t.timed || lt.CreatedAt == nil || lt.PullStartedAt == nil || lt.PullStoppedAt == nil || lt.StartedAt == nil {
+		return
+	}
+	t.timed = true
+	seconds := func(from, to *time.Time) float64 {
+		return to.Sub(*from).Round(100 * time.Millisecond).Seconds()
+	}
+	s.Log.Info(logTaskTimes,
+		"task", shortARN(t.arn),
+		"runner", tagOf(lt, "paddock:runner"),
+		"placementSeconds", seconds(lt.CreatedAt, lt.PullStartedAt),
+		"pullSeconds", seconds(lt.PullStartedAt, lt.PullStoppedAt),
+		"startSeconds", seconds(lt.PullStoppedAt, lt.StartedAt),
+	)
 }
 
 func (s *Scaler) deleteObject(ctx context.Context, t *task) {
