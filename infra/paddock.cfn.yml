@@ -442,7 +442,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref ListenerLogs
-      FilterPattern: '{ $.msg = "repo list unreadable" }'
+      FilterPattern: '{ $.msg = "repo list unreadable" || $.msg = "repo list entry not valid" }'
       MetricTransformations:
         - MetricNamespace: paddock
           MetricName: RepoListUnreadable
@@ -622,15 +622,17 @@ Resources:
         - !Ref AlertsTopic
 
   # The listener reads the list every two minutes and logs each read that
-  # fails, so a list still broken keeps a line in every five minutes.
+  # fails, and each invalid entry, so a list still broken keeps a line in
+  # every five minutes.
   RepoListUnreadableAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: paddock-repo-list-unreadable
       AlarmDescription: >-
-        The listener cannot read or parse the repo list, /paddock/repos.
-        It keeps serving the last list it read, and adds and removes
-        nothing until the list reads again. Its log gives the error.
+        The listener cannot read or parse the repo list, /paddock/repos,
+        or an entry in it is not valid. It keeps serving the last list it
+        read, or the repo of the invalid entry as it was, until the list
+        reads clean. Its log gives the error.
       Namespace: paddock
       MetricName: RepoListUnreadable
       Statistic: Sum

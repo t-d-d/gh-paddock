@@ -60,8 +60,12 @@ var pollLogEvery = time.Minute
 // added is served within one read and its setup, inside five minutes.
 var listReadEvery = 2 * time.Minute
 
-// logListUnreadable is the line the stack's unreadable-list alarm counts.
-const logListUnreadable = "repo list unreadable"
+// The lines the stack's repo-list alarm counts: a list that cannot be read
+// or parsed, and an entry in it that is not valid.
+const (
+	logListUnreadable   = "repo list unreadable"
+	logListEntryInvalid = "repo list entry not valid"
+)
 
 func main() {
 	os.Exit(mainWith(connectAWS))
@@ -297,8 +301,9 @@ type listReader struct {
 }
 
 // read reads the list. ok is false when it cannot be read or parsed: that
-// is logged as the line the alarm counts, and the caller keeps the last
-// good list. A missing list is an empty one, and serves nothing.
+// is logged as a line the alarm counts, and the caller keeps the last good
+// list. Each invalid entry is logged as the other. A missing list is an
+// empty one, and serves nothing.
 func (r *listReader) read(ctx context.Context) (list repos.List, ok bool) {
 	raw, found, err := r.c.Parameter(ctx, r.name)
 	if err != nil {
@@ -319,6 +324,11 @@ func (r *listReader) read(ctx context.Context) (list repos.List, ok bool) {
 	if err != nil {
 		r.log.Error(logListUnreadable, "parameter", r.name, "error", err.Error())
 		return list, false
+	}
+	// Its repo stays as the last good list had it, so the operator hears
+	// of the typo rather than finding the repo on its old settings.
+	for _, err := range list.Skipped {
+		r.log.Error(logListEntryInvalid, "parameter", r.name, "error", err.Error())
 	}
 	return list, true
 }

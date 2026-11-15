@@ -195,7 +195,6 @@ func TestARepoThatCannotBeServedIsLoggedAndSkipped(t *testing.T) {
 			{Owner: "acme", Name: "open", Pools: pool},
 			{Owner: "acme", Name: "widgets", Pools: pool},
 		},
-		Skipped: []error{errors.New("entry 9: repo x/y has no pools")},
 	}
 	var logs syncBuffer
 	m, served := newManager(app, sets, &logs)
@@ -205,7 +204,7 @@ func TestARepoThatCannotBeServedIsLoggedAndSkipped(t *testing.T) {
 	if _, ok := pools["paddock-widgets-test"]; !ok || m.Serving() != 1 {
 		t.Fatalf("serving %+v", pools)
 	}
-	for _, want := range []string{"elsewhere/thing", "not installed", "acme/gone", "acme/open", "public", "entry 9"} {
+	for _, want := range []string{"elsewhere/thing", "not installed", "acme/gone", "acme/open", "public"} {
 		if !strings.Contains(logs.String(), want) {
 			t.Errorf("the logs do not say %q:\n%s", want, logs.String())
 		}

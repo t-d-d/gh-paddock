@@ -634,3 +634,21 @@ func TestTheListenerReadsTheRunnerConfigBucket(t *testing.T) {
 		t.Fatalf("started with no bucket: %v", err)
 	}
 }
+
+// An invalid entry is held as the last good list had it, and raises the
+// same alarm as an unreadable list, so the operator's typo does not sit
+// unnoticed.
+func TestAnInvalidEntryRaisesTheListAlarm(t *testing.T) {
+	c := &fakeCloud{params: map[string]string{
+		"/paddock/github-app": appKey,
+		"/paddock/repos":      `{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spto"}]}]}`,
+	}}
+	stop := runUntilBeat(t, c)
+	code, logs := stop()
+	if code != 0 || !strings.Contains(logs, `"msg":"repo list entry not valid"`) || !strings.Contains(logs, "entry 0") {
+		t.Fatalf("exit %d, logs:\n%s", code, logs)
+	}
+	if strings.Contains(logs, `"msg":"repo skipped: its entry in the list is not valid"`) {
+		t.Fatalf("the invalid entry is logged twice:\n%s", logs)
+	}
+}

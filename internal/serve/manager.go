@@ -88,9 +88,6 @@ func (m *Manager) Apply(ctx context.Context, list repos.List) {
 	if m.served == nil {
 		m.orgs, m.served, m.stopped = map[string]*org{}, map[string]*servedPool{}, map[string]time.Time{}
 	}
-	for _, err := range list.Skipped {
-		m.Log.Error("repo skipped: its entry in the list is not valid", "error", err.Error())
-	}
 	want := map[string]bool{}
 	for _, repo := range list.Repos {
 		for _, p := range repo.Pools {

@@ -18,7 +18,7 @@ pull request or a deploy.
   serves what changed with no restart. A missing or empty list serves
   nothing. An entry that is not valid is logged and skipped, and the rest
   are served; a repo whose entry is skipped stays as the last good list had
-  it.
+  it, and the entry raises the same alarm as an unreadable list.
 - A list the listener cannot read or parse leaves the last good one in
   force, or nothing at the start, and raises an alarm through
   `AlertsTopic`. A failed read adds, changes and deletes nothing.
