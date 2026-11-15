@@ -36,9 +36,11 @@ describe('fitness: every pool runs one x64 image, FROM GitHub\'s runner image, w
     }
   });
 
-  test('runs as the runner\'s own user, and starts one runner from its injected config', () => {
+  // How the image runs a runner for each config the task is handed is the
+  // entrypoint's to hold, and its own check comes with it.
+  test('runs as the runner\'s own user, and starts from the runner\'s home', () => {
     const users = [...dockerfile.matchAll(/^USER\s+(\S+)/gm)].map((m) => m[1]);
     assert.equal(users.at(-1), 'runner');
-    assert.match(dockerfile, /^CMD \["\/home\/runner\/run\.sh"\]$/m);
+    assert.match(dockerfile, /^(?:CMD|ENTRYPOINT) \["\/home\/runner\/[^"]+"/m);
   });
 });

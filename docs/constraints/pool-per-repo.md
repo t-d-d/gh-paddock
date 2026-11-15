@@ -1,5 +1,5 @@
 # A pool per repo
-Relevance: Scale sets, runner groups and runner tasks: internal/repos, internal/serve, internal/github, internal/runners
+Relevance: Scale sets, runner groups and runner tasks, and how a task wipes between jobs: internal/repos, internal/serve, internal/github, internal/runners, runner/
 Decision: Every pool belongs to one repo, and a runner task only runs jobs from its own pool.
 
 Why: Client repos share a deployment. A runner that took jobs from two repos
@@ -13,6 +13,17 @@ by two repos would put one client's cost on another's tag.
   public repos off. The listener narrows a group back if someone widens it.
 - A runner's just-in-time config is made for its pool's scale set, so its
   runner takes jobs from that pool alone, and it runs one job.
+- A task may run several runners in turn, each for one job, and every one
+  of them from its own pool. A finished task waits 30 seconds for its pool's
+  next job, then is removed and stopped.
+- Before each runner, a task wipes the job's checkout and temporary
+  directories. It keeps the tool cache and the home caches, such as npm's
+  and Go's modules.
+- The wipe does not separate two jobs in one task: a job can use sudo in the
+  image, leave a process running, or change a kept cache. The pool is the
+  boundary, so a pool takes only runs that hold the same credentials.
+- GitHub withholds a repo's secrets from Dependabot's runs, so a served repo
+  keeps Dependabot's runs on GitHub's runners.
 - The listener counts a pool's tasks by the scale set they were started for,
   so no pool's tasks count toward another's maximum.
 - Each runner task is tagged with its repo and pool.
@@ -27,8 +38,13 @@ by two repos would put one client's cost on another's tag.
 
 - Do not share a runner group between a repo's pools, or between repos, to
   save on groups: the group is what keeps another repo's jobs off a runner.
-- Do not reuse a runner for a second job: its workspace keeps the first job's
-  files.
+- Do not reuse a runner for a second job: start a new runner from a new
+  config for each one.
+- Do not skip the wipe because the next job comes from the same pool: a job
+  must not find the last job's checkout and take it for its own.
+- Do not let a pool take runs that hold different credentials, such as
+  Dependabot's beside the repo's own: a run without the secrets could leave
+  something behind that reads the next job's.
 
-Judgment: no check sees GitHub's side: that a runner group really is closed to other repos. The listener sets it on every start.
-History: Settled with the owner in PRD #1, and written by #16.
+Judgment: no check sees GitHub's side: that a runner group really is closed to other repos. The listener sets it on every start. No check sees which runs a served repo's workflows send to paddock's labels, so no check sees Dependabot's runs kept off them.
+History: Settled with the owner in PRD #1, and written by #16. #53 let a task run several runners in turn, as PRD #1's journey 2 says.
