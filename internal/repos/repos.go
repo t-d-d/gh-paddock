@@ -11,8 +11,9 @@
 //	]}
 //
 // A pool's runner tasks run x64 unless it sets arch to arm64. Its size
-// defaults to 2 vCPU and 8 GB, as GitHub's private-repo runners, its maximum to 10 runners, and its longest job to two hours. A
-// task running well past its pool's longest job raises an alarm.
+// defaults to 2 vCPU and 8 GB, as GitHub's private-repo runners, its
+// maximum to 10 runners, and its longest job to two hours. A task running
+// well past its pool's longest job raises an alarm.
 package repos
 
 import (

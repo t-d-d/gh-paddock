@@ -179,7 +179,7 @@ func (m *Manager) add(ctx context.Context, repo repos.Repo) {
 	for _, p := range pools {
 		p.Settings = repos.NewCurrent(p.Pool)
 		m.Log.Info("pool ready", "repo", repo.FullName(), "pool", p.Pool.Name, "scaleSet", repo.ScaleSetName(p.Pool),
-			"scaleSetId", p.ScaleSetID, "capacity", string(p.Pool.Capacity), "maxRunners", p.Pool.MaxRunners)
+			"scaleSetId", p.ScaleSetID, "capacity", string(p.Pool.Capacity), "arch", string(p.Pool.Arch), "maxRunners", p.Pool.MaxRunners)
 		pctx, cancel := context.WithCancel(ctx)
 		sp := &servedPool{pool: p, cancel: cancel, done: make(chan struct{})}
 		key := poolKey(repo.Owner, repo.ScaleSetName(p.Pool))

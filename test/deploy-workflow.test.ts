@@ -274,23 +274,32 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
 
   // Runs the index step as Actions runs it, with `aws` and `docker` replaced
   // by stubs. `tags` maps a tag in the registry to its digest; a tag not in
-  // it is not found, unless `denied`, when every read is refused.
-  const runIndex = (tags: Record<string, string>, opts: { denied?: boolean; created?: string } = {}) => {
+  // it is not found, unless `denied`, when every read is refused. Every
+  // image found is of the media type `media`, an OCI index unless set.
+  const runIndex = (tags: Record<string, string>, opts: { denied?: boolean; created?: string; media?: string } = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'deploy-index-'));
     try {
       const calls = join(dir, 'calls');
       const output = join(dir, 'output');
-      const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") echo "${digest}"; exit 0 ;;`).join('\n');
+      const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       writeFileSync(join(dir, 'aws'), `#!/bin/bash
 echo "aws $*" >> "$CALLS"
 case "$1 $2" in
   "ecr describe-images")
     ${opts.denied ? 'echo "An error occurred (AccessDeniedException)" >&2; exit 254' : ''}
-    tag=""; for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; esac; done
-    if [ -f "$CREATED" ] && [ "$tag" = "$(cat "$CREATED")" ]; then echo "${opts.created ?? ''}"; exit 0; fi
-    case "$tag" in
+    tag=""; media=""
+    for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; *imageManifestMediaType*) media=1 ;; esac; done
+    digest=""
+    if [ -f "$CREATED" ] && [ "$tag" = "$(cat "$CREATED")" ]; then digest="${opts.created ?? ''}"; fi
+    if [ -z "$digest" ]; then
+      case "$tag" in
 ${table}
-    esac
+      esac
+    fi
+    if [ -n "$digest" ]; then
+      if [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
+      exit 0
+    fi
     echo "An error occurred (ImageNotFoundException)" >&2; exit 254 ;;
   "sts get-caller-identity") echo the-account ;;
   "ecr get-login-password") echo token ;;
@@ -331,6 +340,20 @@ cat > /dev/null
     assert.equal(status, 0, stderr);
     assert.ok(!lines.some((l) => l.startsWith('docker')), lines.join('\n'));
     assert.equal(out, `digest=${d('4')}\n`);
+  });
+
+  // An earlier deploy pushed a single x64 image at a bare tag. A tree of
+  // runner/ that hashes to one of those tags must not hand on that image as
+  // if it were the index: an arm64 pool's tasks would pull an x64 image.
+  test('refuses, handing on nothing, a tag that holds a single image rather than an index', () => {
+    for (const media of ['application/vnd.docker.distribution.manifest.v2+json', 'application/vnd.oci.image.manifest.v1+json']) {
+      const { status, lines, out } = runIndex({ abc: d('4'), 'abc-x64': d('1'), 'abc-arm64': d('2') }, { media });
+      assert.notEqual(status, 0, media);
+      assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
+      assert.equal(out, '', media);
+    }
+    const docker = runIndex({ abc: d('4') }, { media: 'application/vnd.docker.distribution.manifest.list.v2+json' });
+    assert.equal(docker.out, `digest=${d('4')}\n`, docker.stderr);
   });
 
   test('fails, handing on nothing, when an architecture\'s image is missing or the registry refuses a read', () => {

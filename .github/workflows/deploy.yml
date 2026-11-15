@@ -246,6 +246,18 @@ jobs:
             echo "::error::no index at ${REPO}:${TAG}"
             exit 1
           fi
+          # Before both architectures, the deploy pushed a single x64 image
+          # at the bare tag. A tag holding one of those is refused, not
+          # handed on: an arm64 pool's tasks would pull an x64 image.
+          MEDIA=$(aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" \
+            --query 'imageDetails[0].imageManifestMediaType' --output text)
+          case "$MEDIA" in
+            application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *)
+              echo "::error::${REPO}:${TAG} holds a single image (${MEDIA}), not an index of both architectures"
+              exit 1
+              ;;
+          esac
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
   deploy:
