@@ -61,6 +61,8 @@ describe('the runner\'s image ships with zstd layers', () => {
     const compression = stepById(stepsOf(workflow, 'runner-image'), 'image').with?.compression;
     assert.equal(typeof compression, 'string');
     const dockerfile = readFileSync(resolve(REPO_ROOT, 'runner/Dockerfile'), 'utf-8');
-    assert.match(dockerfile, new RegExp(`^# .*\\b${compression}\\b`, 'm'));
+    // The comment names gzip as what zstd beats, so a bare word match would
+    // pass a deploy that switched to gzip with no change under runner/.
+    assert.match(dockerfile, new RegExp(`^# .*\\brecompressed as ${compression}\\b`, 'm'));
   });
 });
