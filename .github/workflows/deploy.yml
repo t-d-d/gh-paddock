@@ -232,6 +232,25 @@ jobs:
           tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/soci-bin" soci
           echo "${RUNNER_TEMP}/soci-bin" >> "$GITHUB_PATH"
 
+      # crane pushes the converted index. It writes each manifest's bytes as
+      # they stand on disk, where skopeo re-serializes the index and, told to
+      # keep every digest, refuses the push. One release by number, checked
+      # like soci's before it is unpacked.
+      - name: Install crane
+        id: crane
+        env:
+          CRANE_VERSION: 0.22.1
+          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        run: |
+          set -euo pipefail
+          tarball="go-containerregistry_Linux_x86_64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/${tarball}"
+          echo "${CRANE_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/crane-bin"
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/crane-bin" crane
+          echo "${RUNNER_TEMP}/crane-bin" >> "$GITHUB_PATH"
+
       # The registry's tags are immutable, so an index already at a tag is
       # the one an earlier run pushed there, and is reused.
       - name: Join both architectures' images under the plan's tag
@@ -278,20 +297,20 @@ jobs:
               exit 1
             fi
             # soci convert --standalone reads and writes an OCI image layout
-            # on disk and needs no containerd. skopeo moves the index and
-            # every image in it between the registry and the disk, and fails
-            # rather than rewrite a manifest: each SOCI index names its
-            # image's digest, so a rewritten image would lose its index.
+            # on disk and needs no containerd. skopeo pulls the joined index
+            # and every image in it to disk, and fails rather than rewrite a
+            # manifest: each SOCI index names its image's digest, so a
+            # rewritten image would lose its index. crane pushes the
+            # converted index back with every manifest's bytes unchanged.
             AUTH="${RUNNER_TEMP}/auth.json"
             aws ecr get-login-password --region us-east-1 \
               | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
             skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
             soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
-            # soci writes the converted index as a Docker manifest list, which
-            # skopeo will push only as an OCI index. skopeo's own conversion
-            # drops each entry's artifactType, which marks a SOCI index, so
-            # the list is relabelled here with every entry kept as soci wrote
-            # it. Only the list's own digest changes, and nothing names it.
+            # soci writes the converted index as a Docker manifest list. It is
+            # relabelled here as an OCI index, with every entry kept as soci
+            # wrote it, artifactType included, which marks a SOCI index. Only
+            # the list's own digest changes, and nothing names it.
             LAYOUT="${RUNNER_TEMP}/soci"
             LIST_TYPE=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].mediaType else "" end' "${LAYOUT}/index.json")
             case "$LIST_TYPE" in
@@ -313,7 +332,10 @@ jobs:
                 exit 1
                 ;;
             esac
-            skopeo copy --all --preserve-digests --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
+            # crane prints the pushed reference, which carries the account id.
+            aws ecr get-login-password --region us-east-1 \
+              | crane auth login "$REGISTRY" --username AWS --password-stdin
+            crane push "$LAYOUT" "${REGISTRY}/${REPO}:${TAG}" > /dev/null
             DIGEST=$(digest_of "$TAG")
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then

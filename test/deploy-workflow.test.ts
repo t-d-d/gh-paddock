@@ -273,11 +273,11 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
     assert.match(runner.run ?? '', /paddock-runner@\$\{DIGEST\}/);
   });
 
-  // Runs the index step as Actions runs it, with `aws`, `docker`, `skopeo`
-  // and `soci` replaced by stubs. `tags` maps a tag in the registry to its
+  // Runs the index step as Actions runs it, with `aws`, `docker`, `skopeo`,
+  // `soci` and `crane` replaced by stubs. `tags` maps a tag in the registry to its
   // digest; a tag not in it is not found, unless `denied`, when every read
   // is refused. `pushes` maps a tag to the digest it names once docker or
-  // skopeo pushes to it. Every image found is of the media type `media`, an
+  // crane pushes to it. Every image found is of the media type `media`, an
   // OCI index unless set, and its manifest is `manifest`, an index of both
   // architectures with a SOCI index for each unless set.
   // `converted` is the list soci writes into its OCI layout, a Docker
@@ -334,18 +334,21 @@ cat > /dev/null
 echo "skopeo $*" >> "$CALLS"
 [ "$1" = login ] && { cat > /dev/null; exit 0; }
 dest="\${@: -1}"
-src="\${@: -2:1}"
-case "$src" in
-  oci:*)
-    layout="\${src#oci:}"
-    cp "$layout/index.json" "$PUSHED_INDEX"
-    list=$(jq -r '.manifests[0].digest' "$layout/index.json")
-    cp "$layout/blobs/sha256/\${list#sha256:}" "$PUSHED_LIST" ;;
-esac
 case "$dest" in
   oci:*) mkdir -p "\${dest#oci:}" ;;
   docker://*) touch "$PUSHED/\${dest##*:}" ;;
 esac
+`, { mode: 0o755 });
+      writeFileSync(join(bin, 'crane'), `#!/bin/bash
+echo "crane $*" >> "$CALLS"
+[ "$1 $2" = "auth login" ] && { cat > /dev/null; exit 0; }
+if [ "$1" = push ]; then
+  layout="$2"
+  cp "$layout/index.json" "$PUSHED_INDEX"
+  list=$(jq -r '.manifests[0].digest' "$layout/index.json")
+  cp "$layout/blobs/sha256/\${list#sha256:}" "$PUSHED_LIST"
+  touch "$PUSHED/\${3##*:}"
+fi
 `, { mode: 0o755 });
       writeFileSync(join(bin, 'soci'), `#!/bin/bash
 echo "soci $*" >> "$CALLS"
@@ -392,25 +395,25 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
   });
 
   // soci convert --standalone reads and writes an OCI image layout on disk,
-  // with no containerd; skopeo moves the index to and from the registry.
+  // with no containerd. skopeo pulls the joined index to disk, and crane
+  // pushes the converted one back as its bytes stand.
   test('converts the joined index with a SOCI index for each architecture, pushes it at the plan\'s tag, and hands on its digest', () => {
     const { status, lines, out, stderr } = runIndex(built, { pushes });
     assert.equal(status, 0, stderr);
-    const tools = lines.filter((l) => /^(skopeo|soci) /.test(l));
+    const tools = lines.filter((l) => /^(skopeo|soci|crane) /.test(l));
     assert.deepEqual(tools, [
       'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
       `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
       'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
-      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
+      'crane auth login the-account.dkr.ecr.us-east-1.amazonaws.com --username AWS --password-stdin',
+      `crane push $RUNNER_TEMP/soci ${REGISTRY}:abc`,
     ]);
     assert.equal(out, `digest=${d('5')}\n`);
   });
 
-  // soci writes the converted index as a Docker manifest list, which skopeo
-  // will push only as an OCI index. skopeo's own conversion keeps none of an
-  // entry's artifactType, which marks each SOCI index. The step relabels the
-  // list itself, keeping every entry as soci wrote it, and the push keeps
-  // every digest.
+  // soci writes the converted index as a Docker manifest list. The step
+  // relabels the list itself as an OCI index, keeping every entry as soci
+  // wrote it, artifactType included, which marks each SOCI index.
   test('pushes soci\'s Docker manifest list as an OCI index, every entry as soci wrote it', () => {
     const converted = { ...sociIndex(), mediaType: DOCKER_LIST };
     const { status, pushedIndex, pushedList, stderr } = runIndex(built, { pushes, converted });
@@ -436,7 +439,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     const converted = image('amd64', 'a');
     const { status, lines, out } = runIndex(built, { pushes, converted, convertedType: 'application/vnd.oci.image.manifest.v1+json' });
     assert.notEqual(status, 0);
-    assert.ok(!lines.some((l) => l.includes('oci:$RUNNER_TEMP/soci')), lines.join('\n'));
+    assert.ok(!lines.some((l) => l.startsWith('crane push')), lines.join('\n'));
     assert.equal(out, '');
   });
 
@@ -451,7 +454,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
   test('reuses an index already under the tag, and joins and converts nothing', () => {
     const { status, lines, out, stderr } = runIndex({ abc: d('4'), ...built });
     assert.equal(status, 0, stderr);
-    assert.ok(!lines.some((l) => /^(docker|skopeo|soci) /.test(l)), lines.join('\n'));
+    assert.ok(!lines.some((l) => /^(docker|skopeo|soci|crane) /.test(l)), lines.join('\n'));
     assert.equal(out, `digest=${d('4')}\n`);
   });
 
@@ -501,7 +504,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     for (const [tags, opts] of [[{ 'abc-x64': d('1') }, { pushes }], [{ 'abc-arm64': d('2') }, { pushes }], [built, { denied: true, pushes }]] as const) {
       const { status, lines, out } = runIndex(tags, opts);
       assert.notEqual(status, 0, JSON.stringify(tags));
-      assert.ok(!lines.some((l) => /^(docker buildx|skopeo copy|soci) /.test(l)), lines.join('\n'));
+      assert.ok(!lines.some((l) => /^(docker buildx|skopeo copy|soci|crane) /.test(l)), lines.join('\n'));
       assert.equal(out, '');
     }
   });
