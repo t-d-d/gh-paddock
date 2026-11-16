@@ -99,7 +99,7 @@ aws ssm put-parameter --name /paddock/alert-email --type String --value ops@exam
 
 ### Apply the bootstrap stack
 
-`infra/bootstrap.cfn.yml` makes GitHub's OIDC provider and the role a run on the fork's `main` assumes to deploy. Nothing can assume a role that does not exist yet, so you apply it once by hand. Every deploy applies it again after that.
+`infra/bootstrap.cfn.yml` makes GitHub's OIDC provider and the role a run on the fork's `main` assumes to deploy, and sets the registry's scan-on-push rule for the `paddock-` repositories. Nothing can assume a role that does not exist yet, so you apply it once by hand. Every deploy applies it again after that.
 
 It takes four parameters, which pin the role to your fork by name and by numeric id, so a repo that later takes either name cannot assume it:
 

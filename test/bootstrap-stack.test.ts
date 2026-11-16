@@ -1,15 +1,14 @@
 /**
- * The bootstrap stack: the role a run on main assumes to deploy, and the
- * registry's scan-on-push rule
- * (docs/constraints/deploy.md). The App key is no part of a stack
- * (docs/constraints/public-repo.md).
+ * The bootstrap stack: the role a run on main assumes to deploy
+ * (docs/constraints/deploy.md), and the registry's scan-on-push rule. The
+ * App key is no part of a stack (docs/constraints/public-repo.md).
  */
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadTemplate, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
+import { loadTemplate, onlyResource, resourcesOfType, REPO_ROOT } from './helpers/cfn.ts';
 
 const tpl = loadTemplate('infra/bootstrap.cfn.yml');
 
@@ -77,18 +76,13 @@ describe('fitness: no stack creates the App key or a Secrets Manager secret (pub
   });
 });
 
-// AWS deprecates the repository's scan-on-push flag in favour of the
-// registry's scanning configuration, and a registry with no rule scans a
-// repository only by hand. The bootstrap stack is applied before the
-// listener's image is pushed, so its rule is in force for that push.
+// Why the rule lives in the registry and not on each repository is in the
+// stack's comment.
 describe('the registry\'s scanning configuration', () => {
-  const configs = resourcesOfType(tpl, 'AWS::ECR::RegistryScanningConfiguration');
-
   test('the bootstrap stack sets basic scanning, with one scan-on-push rule for the paddock- repositories', () => {
-    assert.equal(configs.length, 1);
-    const config = configs[0]?.[1];
-    assert.equal(config?.Properties?.ScanType, 'BASIC');
-    assert.deepEqual(config?.Properties?.Rules, [
+    const config = onlyResource(tpl, 'AWS::ECR::RegistryScanningConfiguration');
+    assert.equal(config.Properties?.ScanType, 'BASIC');
+    assert.deepEqual(config.Properties?.Rules, [
       { ScanFrequency: 'SCAN_ON_PUSH', RepositoryFilters: [{ Filter: 'paddock-*', FilterType: 'WILDCARD' }] },
     ]);
   });
