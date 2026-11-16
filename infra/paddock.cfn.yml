@@ -28,8 +28,9 @@ Parameters:
     Type: String
     AllowedPattern: '^.+@sha256:[0-9a-f]{64}$'
     Description: >-
-      The runner's image, pinned by digest: x64, built FROM GitHub's runner
-      image. The deploy builds it on an x64 runner.
+      The runner's image, pinned by digest: an index of an x64 and an arm64
+      image, built FROM GitHub's runner image. The deploy builds each on a
+      runner of its architecture.
 
   VpcId:
     Type: AWS::EC2::VPC::Id

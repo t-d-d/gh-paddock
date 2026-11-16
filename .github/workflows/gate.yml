@@ -1,6 +1,7 @@
 # The offline gate: the same `npm run gate` a contributor runs, and builds
-# of the listener's image and the runner's. It holds no secret and reaches no AWS account, so
-# it is safe to run on any pull request, a fork's included.
+# of the listener's image and of the runner's for each architecture. It
+# holds no secret and reaches no AWS account, so it is safe to run on any
+# pull request, a fork's included.
 #
 # It runs on pull_request, not on a branch push. Each commit on a pull
 # request gets one run, and its checks are `gate` and `image` whether the
@@ -87,22 +88,41 @@ jobs:
           cat "$RUNNER_TEMP/run.out"
           grep -q '"msg":"listener started"' "$RUNNER_TEMP/run.out"
 
-  # The runner's image, as the deploy builds it: x64, on an x64 runner. It
+  # The runner's image, as the deploy builds it: once for each architecture,
+  # each on a GitHub runner of that architecture, never under emulation. Each
   # starts the runner far enough to print its version, checks the tools the
-  # image adds are on the path, and starts the entrypoint.
+  # image adds are on the path and the image is the architecture asked for,
+  # and starts the entrypoint.
   runner-image:
-    name: runner-image
-    runs-on: ubuntu-24.04
+    name: runner-image (${{ matrix.arch }})
+    strategy:
+      # One architecture's failure does not cancel the other's answer.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runs-on: ubuntu-24.04
+            platform: linux/amd64
+            machine: x86_64
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+            platform: linux/arm64
+            machine: aarch64
+    runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the runner's image
-        run: docker build --platform linux/amd64 --file runner/Dockerfile --tag paddock-runner:gate runner
-      - name: Start the runner, and check the tools it adds
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: docker build --platform "$PLATFORM" --file runner/Dockerfile --tag paddock-runner:gate runner
+      - name: Start the runner, and check the tools it adds and its architecture
+        env:
+          MACHINE: ${{ matrix.machine }}
         run: |
           docker run --rm --entrypoint /home/runner/bin/Runner.Listener paddock-runner:gate --version
-          docker run --rm --entrypoint bash paddock-runner:gate -c \
-            'set -e; aws --version; jq --version; zip -v >/dev/null; python3 --version; test "$(id -un)" = runner'
+          docker run --rm --entrypoint bash --env MACHINE paddock-runner:gate -c \
+            'set -e; aws --version; jq --version; zip -v >/dev/null; python3 --version; test "$(id -un)" = runner; test "$(uname -m)" = "$MACHINE"'
       # The entrypoint is written inline in the Dockerfile. With no config it
       # stops at once, which shows it landed whole and runs.
       - name: Start the entrypoint with no config

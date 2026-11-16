@@ -32,11 +32,12 @@ describe('fitness: the deploy\'s log never shows the AWS account id (public-repo
   const { workflow, codeOnly } = loadWorkflow('.github/workflows/deploy.yml');
   const jobs = Object.entries(workflow.jobs ?? {}) as [string, { steps?: WorkflowStep[] }][];
   const isCredentials = (step: WorkflowStep) => step.uses?.startsWith('aws-actions/configure-aws-credentials@') ?? false;
-  // The deploy job, and the job that builds the runner's image on x64.
+  // The deploy job, the jobs that build the runner's image for each
+  // architecture, and the job that joins them under one index.
   const withCredentials = jobs.filter(([, job]) => (job.steps ?? []).some(isCredentials));
 
-  test('only the deploy and the runner\'s image build hold AWS credentials', () => {
-    assert.deepEqual(withCredentials.map(([name]) => name).sort(), ['deploy', 'runner-image']);
+  test('only the deploy and the runner\'s image builds and index hold AWS credentials', () => {
+    assert.deepEqual(withCredentials.map(([name]) => name).sort(), ['deploy', 'runner-build', 'runner-image']);
   });
 
   for (const [name, job] of withCredentials) {

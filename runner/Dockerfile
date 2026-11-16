@@ -1,12 +1,16 @@
-# The runner's image: every pool's runner tasks run it, on x64
-# (docs/constraints/runner-image.md). It starts FROM GitHub's official runner
-# image and adds the CLI tools common workflows call without a setup action:
-# the AWS CLI, jq, zip, Python 3, and the system libraries Chromium needs.
+# The runner's image: every pool's runner tasks run it, on x64 or arm64 as
+# the pool sets (docs/constraints/runner-image.md). It starts FROM GitHub's
+# official runner image and adds the CLI tools common workflows call without
+# a setup action: the AWS CLI, jq, zip, Python 3, and the system libraries
+# Chromium needs.
 #
-# Built on an x64 runner by the deploy, and by the gate, which starts its
-# runner. Dependabot moves the tag below; GitHub stops sending jobs to a
-# runner more than 30 days behind its latest release once updates are off,
-# and the scale set turns them off.
+# Built once for each architecture, each on a GitHub runner of that
+# architecture and never under emulation, by the deploy and by the gate,
+# which starts its runner. GitHub publishes the base for both, so this file
+# names no platform: the builder's own architecture picks the base's layer.
+# Dependabot moves the tag below; GitHub stops sending jobs to a runner more
+# than 30 days behind its latest release once updates are off, and the scale
+# set turns them off.
 #
 # The deploy pushes it with every layer recompressed as zstd, which Fargate
 # pulls and unpacks faster than gzip, so a cold runner task starts sooner.
@@ -33,7 +37,12 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
-    curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscli.zip; \
+    case "$(uname -m)" in \
+      x86_64) cli=awscli-exe-linux-x86_64.zip ;; \
+      aarch64) cli=awscli-exe-linux-aarch64.zip ;; \
+      *) echo "no AWS CLI for $(uname -m)"; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://awscli.amazonaws.com/${cli}" -o /tmp/awscli.zip; \
     unzip -q /tmp/awscli.zip -d /tmp; \
     /tmp/aws/install; \
     rm -rf /tmp/aws /tmp/awscli.zip; \

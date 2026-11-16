@@ -166,8 +166,9 @@ runs:
           echo "::warning::If the error was AccessDenied, grant the deploy role ecr-public:GetAuthorizationToken and sts:GetServiceBearerToken."
         fi
 
-    # Native to the caller's runner: arm64 for the listener, x64 for the
-    # runner. An emulated build routes through qemu and triples the
+    # Native to the caller's runner: arm64 for the listener, and each
+    # architecture's runner image on a runner of that architecture. An
+    # emulated build routes through qemu and triples the
     # wall-clock or worse.
     # The build record and the summary both name the image by its registry,
     # which carries the account id. The log mask does not reach either, and

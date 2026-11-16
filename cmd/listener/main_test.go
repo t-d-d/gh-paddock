@@ -556,7 +556,8 @@ func TestAJobOnAListedPoolStartsARunnerTask(t *testing.T) {
 	if got := aws.ToString(c.runs[0].CapacityProviderStrategy[0].CapacityProvider); got != "FARGATE" {
 		t.Fatalf("capacity %s", got)
 	}
-	if !strings.Contains(logs, `"msg":"pool ready"`) || !strings.Contains(logs, `"scaleSet":"paddock-widgets-dev"`) {
+	// The pool's ready line names its arch, as its settings-changed line does.
+	if !strings.Contains(logs, `"msg":"pool ready"`) || !strings.Contains(logs, `"scaleSet":"paddock-widgets-dev"`) || !strings.Contains(logs, `"arch":"x64"`) {
 		t.Fatalf("logs:\n%s", logs)
 	}
 }

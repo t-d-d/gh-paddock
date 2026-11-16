@@ -330,7 +330,7 @@ func assigned(n int) *scaleset.RunnerScaleSetMessage {
 var spotTest = repos.Pool{Name: "test", Capacity: repos.Spot, VCPU: 2, MemoryGB: 8, MaxRunners: 10}
 
 func TestAnAssignedJobStartsARunnerTaskOfThePoolsCapacityAndSize(t *testing.T) {
-	t.Run("fitness: a runner task runs x64, counted to its own pool (runner-image.md, pool-per-repo.md)", func(t *testing.T) {
+	t.Run("fitness: a pool with no arch runs its runner tasks on x64, counted to its own pool (runner-image.md, pool-per-repo.md)", func(t *testing.T) {
 		f := newFakeAWS()
 		s, jit := newScaler(f, repos.Pool{Name: "dev", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 10})
 		if err := s.Scale(context.Background(), assigned(1)); err != nil {
@@ -365,6 +365,18 @@ func TestAnAssignedJobStartsARunnerTaskOfThePoolsCapacityAndSize(t *testing.T) {
 			t.Fatalf("tags %v", tags)
 		}
 	})
+}
+
+func TestAnArm64PoolsRunnerTasksRunOnArm64(t *testing.T) {
+	f := newFakeAWS()
+	s, _ := newScaler(f, repos.Pool{Name: "arm", Capacity: repos.Spot, Arch: repos.ARM64, VCPU: 2, MemoryGB: 8, MaxRunners: 10})
+	if err := s.Scale(context.Background(), assigned(1)); err != nil {
+		t.Fatal(err)
+	}
+	def := f.defs[aws.ToString(f.runs[0].TaskDefinition)]
+	if def.RuntimePlatform.CpuArchitecture != ecstypes.CPUArchitectureArm64 {
+		t.Fatalf("architecture %q", def.RuntimePlatform.CpuArchitecture)
+	}
 }
 
 func TestSpotPoolsRunOnFargateSpot(t *testing.T) {
@@ -656,7 +668,7 @@ func TestAChangedPoolSettingAppliesToTheNextTaskStarted(t *testing.T) {
 	if err := s.Scale(context.Background(), assigned(1)); err != nil {
 		t.Fatal(err)
 	}
-	s.Settings.Set(repos.Pool{Name: "test", Capacity: repos.OnDemand, VCPU: 4, MemoryGB: 16, MaxRunners: 2, MaxJob: time.Hour})
+	s.Settings.Set(repos.Pool{Name: "test", Capacity: repos.OnDemand, Arch: repos.ARM64, VCPU: 4, MemoryGB: 16, MaxRunners: 2, MaxJob: time.Hour})
 	if err := s.Scale(context.Background(), assigned(5)); err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +684,12 @@ func TestAChangedPoolSettingAppliesToTheNextTaskStarted(t *testing.T) {
 	}
 	if def := f.defs[aws.ToString(run.TaskDefinition)]; aws.ToString(def.Cpu) != "4096" || aws.ToString(def.Memory) != "16384" {
 		t.Errorf("the next task's size %s/%s", aws.ToString(def.Cpu), aws.ToString(def.Memory))
+	}
+	if first := f.defs[aws.ToString(f.runs[0].TaskDefinition)]; first.RuntimePlatform.CpuArchitecture != ecstypes.CPUArchitectureX8664 {
+		t.Errorf("the first task's architecture %q", first.RuntimePlatform.CpuArchitecture)
+	}
+	if def := f.defs[aws.ToString(run.TaskDefinition)]; def.RuntimePlatform.CpuArchitecture != ecstypes.CPUArchitectureArm64 {
+		t.Errorf("the next task's architecture %q", def.RuntimePlatform.CpuArchitecture)
 	}
 	if s.Pool.MaxJob != time.Hour {
 		t.Errorf("the pool's maximum job time %s", s.Pool.MaxJob)

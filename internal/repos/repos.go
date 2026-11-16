@@ -6,13 +6,14 @@
 //	{"repos": [
 //	  {"repo": "owner/name", "pools": [
 //	    {"name": "test", "capacity": "spot"},
-//	    {"name": "dev", "capacity": "on-demand", "vcpu": 2, "memoryGb": 8, "maxRunners": 10, "maxJobMinutes": 120}
+//	    {"name": "dev", "capacity": "on-demand", "arch": "x64", "vcpu": 2, "memoryGb": 8, "maxRunners": 10, "maxJobMinutes": 120}
 //	  ]}
 //	]}
 //
-// A pool's size defaults to 2 vCPU and 8 GB, as GitHub's private-repo
-// runners, its maximum to 10 runners, and its longest job to two hours. A
-// task running well past its pool's longest job raises an alarm.
+// A pool's runner tasks run x64 unless it sets arch to arm64. Its size
+// defaults to 2 vCPU and 8 GB, as GitHub's private-repo runners, its
+// maximum to 10 runners, and its longest job to two hours. A task running
+// well past its pool's longest job raises an alarm.
 package repos
 
 import (
@@ -34,6 +35,14 @@ const (
 	OnDemand Capacity = "on-demand"
 )
 
+// Arch is the CPU architecture a pool's runner tasks run on.
+type Arch string
+
+const (
+	X64   Arch = "x64"
+	ARM64 Arch = "arm64"
+)
+
 const (
 	defaultVCPU       = 2
 	defaultMemoryGB   = 8
@@ -50,6 +59,7 @@ const (
 type Pool struct {
 	Name       string
 	Capacity   Capacity
+	Arch       Arch
 	VCPU       int
 	MemoryGB   int
 	MaxRunners int
@@ -138,6 +148,7 @@ type document struct {
 		Pools []struct {
 			Name       string   `json:"name"`
 			Capacity   Capacity `json:"capacity"`
+			Arch       *Arch    `json:"arch"`
 			VCPU       *int     `json:"vcpu"`
 			MemoryGB   *int     `json:"memoryGb"`
 			MaxRunners *int     `json:"maxRunners"`
@@ -190,9 +201,13 @@ func Parse(raw string) (List, error) {
 			pool := Pool{
 				Name:       p.Name,
 				Capacity:   p.Capacity,
+				Arch:       X64,
 				VCPU:       orDefault(p.VCPU, defaultVCPU),
 				MemoryGB:   orDefault(p.MemoryGB, defaultMemoryGB),
 				MaxRunners: orDefault(p.MaxRunners, defaultMaxRunners),
+			}
+			if p.Arch != nil {
+				pool.Arch = *p.Arch
 			}
 			jobMins := orDefault(p.MaxJobMins, defaultMaxJobMins)
 			if jobMins < 1 || jobMins > maxMaxJobMins {
@@ -252,6 +267,9 @@ func checkPool(p Pool, names map[string]bool) error {
 	}
 	if p.Capacity != Spot && p.Capacity != OnDemand {
 		return fmt.Errorf("pool %s: capacity %q is neither %q nor %q", p.Name, p.Capacity, Spot, OnDemand)
+	}
+	if p.Arch != X64 && p.Arch != ARM64 {
+		return fmt.Errorf("pool %s: arch %q is neither %q nor %q", p.Name, p.Arch, X64, ARM64)
 	}
 	if !fargateSize(p.VCPU, p.MemoryGB) {
 		return fmt.Errorf("pool %s: size %d vCPU and %d GB is not a Fargate task size", p.Name, p.VCPU, p.MemoryGB)

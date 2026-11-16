@@ -21,7 +21,7 @@ const build = actionSteps.find((s) => s.uses?.startsWith('docker/build-push-acti
 
 describe('the runner\'s image ships with zstd layers', () => {
   test('the deploy asks for zstd for the runner\'s image alone', () => {
-    assert.equal(stepById(stepsOf(workflow, 'runner-image'), 'image').with?.compression, 'zstd');
+    assert.equal(stepById(stepsOf(workflow, 'runner-build'), 'image').with?.compression, 'zstd');
     assert.equal(stepById(stepsOf(workflow, 'deploy'), 'image').with?.compression, undefined);
   });
 
@@ -58,7 +58,7 @@ describe('the runner\'s image ships with zstd layers', () => {
   // tag exists, and the tag hashes runner/ alone. Only a change under
   // runner/ makes the deploy build, and so push, a zstd image.
   test('the runner\'s Dockerfile names the compression the deploy asks for, so its tag moves with the change', () => {
-    const compression = stepById(stepsOf(workflow, 'runner-image'), 'image').with?.compression;
+    const compression = stepById(stepsOf(workflow, 'runner-build'), 'image').with?.compression;
     assert.equal(typeof compression, 'string');
     const dockerfile = readFileSync(resolve(REPO_ROOT, 'runner/Dockerfile'), 'utf-8');
     // The comment names gzip as what zstd beats, so a bare word match would
