@@ -10,8 +10,8 @@
 # Each is one release by number for an x64 runner, checked against its
 # sha256 before it is unpacked: the deploy's job holds the deploy role, so an
 # unchecked binary would run with it. The pins below are the only ones. A
-# caller may set them in the environment, which only the workflows and the
-# tests do.
+# caller may set them in the environment, which only the tests do: no
+# workflow sets them.
 set -euo pipefail
 
 : "${SOCI_VERSION:=0.16.1}"

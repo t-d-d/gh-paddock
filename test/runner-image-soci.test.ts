@@ -13,7 +13,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
@@ -90,8 +90,10 @@ const TOOLS = [
   { tool: 'crane', env: 'CRANE', release: 'https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/' },
 ];
 
-// Runs the install script with curl replaced by a stub that serves a local
-// tarball holding a stub of each tool, and each tool's sha256 set by `sha`.
+// Runs the deploy's install step as Actions runs it, with curl replaced by a
+// stub that serves a local tarball holding a stub of each tool, and each
+// tool's sha256 set by `sha`. `added` is what the step put on the path.
+const installStep = indexSteps.find((s) => s.run?.includes(INSTALL));
 const runInstall = (sha: (tool: string, tarball: Buffer) => string) => {
   const dir = mkdtempSync(join(tmpdir(), 'soci-install-'));
   try {
@@ -116,10 +118,17 @@ ${cases.join('\n')}
   *) exit 22 ;;
 esac
 `, { mode: 0o755 });
-    const target = join(dir, 'tools');
-    const result = spawnSync('bash', [resolve(REPO_ROOT, INSTALL), target], { env, stdio: 'pipe' });
-    const installed = TOOLS.filter(({ tool }) => existsSync(join(target, tool))).map(({ tool }) => tool);
-    return { status: result.status, installed, stderr: result.stderr.toString() };
+    const runnerTemp = join(dir, 'temp');
+    mkdirSync(runnerTemp);
+    const githubPath = join(dir, 'path');
+    const result = spawnSync('bash', ['-e', '-c', installStep?.run ?? ''], {
+      cwd: REPO_ROOT,
+      env: { ...env, RUNNER_TEMP: runnerTemp, GITHUB_PATH: githubPath },
+      stdio: 'pipe',
+    });
+    const added = existsSync(githubPath) ? readFileSync(githubPath, 'utf-8').trim() : '';
+    const installed = added === '' ? [] : TOOLS.filter(({ tool }) => existsSync(join(added, tool))).map(({ tool }) => tool);
+    return { status: result.status, added, installed, stderr: result.stderr.toString() };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -136,9 +145,18 @@ describe('fitness: the deploy installs one pinned release of soci and of crane, 
   }
 
   test('the deploy\'s join job installs both before its index step', () => {
-    const install = indexSteps.find((s) => s.run?.includes(INSTALL));
-    assert.ok(install, 'the join job runs the install script');
-    assert.ok(indexSteps.indexOf(install) < indexSteps.indexOf(stepById(indexSteps, 'index')));
+    assert.ok(installStep, 'the join job runs the install script');
+    assert.ok(indexSteps.indexOf(installStep) < indexSteps.indexOf(stepById(indexSteps, 'index')));
+  });
+
+  // install.sh takes its pins from the environment only so the tests can
+  // stand in a tarball of their own. A workflow that set them would replace
+  // the pins with no test failing.
+  test('no workflow sets the pins, so install.sh\'s are the ones that run', () => {
+    const dir = resolve(REPO_ROOT, '.github/workflows');
+    for (const file of readdirSync(dir)) {
+      assert.doesNotMatch(readFileSync(join(dir, file), 'utf-8'), /\b(SOCI|CRANE)_(VERSION|SHA256)\b/, file);
+    }
   });
 
   test('puts both on the path when each download matches its pinned sha256', () => {
@@ -148,10 +166,10 @@ describe('fitness: the deploy installs one pinned release of soci and of crane, 
   });
 
   for (const { tool } of TOOLS) {
-    test(`refuses a ${tool} download that does not match, and fails`, () => {
-      const { status, installed } = runInstall((t, b) => (t === tool ? 'f'.repeat(64) : matching(t, b)));
+    test(`refuses a ${tool} download that does not match, and puts nothing on the path`, () => {
+      const { status, added } = runInstall((t, b) => (t === tool ? 'f'.repeat(64) : matching(t, b)));
       assert.notEqual(status, 0);
-      assert.ok(!installed.includes(tool), `${tool} was installed`);
+      assert.equal(added, '');
     });
   }
 });

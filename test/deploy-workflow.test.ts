@@ -469,7 +469,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
   // own, so what it proves on a pull request is what the deploy runs.
   test('converts, pushes and checks the index with the scripts the gate\'s soci job runs', () => {
     const run = stepById(indexSteps, 'index').run ?? '';
-    assert.match(run, /scripts\/soci\/convert-and-push\.sh "docker:\/\/|scripts\/soci\/convert-and-push\.sh "\$\{REGISTRY\}/);
+    assert.match(run, /scripts\/soci\/convert-and-push\.sh "\$\{REGISTRY\}\/\$\{REPO\}@\$\{GZIP\}" "\$\{REGISTRY\}\/\$\{REPO\}:\$\{TAG\}" /);
     assert.match(run, /jq -e -f scripts\/soci\/check-index\.jq /);
     assert.ok(stepsOf(workflow, 'runner-image')[0]?.uses?.startsWith('actions/checkout@'), 'the join job checks out the scripts first');
   });

@@ -57,15 +57,16 @@ esac
 
 # crane writes each manifest's bytes as they stand in the layout. skopeo
 # re-serializes an index before it pushes it, and, told to keep every
-# digest, refused this one. crane prints the pushed reference, which in the
-# deploy carries the account id.
+# digest, refused this one. crane prints the pushed reference on stdout and
+# logs it on stderr as it pushes. In the deploy it carries the account id,
+# which the credentials step masks in every later line of the log.
 crane push "$layout" "$destination" > /dev/null
 
 # skopeo refused to push a manifest it would rewrite, and crane has no such
 # check. The tag must name the index in the layout, whose entries are the
 # images each SOCI index names.
 want=$(jq -r '.manifests[0].digest' "${layout}/index.json")
-got=$(crane digest "$destination")
+got=$(crane digest "$destination" || true)
 if [[ "$got" != "$want" ]]; then
   echo "::error::${destination##*/} names ${got:-nothing}, not the index soci wrote (${want})" >&2
   exit 1
