@@ -87,6 +87,11 @@ type fakeGitHub struct {
 	// runner groups by name
 	groups    map[string]map[string]any
 	groupRepo map[int][]int
+	// runners registered in each group, by group id
+	groupRunners map[int]int
+	// vanish names a group someone else deletes just before the App's
+	// delete reaches GitHub
+	vanish    string
 	nextGroup int
 	repos     map[string]map[string]any
 	installs  map[string]int64
@@ -97,7 +102,7 @@ type fakeGitHub struct {
 }
 
 func newFake(t *testing.T) (*fakeGitHub, *App) {
-	f := &fakeGitHub{t: t, groups: map[string]map[string]any{}, groupRepo: map[int][]int{}, nextGroup: 2,
+	f := &fakeGitHub{t: t, groups: map[string]map[string]any{}, groupRepo: map[int][]int{}, groupRunners: map[int]int{}, nextGroup: 2,
 		repos:    map[string]map[string]any{"acme/widgets": {"id": 7, "private": true}, "acme/open": {"id": 8, "private": false}},
 		installs: map[string]int64{"acme": 99}}
 	srv := httptest.NewServer(f)
@@ -186,6 +191,24 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.groupRepo[id] = append(f.groupRepo[id], int(r.(float64)))
 		}
 		reply(201, g)
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/") && strings.HasSuffix(r.URL.Path, "/runners"):
+		var id int
+		fmt.Sscanf(strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"), "%d", &id)
+		runners := []any{}
+		for n := range f.groupRunners[id] {
+			runners = append(runners, map[string]any{"id": 100 + n})
+		}
+		reply(200, map[string]any{"total_count": f.groupRunners[id], "runners": runners})
+	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"):
+		delete(f.groups, f.vanish)
+		for name, g := range f.groups {
+			if fmt.Sprint(g["id"]) == strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/") {
+				delete(f.groups, name)
+				w.WriteHeader(204)
+				return
+			}
+		}
+		reply(404, map[string]any{"message": "Not Found"})
 	case r.Method == "PATCH" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"):
 		for _, g := range f.groups {
 			if fmt.Sprint(g["id"]) == strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/") {
@@ -353,5 +376,52 @@ func TestRunnerGroupsListsTheOrgsGroupsByName(t *testing.T) {
 	slices.Sort(names)
 	if want := []string{"Default", "paddock-gone-dev", "paddock-widgets-test"}; !slices.Equal(names, want) {
 		t.Fatalf("groups %v, want %v", names, want)
+	}
+}
+
+// A removed pool's runner group is deleted by name. One already gone is no
+// error. One that still holds a runner is left: GitHub would move the runner
+// to the org's default group, open to every repo.
+func TestARunnerGroupIsDeletedByNameOnlyWhenItHoldsNoRunner(t *testing.T) {
+	f, app := newFake(t)
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"Default", "paddock-gone-dev", "paddock-busy-test"} {
+		f.groups[name] = map[string]any{"id": len(f.groups) + 1, "name": name}
+	}
+	f.groupRunners[f.groups["paddock-busy-test"]["id"].(int)] = 1
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.groups["paddock-gone-dev"]; ok {
+		t.Fatal("the group was not deleted")
+	}
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatalf("a group already gone: %v", err)
+	}
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-busy-test"); err == nil {
+		t.Fatal("a group holding a runner was deleted")
+	}
+	if _, ok := f.groups["paddock-busy-test"]; !ok || len(f.groups) != 2 {
+		t.Fatalf("groups %v", f.groups)
+	}
+}
+
+// A group someone else deletes between the App finding it and deleting it
+// is already gone, which is no error.
+func TestARunnerGroupGoneBeforeItsDeleteIsNoError(t *testing.T) {
+	f, app := newFake(t)
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.groups["paddock-gone-dev"] = map[string]any{"id": 3, "name": "paddock-gone-dev"}
+	f.vanish = "paddock-gone-dev"
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatalf("a group gone before its delete: %v", err)
 	}
 }

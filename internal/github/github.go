@@ -260,6 +260,35 @@ func (i *Installation) findRunnerGroup(ctx context.Context, base, name string) (
 	return found, err
 }
 
+// DeleteRunnerGroup deletes the org's runner group named name, once a
+// removed pool's scale set has gone. A group already gone is no error. A
+// group that still holds a runner is left, and is an error: GitHub would
+// move the runner to the org's default group, open to every repo
+// (docs/constraints/pool-per-repo.md).
+func (i *Installation) DeleteRunnerGroup(ctx context.Context, org, name string) error {
+	base := "/orgs/" + url.PathEscape(org) + "/actions/runner-groups"
+	group, err := i.findRunnerGroup(ctx, base, name)
+	if err != nil || group == nil {
+		return err
+	}
+	path := fmt.Sprintf("%s/%d", base, group.ID)
+	var runners struct {
+		Total int `json:"total_count"`
+	}
+	if err := i.do(ctx, http.MethodGet, path+"/runners?per_page=1", nil, &runners, http.StatusOK); err != nil {
+		return err
+	}
+	if runners.Total > 0 {
+		return fmt.Errorf("the runner group %s still holds runners: %d", name, runners.Total)
+	}
+	err = i.do(ctx, http.MethodDelete, path, nil, nil, http.StatusNoContent)
+	var status *StatusError
+	if errors.As(err, &status) && status.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
+}
+
 // RunnerGroups names every runner group of org.
 func (i *Installation) RunnerGroups(ctx context.Context, org string) ([]string, error) {
 	var names []string

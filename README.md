@@ -71,7 +71,7 @@ The listener acts in GitHub as an App of your own.
 1. In the org's settings, open Developer settings, then GitHub Apps, and choose New GitHub App. A private App can only be installed on the account that owns it, so create it in the org whose repos it serves. To serve repos in more than one org, let it be installed on any account.
 2. Give it any name and homepage URL. Clear Active under Webhook. The listener polls GitHub and takes no webhooks.
 3. Give it two permissions and no others:
-   - Organization permissions, Self-hosted runners: Read and write. The listener makes a scale set and a runner group for each pool.
+   - Organization permissions, Self-hosted runners: Read and write. The listener makes a scale set and a runner group for each pool, and deletes both when the pool leaves the list.
    - Repository permissions, Actions: Read and write. The listener uses it only to re-run a job that a Spot reclaim killed.
 4. Create the App, and note its App ID from its settings page.
 5. Under Private keys, choose Generate a private key. GitHub downloads a `.pem` file.
@@ -176,7 +176,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
    ```
 
 4. Run the workflow by hand from the scratch repo's Actions tab. A runner task starts on Fargate Spot within about a minute, runs the job and exits. Its log is in the log group `/paddock/runners`.
-5. When the job is green, take the repo off the list. Write the list without it, or `{"repos": []}`. The listener deletes the pool's scale set once its last task has stopped, and logs `scale set deleted`. Its runner group stays in the org. Delete it by hand under Runner groups only after that line. The listener finds a removed pool's scale set by its runner group, so a group deleted first leaves the scale set behind. Then delete the scratch repo.
+5. When the job is green, take the repo off the list. Write the list without it, or `{"repos": []}`. The listener deletes the pool's scale set once its last task has stopped, and logs `scale set deleted`, then deletes its runner group and logs `runner group deleted`. Do not delete the group by hand first: the listener finds a removed pool's scale set by its runner group, so a group deleted first leaves the scale set behind. Then delete the scratch repo.
 
 ### Serve a real repo
 
@@ -203,7 +203,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
 
 An entry that is not valid, such as a pool with capacity `spto`, is logged as `repo list entry not valid` and skipped, and the rest of the list is served. Its repo stays as the last good list had it, so a typo never reads as a removal. A list that cannot be read or is not JSON leaves the last good list in force, or nothing at the listener's start, and changes nothing. Both raise `paddock-repo-list-unreadable` until the list reads clean. A missing or empty list serves nothing.
 
-A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops. Its runner group stays until you delete it. Delete it only after the listener logs `scale set deleted`, or the scale set is left behind.
+A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops, then its runner group. Do not delete the group by hand: the listener finds the scale set by its group, so the scale set would be left behind. A group that still holds a runner is left in place, since GitHub would move the runner to the org's default group, and the listener logs `could not delete a removed pool's runner group` on each read until the runner is gone.
 
 #### The runner-label variables
 

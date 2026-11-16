@@ -132,6 +132,8 @@ func (c *fakeCloud) Repo(_ context.Context, owner, name string) (github.Repo, er
 
 func (c *fakeCloud) EnsureRunnerGroup(context.Context, string, string, int64) error { return nil }
 
+func (c *fakeCloud) DeleteRunnerGroup(context.Context, string, string) error { return nil }
+
 func (c *fakeCloud) RunnerGroups(context.Context, string) ([]string, error) {
 	return []string{"paddock-widgets-dev"}, nil
 }

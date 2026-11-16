@@ -412,3 +412,85 @@ func TestAnOrgWhoseGroupsFailedIsSweptOnTheNextRead(t *testing.T) {
 		t.Fatalf("deleted %v", sets.deleted)
 	}
 }
+
+// A removed pool's runner group goes after its scale set, so the two stay a
+// pair and a later read finds nothing left to look up. A group whose
+// delete failed, after its scale set went, is deleted on a later read. A
+// listed pool's group, or a held repo's, is never deleted.
+func TestARemovedPoolsRunnerGroupIsDeletedAfterItsScaleSet(t *testing.T) {
+	t.Run("the group goes after the scale set, and a listed pool's stays", func(t *testing.T) {
+		inst, sets, app := acme()
+		var logs syncBuffer
+		m, served, live, clk := newManagerWith(app, sets, &logs)
+		t.Cleanup(served.stop)
+		ctx := served.ctx
+		m.Apply(ctx, widgetsList(testPool, devPool))
+		served.waitFor(t, 2)
+		live.set(sets.sets["paddock-widgets-dev"].ID, 1)
+		m.Apply(ctx, widgetsList(testPool))
+		clk.advance(3 * time.Minute)
+		m.Apply(ctx, widgetsList(testPool))
+		if len(inst.deletedGroups) != 0 {
+			t.Fatalf("deleted groups %v before the scale set", inst.deletedGroups)
+		}
+		live.set(sets.sets["paddock-widgets-dev"].ID, 0)
+		m.Apply(ctx, widgetsList(testPool))
+		if !slices.Equal(sets.deleted, []string{"paddock-widgets-dev"}) || !slices.Equal(inst.deletedGroups, []string{"paddock-widgets-dev"}) {
+			t.Fatalf("deleted scale sets %v, groups %v", sets.deleted, inst.deletedGroups)
+		}
+		if _, ok := inst.groups["paddock-widgets-test"]; !ok {
+			t.Fatal("the listed pool lost its runner group")
+		}
+		if !strings.Contains(logs.String(), `"msg":"runner group deleted"`) {
+			t.Fatalf("logs:\n%s", logs.String())
+		}
+	})
+	t.Run("a group whose delete failed goes on a later read", func(t *testing.T) {
+		inst, sets, app := acme()
+		var logs syncBuffer
+		m, served, _, clk := newManagerWith(app, sets, &logs)
+		t.Cleanup(served.stop)
+		ctx := served.ctx
+		m.Apply(ctx, widgetsList(testPool, devPool))
+		served.waitFor(t, 2)
+		m.Apply(ctx, widgetsList(testPool))
+		clk.advance(3 * time.Minute)
+		inst.deleteErr = errors.New("GitHub answered 502")
+		m.Apply(ctx, widgetsList(testPool))
+		if !slices.Equal(sets.deleted, []string{"paddock-widgets-dev"}) || len(inst.deletedGroups) != 0 {
+			t.Fatalf("deleted scale sets %v, groups %v", sets.deleted, inst.deletedGroups)
+		}
+		if !strings.Contains(logs.String(), `"msg":"could not delete a removed pool's runner group"`) {
+			t.Fatalf("logs:\n%s", logs.String())
+		}
+		inst.deleteErr = nil
+		m.Apply(ctx, widgetsList(testPool))
+		if !slices.Equal(inst.deletedGroups, []string{"paddock-widgets-dev"}) {
+			t.Fatalf("deleted groups %v", inst.deletedGroups)
+		}
+		m.Apply(ctx, widgetsList(testPool))
+		if len(inst.deletedGroups) != 1 {
+			t.Fatalf("deleted groups %v", inst.deletedGroups)
+		}
+	})
+	t.Run("a held repo's groups stay through a typo", func(t *testing.T) {
+		inst, sets, app := acme()
+		var logs syncBuffer
+		m, served, _, clk := newManagerWith(app, sets, &logs)
+		t.Cleanup(served.stop)
+		ctx := served.ctx
+		m.Apply(ctx, widgetsList(testPool, devPool))
+		served.waitFor(t, 2)
+		typo, err := repos.Parse(`{"repos": [{"repo": "acme/widgets", "pools": [{"name": "test", "capacity": "spto"}]}]}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range 3 {
+			m.Apply(ctx, typo)
+			clk.advance(5 * time.Minute)
+		}
+		if len(inst.deletedGroups) != 0 || len(inst.groups) != 2 {
+			t.Fatalf("deleted groups %v over a typo", inst.deletedGroups)
+		}
+	})
+}
