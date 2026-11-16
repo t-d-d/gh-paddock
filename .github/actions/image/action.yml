@@ -43,8 +43,8 @@ inputs:
     default: ''
   compression:
     description: >-
-      The layers' compression, such as zstd, which Fargate pulls and unpacks
-      faster than gzip. Every layer is recompressed, the base's included,
+      The layers' compression, such as gzip, which a SOCI index needs.
+      Every layer is recompressed, the base's included,
       and the image is pushed with OCI media types. Empty pushes as buildx
       does by default: gzip, with the base's layers as published.
     required: false

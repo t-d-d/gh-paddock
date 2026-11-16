@@ -24,8 +24,9 @@
 #
 # The runner-build jobs build the runner's image for x64 and for arm64, each
 # on a GitHub runner of that architecture, under a tag that hashes runner/.
-# The runner-image job joins the two under one image index and hands on the
-# index's digest. The deploy job, in
+# The runner-image job joins the two under one image index, converts it into
+# one with a SOCI index for each architecture, and hands on that index's
+# digest. The deploy job, in
 # order: apply the bootstrap stack (infra/bootstrap.cfn.yml), derive the
 # listener's image tag from the image's inputs, build only when that tag is
 # new, join the runner's digest to the registry, read the default VPC, apply
@@ -172,9 +173,10 @@ jobs:
           region: us-east-1
           platform: ${{ matrix.platform }}
           cache_scope: runner-${{ matrix.arch }}
-          # A cold runner task pulls and unpacks the whole image before it
-          # starts, and Fargate does both faster from zstd layers.
-          compression: zstd
+          # Fargate lazy loads an image with a SOCI index, and reads one only
+          # over gzip layers. Every layer is pushed as an OCI gzip layer, the
+          # base's included, so the index soci converts is all OCI.
+          compression: gzip
 
   # Both architectures' images joined under one image index, at the plan's
   # tag, so the stack takes one image and the rollback is unchanged: ECS
@@ -182,11 +184,19 @@ jobs:
   # output is the index's digest alone: Actions drops an output that holds a
   # masked string, and the image URI carries the account id, which the
   # credentials step masks.
+  #
+  # The index at the plan's tag carries a SOCI index manifest v2 for each
+  # architecture, so Fargate starts a cold runner task's container before the
+  # whole image is down. The two images are first joined at the plan's tag
+  # with -gzip after it, and `soci convert` turns that index into one with a
+  # SOCI index bound to each image. Converting changes each image's digest,
+  # and the registry's tags are immutable, so the plan's tag holds the
+  # converted index alone.
   runner-image:
     needs: [runner-plan, runner-build]
     name: Join the runner's images under one index
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       id-token: write   # OIDC token for AWS assume-role
       contents: read    # the workflow's own permissions, kept
@@ -203,8 +213,27 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # The registry's tags are immutable, so an index already at the tag is
-      # the one an earlier run joined, and is reused.
+      # One release of the soci CLI by number, for this job's x64 runner,
+      # checked against the sha256 the release publishes before it is
+      # unpacked. The job holds the deploy role, so an unchecked binary would
+      # run with it.
+      - name: Install the soci CLI
+        id: soci
+        env:
+          SOCI_VERSION: 0.16.1
+          SOCI_SHA256: 2be9f26ad853455515da69885f8906e6aecc65684cc302f8689c25cad8417bc8
+        run: |
+          set -euo pipefail
+          tarball="soci-snapshotter-${SOCI_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
+            "https://github.com/awslabs/soci-snapshotter/releases/download/v${SOCI_VERSION}/${tarball}"
+          echo "${SOCI_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/soci-bin"
+          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/soci-bin" soci
+          echo "${RUNNER_TEMP}/soci-bin" >> "$GITHUB_PATH"
+
+      # The registry's tags are immutable, so an index already at a tag is
+      # the one an earlier run pushed there, and is reused.
       - name: Join both architectures' images under the plan's tag
         id: index
         env:
@@ -226,20 +255,39 @@ jobs:
           }
           DIGEST=$(digest_of "$TAG")
           if [[ -z "$DIGEST" ]]; then
-            X64=$(digest_of "${TAG}-x64")
-            ARM64=$(digest_of "${TAG}-arm64")
-            for digest in "$X64" "$ARM64"; do
-              if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-                echo "::error::an architecture's image is missing for ${TAG}"
-                exit 1
-              fi
-            done
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
             REGISTRY="${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
+            GZIP=$(digest_of "${TAG}-gzip")
+            if [[ -z "$GZIP" ]]; then
+              X64=$(digest_of "${TAG}-x64")
+              ARM64=$(digest_of "${TAG}-arm64")
+              for digest in "$X64" "$ARM64"; do
+                if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                  echo "::error::an architecture's image is missing for ${TAG}"
+                  exit 1
+                fi
+              done
+              aws ecr get-login-password --region us-east-1 \
+                | docker login --username AWS --password-stdin "$REGISTRY"
+              docker buildx imagetools create --tag "${REGISTRY}/${REPO}:${TAG}-gzip" \
+                "${REGISTRY}/${REPO}@${X64}" "${REGISTRY}/${REPO}@${ARM64}"
+              GZIP=$(digest_of "${TAG}-gzip")
+            fi
+            if [[ ! "$GZIP" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::no index at ${REPO}:${TAG}-gzip"
+              exit 1
+            fi
+            # soci convert --standalone reads and writes an OCI image layout
+            # on disk and needs no containerd. skopeo moves the index and
+            # every image in it between the registry and the disk, and fails
+            # rather than rewrite a manifest: each SOCI index names its
+            # image's digest, so a rewritten image would lose its index.
+            AUTH="${RUNNER_TEMP}/auth.json"
             aws ecr get-login-password --region us-east-1 \
-              | docker login --username AWS --password-stdin "$REGISTRY"
-            docker buildx imagetools create --tag "${REGISTRY}/${REPO}:${TAG}" \
-              "${REGISTRY}/${REPO}@${X64}" "${REGISTRY}/${REPO}@${ARM64}"
+              | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
+            skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
+            soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
+            skopeo copy --all --preserve-digests --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
             DIGEST=$(digest_of "$TAG")
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -258,6 +306,25 @@ jobs:
               exit 1
               ;;
           esac
+          # Fargate starts a task from an index with no SOCI index all the
+          # same, pulling the whole image first, so nothing later would
+          # notice one missing. Each architecture's image must be there with
+          # a SOCI index manifest v2 of the same architecture beside it.
+          aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$TAG" \
+            --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.docker.distribution.manifest.list.v2+json \
+            --query 'images[0].imageManifest' --output text > "${RUNNER_TEMP}/index.json"
+          if ! jq -e '
+              [.manifests[] | select(.artifactType == null) | .platform.architecture] as $images
+              | [.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] as $soci
+              | ($images | index("amd64")) != null and ($images | index("arm64")) != null
+                and ($soci | length) >= ($images | length)
+                and (if all($soci[]; .platform.architecture != null)
+                     then all($images[]; . as $arch | ([$soci[].platform.architecture] | index($arch)) != null)
+                     else true end)
+            ' "${RUNNER_TEMP}/index.json" > /dev/null; then
+            echo "::error::${REPO}:${TAG} has no SOCI index manifest v2 for each architecture"
+            exit 1
+          fi
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
   deploy:

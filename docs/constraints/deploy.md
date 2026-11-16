@@ -28,7 +28,11 @@ running stops them all, and nobody watches the deploy as it happens.
   each on a GitHub-hosted runner of that architecture, under a tag that
   hashes runner/ with the architecture after it. runner/'s Dockerfile copies
   nothing from the repo. A job of its own joins the two under one image
-  index at the bare tag and hands the deploy job the index's digest alone.
+  index, converts that into an index with a SOCI index manifest v2 for each
+  architecture at the bare tag, and hands the deploy job the converted
+  index's digest alone. It refuses an index without a SOCI index for each
+  architecture. The soci CLI it runs is one release by number, checked
+  against a pinned sha256 before it is unpacked.
   The stack takes it as a second parameter, `RunnerImageUri`, so both
   architectures roll back together as one image.
 - The listener's service stops the old task before it starts the new one
@@ -80,4 +84,4 @@ running stops them all, and nobody watches the deploy as it happens.
   copied but not hashed ships under an old tag.
 
 Judgment: whether the probe proves enough of the listener's work grows with the listener; the tests pin only what it checks today. A healthy task has reached GitHub with the App key, but the probe sees nothing of a runner task, so a broken runner image passes it.
-History: Set with the repo's scaffold, November 2026, under PRD #1. Modelled on gh-governor's deploy. The old task stopping first, the runner's image and the two-image rollback came with #16, settled in PRD #1. #70 built the runner's image for x64 and arm64 and joined them under one index.
+History: Set with the repo's scaffold, November 2026, under PRD #1. Modelled on gh-governor's deploy. The old task stopping first, the runner's image and the two-image rollback came with #16, settled in PRD #1. #70 built the runner's image for x64 and arm64 and joined them under one index. #51 added a SOCI index for each architecture, so Fargate lazy loads the runner's image.

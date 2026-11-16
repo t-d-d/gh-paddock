@@ -12,8 +12,10 @@
 # than 30 days behind its latest release once updates are off, and the scale
 # set turns them off.
 #
-# The deploy pushes it with every layer recompressed as zstd, which Fargate
-# pulls and unpacks faster than gzip, so a cold runner task starts sooner.
+# The deploy pushes it with every layer recompressed as gzip, and adds a SOCI
+# index for each architecture, so Fargate starts a cold runner task's
+# container before the whole image is down. Fargate reads a SOCI index over
+# gzip layers, not zstd.
 #
 # It copies nothing from the repo, so the deploy's tag hashes runner/ alone:
 # the entrypoint below is written inline. The listener's task definition for
