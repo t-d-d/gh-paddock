@@ -282,7 +282,8 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
   // OCI index unless set, and its manifest is `manifest`, an index of both
   // architectures with a SOCI index for each unless set.
   // `batch-get-image` answers as ECR does, exit 0 with the image or a
-  // failure, and `failures` maps a tag to the failure code it reports.
+  // failure, and `failures` maps a tag to the failure code it reports. An
+  // image whose media type the call does not accept is not found.
   // `converted` is the list soci writes into its OCI layout, a Docker
   // manifest list of both architectures with a SOCI index for each unless
   // set, and `convertedType` the media type index.json names it by.
@@ -306,8 +307,8 @@ echo "aws $*" >> "$CALLS"
 case "$1 $2" in
   "ecr describe-images" | "ecr batch-get-image")
     ${opts.denied ? 'echo "An error occurred (AccessDeniedException)" >&2; exit 254' : ''}
-    tag=""; media=""
-    for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; *imageManifestMediaType*) media=1 ;; esac; done
+    tag=""
+    for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; esac; done
     digest=""
     if [ -f "$PUSHED/$tag" ]; then
       case "$tag" in
@@ -325,18 +326,20 @@ ${table}
 ${failTable}
     esac
     if [ "$2" = batch-get-image ]; then
-      if [ -z "$failure" ] && [ -n "$digest" ]; then
-        jq -n --arg d "$digest" --arg t "$tag" --arg m "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}" --rawfile f "$MANIFEST" \
+      m="${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"
+      accepted=""; listing=""
+      for a in "$@"; do
+        case "$a" in --accepted-media-types) listing=1 ;; --*) listing="" ;; "$m") [ -n "$listing" ] && accepted=1 ;; esac
+      done
+      if [ -z "$failure" ] && [ -n "$digest" ] && [ -n "$accepted" ]; then
+        jq -n --arg d "$digest" --arg t "$tag" --arg m "$m" --rawfile f "$MANIFEST" \
           '{images: [{imageId: {imageDigest: $d, imageTag: $t}, imageManifestMediaType: $m, imageManifest: $f}], failures: []}'
       else
         jq -n --arg t "$tag" --arg c "\${failure:-ImageNotFound}" '{images: [], failures: [{imageId: {imageTag: $t}, failureCode: $c, failureReason: "the reason"}]}'
       fi
       exit 0
     fi
-    if [ -n "$digest" ]; then
-      if [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
-      exit 0
-    fi
+    if [ -n "$digest" ]; then echo "$digest"; exit 0; fi
     echo "An error occurred (ImageNotFoundException)" >&2; exit 254 ;;
   "sts get-caller-identity") echo the-account ;;
   "ecr get-login-password") echo token ;;
