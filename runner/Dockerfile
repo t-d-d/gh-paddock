@@ -1,8 +1,8 @@
 # The runner's image: every pool's runner tasks run it, on x64 or arm64 as
 # the pool sets (docs/constraints/runner-image.md). It starts FROM GitHub's
-# official runner image and adds the CLI tools common workflows call without
-# a setup action: the AWS CLI, jq, zip, Python 3, and the system libraries
-# Chromium needs.
+# official runner image, installs Ubuntu's published updates, and adds the
+# CLI tools common workflows call without a setup action: the AWS CLI, jq,
+# zip, Python 3, and the system libraries Chromium needs.
 #
 # Built once for each architecture, each on a GitHub runner of that
 # architecture and never under emulation, by the deploy and by the gate,
@@ -25,10 +25,15 @@ FROM ghcr.io/actions/actions-runner:2.338.2
 
 USER root
 
-# Ubuntu 24.04 renamed some of Chromium's libraries with a t64 suffix; take
-# whichever name this base offers.
+# The base carries Ubuntu's packages as GitHub last built it, so the build
+# first installs every update Ubuntu has published since, keeping each
+# changed config file as the base shipped it. A plain upgrade holds back an
+# update that needs a new package, so this one installs those packages too,
+# and removes none. Ubuntu 24.04 renamed some of Chromium's libraries with
+# a t64 suffix; take whichever name this base offers.
 RUN set -eux; \
     apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get -y --with-new-pkgs --no-install-recommends -o Dpkg::Options::=--force-confold upgrade; \
     pkgs="jq zip unzip curl ca-certificates python3 python3-pip python3-venv fonts-liberation \
       libnss3 libnspr4 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 \
       libgbm1 libpango-1.0-0 libcairo2 libx11-xcb1 libxshmfence1 libxss1 libgtk-3-0"; \

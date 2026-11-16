@@ -16,6 +16,12 @@ latest release, so the image must keep up.
   a release by number, and adds only CLI tools common workflows call
   without a setup action: the AWS CLI, jq, zip, Python 3 and the libraries
   Chromium needs.
+- The build installs the updates Ubuntu has published by then, in the step
+  that refreshes the package lists, on both architectures, taking any new
+  package an update needs. The deploy's layer cache reuses that step until
+  the base or the step itself changes, so a fix Ubuntu publishes later
+  reaches the image with Dependabot's next bump of the base. No build runs
+  on a timer.
 - It copies nothing from the repo and runs as the `runner` user. Its
   entrypoint runs a runner for each config the task is handed: `run.sh`
   reads the config and runs one job. After each job the entrypoint waits up
@@ -62,4 +68,4 @@ latest release, so the image must keep up.
   and a single-use runner would lose its job.
 
 Judgment: no offline check sees how far the image is behind GitHub's latest runner release. A Dependabot pull request left unmerged for three weeks is the warning.
-History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed. #54 had it wait 30 seconds after each job and exit by itself. #19 had it hold SIGTERM back from a running job. #70 let a pool run arm64, and built the image for both architectures.
+History: Settled with the owner in PRD #1, and written by #16. #53 had the entrypoint run a runner for each config the task is handed. #54 had it wait 30 seconds after each job and exit by itself. #19 had it hold SIGTERM back from a running job. #70 let a pool run arm64, and built the image for both architectures. #100 had the build install Ubuntu's updates.
