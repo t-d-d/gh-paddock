@@ -24,7 +24,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
-import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
+import { joinContinuations, loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
 const GATE_CHECKS = ['gate', 'image', 'runner-image', 'soci'];
@@ -210,7 +210,7 @@ describe('the gate', () => {
 describe('the gate builds the runner\'s image with the deploy\'s buildx output options', () => {
   const steps = stepsOf(workflow, 'runner-image');
   const build = steps.find((s) => /docker buildx build /.test(s.run ?? ''));
-  const command = (build?.run ?? '').replace(/\\\n\s*/g, ' ');
+  const command = joinContinuations(build?.run ?? '');
 
   // An exporter's options as a map, less the ones that only say where the
   // image goes: the deploy pushes it, the gate writes a file and loads it.
@@ -219,7 +219,10 @@ describe('the gate builds the runner\'s image with the deploy\'s buildx output o
     Object.fromEntries(
       output
         .split(',')
-        .map((pair) => pair.split('=') as [string, string])
+        .map((pair): [string, string] => {
+          const at = pair.indexOf('=');
+          return at < 0 ? [pair, ''] : [pair.slice(0, at), pair.slice(at + 1)];
+        })
         .filter(([key]) => !WHERE.includes(key)),
     );
   const outputs = [...command.matchAll(/--output[ =]("[^"]*"|\S+)/g)].map((m) => (m[1] ?? '').replace(/^"|"$/g, ''));
@@ -263,6 +266,20 @@ describe('the gate builds the runner\'s image with the deploy\'s buildx output o
     assert.deepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=gzip,force-compression=true'), deployed);
     assert.notDeepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=zstd,force-compression=true'), deployed);
     assert.notDeepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=gzip'), deployed);
+    // A value may itself hold '='; it is cut at the first one only.
+    assert.deepEqual(options('annotation.a=b=c'), { 'annotation.a': 'b=c' });
+  });
+
+  // buildx could take an option and not act on it. The tarball's manifest
+  // shows what the deploy's output would push: OCI media types and gzip
+  // layers, the base's included, which is what soci indexes.
+  test('a later step checks the tarball\'s manifest is OCI and every layer is OCI gzip', () => {
+    const at = steps.indexOf(build!);
+    const check = steps.slice(at + 1).find((s) => (s.run ?? '').includes('$RUNNER_TEMP/runner-image.tar'));
+    assert.ok(check, 'a step after the build reads the tarball');
+    assert.match(check!.run!, /application\/vnd\.oci\.image\.manifest\.v1\+json/);
+    assert.match(check!.run!, /all\(\.layers\[\]; \.mediaType == "application\/vnd\.oci\.image\.layer\.v1\.tar\+gzip"\)/);
+    assert.match(check!.run!, /jq -e /);
   });
 });
 

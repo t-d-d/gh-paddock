@@ -21,13 +21,17 @@ export type WorkflowStep = {
  */
 export function loadWorkflow(path: string): { raw: string; codeOnly: string; workflow: Record<string, any> } {
   const raw = readFileSync(resolve(REPO_ROOT, path), 'utf-8');
-  const codeOnly = raw
-    .split('\n')
-    .filter((line) => !/^\s*#/.test(line))
-    .join('\n')
-    .replace(/\\\n\s*/g, ' ');
+  const codeOnly = joinContinuations(
+    raw
+      .split('\n')
+      .filter((line) => !/^\s*#/.test(line))
+      .join('\n'),
+  );
   return { raw, codeOnly, workflow: yaml.load(raw) as Record<string, any> };
 }
+
+/** A shell script with each backslash line continuation joined into one line. */
+export const joinContinuations = (script: string): string => script.replace(/\\\n\s*/g, ' ');
 
 /** The steps of one job, in order. */
 export const stepsOf = (workflow: Record<string, any>, job: string): WorkflowStep[] => workflow.jobs?.[job]?.steps ?? [];
