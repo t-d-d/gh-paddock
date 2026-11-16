@@ -246,8 +246,28 @@ jobs:
             fi
             [[ "$out" == None ]] || echo "$out"
           }
-          DIGEST=$(digest_of "$TAG")
-          if [[ -z "$DIGEST" ]]; then
+          # The bare tag's digest, media type and manifest, read in one call
+          # into image.json. batch-get-image exits 0 when it cannot find a
+          # tag and names the cause in its failures. Returns 1 when the tag is
+          # not there; any other failure stops the job and says it could not
+          # read the tag.
+          IMAGE="${RUNNER_TEMP}/image.json"
+          read_tag() {
+            if ! aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$TAG" \
+                --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.docker.distribution.manifest.list.v2+json \
+                  application/vnd.oci.image.manifest.v1+json application/vnd.docker.distribution.manifest.v2+json \
+                --output json > "$IMAGE" 2>"$RUNNER_TEMP/ecr.err"; then
+              echo "::error::could not read ${REPO}:${TAG}: $(cat "$RUNNER_TEMP/ecr.err")"
+              exit 1
+            fi
+            jq -e '.images | length == 1' "$IMAGE" > /dev/null && return 0
+            if jq -e '.images == [] and .failures[0].failureCode == "ImageNotFound"' "$IMAGE" > /dev/null; then
+              return 1
+            fi
+            echo "::error::could not read ${REPO}:${TAG}: $(jq -c '.failures' "$IMAGE")"
+            exit 1
+          }
+          if ! read_tag; then
             ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
             REGISTRY="${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
             GZIP=$(digest_of "${TAG}-gzip")
@@ -278,8 +298,12 @@ jobs:
             aws ecr get-login-password --region us-east-1 \
               | crane auth login "$REGISTRY" --username AWS --password-stdin
             scripts/soci/convert-and-push.sh "${REGISTRY}/${REPO}@${GZIP}" "${REGISTRY}/${REPO}:${TAG}" "$RUNNER_TEMP"
-            DIGEST=$(digest_of "$TAG")
+            if ! read_tag; then
+              echo "::error::could not read ${REPO}:${TAG}: it is not there after the push"
+              exit 1
+            fi
           fi
+          DIGEST=$(jq -r '.images[0].imageId.imageDigest' "$IMAGE")
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::no index at ${REPO}:${TAG}"
             exit 1
@@ -287,8 +311,7 @@ jobs:
           # Before both architectures, the deploy pushed a single x64 image
           # at the bare tag. A tag holding one of those is refused, not
           # handed on: an arm64 pool's tasks would pull an x64 image.
-          MEDIA=$(aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" \
-            --query 'imageDetails[0].imageManifestMediaType' --output text)
+          MEDIA=$(jq -r '.images[0].imageManifestMediaType' "$IMAGE")
           case "$MEDIA" in
             application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json) ;;
             *)
@@ -300,9 +323,7 @@ jobs:
           # same, pulling the whole image first, so nothing later would
           # notice one missing. Each architecture's image must be there with
           # a SOCI index manifest v2 of the same architecture beside it.
-          aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$TAG" \
-            --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.docker.distribution.manifest.list.v2+json \
-            --query 'images[0].imageManifest' --output text > "${RUNNER_TEMP}/index.json"
+          jq -r '.images[0].imageManifest' "$IMAGE" > "${RUNNER_TEMP}/index.json"
           if ! jq -e -f scripts/soci/check-index.jq "${RUNNER_TEMP}/index.json" > /dev/null; then
             echo "::error::${REPO}:${TAG} has no SOCI index manifest v2 for each architecture"
             exit 1

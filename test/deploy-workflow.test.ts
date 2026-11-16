@@ -281,10 +281,12 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
   // index crane read from the layout. Every image found is of the media type `media`, an
   // OCI index unless set, and its manifest is `manifest`, an index of both
   // architectures with a SOCI index for each unless set.
+  // `batch-get-image` answers as ECR does, exit 0 with the image or a
+  // failure, and `failures` maps a tag to the failure code it reports.
   // `converted` is the list soci writes into its OCI layout, a Docker
   // manifest list of both architectures with a SOCI index for each unless
   // set, and `convertedType` the media type index.json names it by.
-  type IndexOpts = { denied?: boolean; pushes?: Record<string, string>; media?: string; manifest?: unknown; converted?: unknown; convertedType?: string };
+  type IndexOpts = { denied?: boolean; pushes?: Record<string, string>; failures?: Record<string, string>; media?: string; manifest?: unknown; converted?: unknown; convertedType?: string };
   const runIndex = (tags: Record<string, string>, opts: IndexOpts = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'deploy-index-'));
     try {
@@ -296,6 +298,7 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
       mkdirSync(bin);
       const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       const pushTable = Object.entries(opts.pushes ?? {}).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
+      const failTable = Object.entries(opts.failures ?? {}).map(([tag, code]) => `"${tag}") failure="${code}" ;;`).join('\n');
       writeFileSync(join(dir, 'manifest.json'), JSON.stringify(opts.manifest ?? sociIndex()));
       writeFileSync(join(dir, 'converted.json'), JSON.stringify(opts.converted ?? { ...sociIndex(), mediaType: DOCKER_LIST }));
       writeFileSync(join(bin, 'aws'), `#!/bin/bash
@@ -317,9 +320,21 @@ ${pushTable}
 ${table}
       esac
     fi
+    failure=""
+    case "$tag" in
+${failTable}
+    esac
+    if [ "$2" = batch-get-image ]; then
+      if [ -z "$failure" ] && [ -n "$digest" ]; then
+        jq -n --arg d "$digest" --arg t "$tag" --arg m "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}" --rawfile f "$MANIFEST" \
+          '{images: [{imageId: {imageDigest: $d, imageTag: $t}, imageManifestMediaType: $m, imageManifest: $f}], failures: []}'
+      else
+        jq -n --arg t "$tag" --arg c "\${failure:-ImageNotFound}" '{images: [], failures: [{imageId: {imageTag: $t}, failureCode: $c, failureReason: "the reason"}]}'
+      fi
+      exit 0
+    fi
     if [ -n "$digest" ]; then
-      if [ "$2" = batch-get-image ]; then cat "$MANIFEST"
-      elif [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
+      if [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
       exit 0
     fi
     echo "An error occurred (ImageNotFoundException)" >&2; exit 254 ;;
@@ -376,7 +391,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
       const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n').map((l) => l.replaceAll(dir, '$RUNNER_TEMP')) : [];
       const out = existsSync(output) ? readFileSync(output, 'utf-8') : '';
       const read = (name: string) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name)) : undefined);
-      return { status: result.status, lines, out, stderr: result.stderr.toString(), pushedIndex: read('pushed-index.json'), pushedList: read('pushed-list.json') };
+      return { status: result.status, lines, out, stdout: result.stdout.toString(), stderr: result.stderr.toString(), pushedIndex: read('pushed-index.json'), pushedList: read('pushed-list.json') };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -529,6 +544,34 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     }
     const docker = runIndex({ abc: d('4') }, { media: 'application/vnd.docker.distribution.manifest.list.v2+json' });
     assert.equal(docker.out, `digest=${d('4')}\n`, docker.stderr);
+  });
+
+  // batch-get-image answers with the digest, the media type and the
+  // manifest at once, so the bare tag is read in one call.
+  test('reads the bare tag\'s digest, media type and manifest in one call', () => {
+    const { status, lines, out, stderr } = runIndex({ abc: d('4'), ...built });
+    assert.equal(status, 0, stderr);
+    const reads = lines.filter((l) => / imageTag=abc( |$)/.test(l));
+    assert.equal(reads.length, 1, reads.join('\n'));
+    assert.match(reads[0] ?? '', /^aws ecr batch-get-image /);
+    assert.equal(out, `digest=${d('4')}\n`);
+  });
+
+  // batch-get-image exits 0 when it cannot find a tag, and says why in its
+  // failures. That must read as a failed read, not as a missing SOCI index.
+  test('fails, handing on nothing, with a message that names a tag it cannot read', () => {
+    const cases: [Record<string, string>, IndexOpts][] = [
+      [{ abc: d('4') }, { failures: { abc: 'KmsError' } }],
+      [built, { pushes, failures: { abc: 'ImageNotFound' } }],
+    ];
+    for (const [tags, opts] of cases) {
+      const { status, out, stdout, stderr } = runIndex(tags, opts);
+      assert.notEqual(status, 0, JSON.stringify(opts));
+      assert.equal(out, '');
+      const said = stdout + stderr;
+      assert.match(said, /::error::could not read paddock-runner:abc/, said);
+      assert.doesNotMatch(said, /SOCI/, said);
+    }
   });
 
   test('fails, handing on nothing, when an architecture\'s image is missing or the registry refuses a read', () => {
