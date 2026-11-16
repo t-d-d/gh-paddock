@@ -279,15 +279,17 @@ jobs:
             fi
             # soci convert --standalone reads and writes an OCI image layout
             # on disk and needs no containerd. skopeo moves the index and
-            # every image in it between the registry and the disk, and fails
-            # rather than rewrite a manifest: each SOCI index names its
-            # image's digest, so a rewritten image would lose its index.
+            # every image in it between the registry and the disk. The pull
+            # keeps every digest. soci writes the converted index as a Docker
+            # manifest list, which skopeo will push only as an OCI index, so
+            # the push writes OCI. The images in it are OCI already, so their
+            # digests, which each SOCI index names, do not change.
             AUTH="${RUNNER_TEMP}/auth.json"
             aws ecr get-login-password --region us-east-1 \
               | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
             skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
             soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
-            skopeo copy --all --preserve-digests --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
+            skopeo copy --all --format oci --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
             DIGEST=$(digest_of "$TAG")
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then

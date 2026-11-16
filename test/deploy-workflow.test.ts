@@ -381,7 +381,7 @@ mkdir -p "\${@: -1}"
       'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
       `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
       'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
-      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
+      `skopeo copy --all --format oci --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
     ]);
     assert.equal(out, `digest=${d('5')}\n`);
   });
