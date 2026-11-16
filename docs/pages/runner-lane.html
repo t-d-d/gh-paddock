@@ -104,8 +104,7 @@ code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .task.busy { border-color: var(--job); background: var(--job-soft); }
 .task.busy .state::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--job); margin-right: 5px; animation: pulse 1s ease-in-out infinite; }
 .task.waiting { border-style: dashed; }
-.task.starting { border-color: var(--warn); background: var(--warn-soft); }
-.task.handover { border-color: var(--warn); background: var(--warn-soft); }
+.task.starting, .task.handover { border-color: var(--warn); background: var(--warn-soft); }
 .task.exited { opacity: 0.45; }
 .task.stopped { opacity: 0.45; text-decoration: line-through; }
 .task.failed, .task.reclaim { border-color: var(--bad); background: var(--bad-soft); }
@@ -214,11 +213,11 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       </div>
       <div class="card">
         <h3>Warm reuse within a pool</h3>
-        <p>When a task's runner finishes its job, the runner leaves GitHub and the task waits up to 30 seconds with no runner registered. If a job is assigned to the same pool, the listener hands the task a config through the task's own URL, and a new runner takes the job in a few seconds. A dev deploy and the E2E gate after it chain on one warm task.</p>
+        <p>When a task's runner finishes its job, the runner leaves GitHub and the task waits up to 30 seconds with no runner registered. If a job is assigned to the same pool, the listener hands the task a config through the task's own URL, and a new runner takes the job in a few seconds. A task is handed configs only for 30 minutes from its start, so a dev deploy and the E2E gate after it chain on one warm task, but a long chain moves to a fresh one.</p>
       </div>
       <div class="card">
         <h3>Remove, then terminate</h3>
-        <p>A task ends only with no runner registered. A waiting task holds none, and exits by itself when no config comes in 30 seconds, so there is nothing to remove and the listener stops no waiting task. The listener stops only a failed start, and removes the runner record that start made before it stops the task.</p>
+        <p>A task exits only with no runner registered. A waiting task holds none, and exits by itself when no config comes in 30 seconds, so there is nothing to remove and the listener stops no waiting task. The listener stops only a failed start, and removes the runner record that start made before it stops the task.</p>
       </div>
       <div class="card">
         <h3>GitHub is the queue</h3>
@@ -330,7 +329,7 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       { caption: 'Task b\'s job finishes and its runner leaves GitHub. The task waits again, with no runner registered.',
         queue: [], done: ['retry flaky'], listener: 'polling', note: '1 waiting',
         test: [t('b', 'waiting')] },
-      { caption: 'No job comes, so task b exits by itself too. A task ends only with no runner registered, so no job is ever lost to a stop.',
+      { caption: 'No job comes, so task b exits by itself too. A task exits only with no runner registered, so no job is lost to its exit.',
         queue: [], done: ['retry flaky'], listener: 'polling', note: 'stops nothing',
         test: [t('b', 'exited')] }
     ] },
