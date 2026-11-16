@@ -182,7 +182,7 @@ describe('the gate', () => {
     assert.equal(job?.name, 'runner-image (${{ matrix.arch }})');
     const steps = stepsOf(workflow, 'runner-image');
     const runs = steps.map((s) => s.run ?? '').join('\n');
-    assert.match(runs, /docker build --platform "\$PLATFORM" --file runner\/Dockerfile/);
+    assert.match(runs, /docker buildx build --platform "\$PLATFORM" --provenance=false --file runner\/Dockerfile /);
     assert.match(runs, /--entrypoint \/home\/runner\/bin\/Runner\.Listener \S+ --version/);
     for (const tool of ['aws --version', 'jq --version', 'zip -v', 'python3 --version']) assert.ok(runs.includes(tool), tool);
     // The image the job built is the architecture it was asked for.
@@ -199,6 +199,70 @@ describe('the gate', () => {
     const runs = stepsOf(workflow, 'runner-image').map((s) => s.run ?? '').join('\n');
     assert.match(runs, /docker run --rm paddock-runner:gate >"\$RUNNER_TEMP\/entrypoint\.out" 2>&1/);
     assert.match(runs, /grep -q "the task was given no config" "\$RUNNER_TEMP\/entrypoint\.out"/);
+  });
+});
+
+// The deploy builds the runner's image through the image action, with buildx
+// and an image output that recompresses every layer. The gate builds it with
+// the same output options, exported to a local OCI tarball, so a mistake in
+// them, or a buildx release that refuses one, fails a pull request rather
+// than the deploy on main.
+describe('the gate builds the runner\'s image with the deploy\'s buildx output options', () => {
+  const steps = stepsOf(workflow, 'runner-image');
+  const build = steps.find((s) => /docker buildx build /.test(s.run ?? ''));
+  const command = (build?.run ?? '').replace(/\\\n\s*/g, ' ');
+
+  // An exporter's options as a map, less the ones that only say where the
+  // image goes: the deploy pushes it, the gate writes a file and loads it.
+  const WHERE = ['type', 'push', 'dest', 'name'];
+  const options = (output: string): Record<string, string> =>
+    Object.fromEntries(
+      output
+        .split(',')
+        .map((pair) => pair.split('=') as [string, string])
+        .filter(([key]) => !WHERE.includes(key)),
+    );
+  const outputs = [...command.matchAll(/--output[ =]("[^"]*"|\S+)/g)].map((m) => (m[1] ?? '').replace(/^"|"$/g, ''));
+  const oci = outputs.find((o) => o.startsWith('type=oci,'));
+
+  const action = loadWorkflow('.github/actions/image/action.yml').workflow;
+  const actionBuild = (action.runs?.steps ?? []).find((s: { uses?: string }) => s.uses?.startsWith('docker/build-push-action@'));
+  const deploy = loadWorkflow('.github/workflows/deploy.yml').workflow;
+  const compression = stepById(stepsOf(deploy, 'runner-build'), 'image').with?.compression;
+  const format = /format\('([^']*)', inputs\.compression\)/.exec(String(actionBuild?.with?.outputs ?? ''))?.[1];
+
+  test('it builds with buildx, on a builder set up for the job', () => {
+    assert.ok(build, 'a step runs docker buildx build');
+    const setup = steps.findIndex((s) => s.uses?.startsWith('docker/setup-buildx-action@'));
+    assert.ok(setup >= 0 && setup < steps.indexOf(build!), 'setup-buildx-action runs before the build');
+  });
+
+  test('it writes the image to a local OCI tarball and loads it to run, pushing nothing', () => {
+    assert.ok(oci, `outputs are ${JSON.stringify(outputs)}`);
+    assert.match(oci!, /,dest=\$RUNNER_TEMP\/[\w.-]+\.tar(,|$)/);
+    assert.ok(outputs.includes('type=docker,name=paddock-runner:gate'), 'the image is loaded under the tag the later steps run');
+    assert.doesNotMatch(command, /push=true|--push\b/);
+    assert.doesNotMatch(JSON.stringify(workflow.jobs?.['runner-image']), /secrets\.|aws-actions|id-token/);
+  });
+
+  test('its OCI output carries the same options as the deploy\'s image output for the runner', () => {
+    assert.ok(format, 'the image action formats its output from the compression');
+    assert.equal(typeof compression, 'string');
+    const deployed = options(format!.replace('{0}', compression));
+    assert.ok(Object.keys(deployed).length > 0);
+    assert.deepEqual(options(oci ?? ''), deployed);
+  });
+
+  test('it leaves out provenance, as the deploy does', () => {
+    assert.equal(actionBuild?.with?.provenance, false);
+    assert.match(command, /--provenance=false/);
+  });
+
+  test('the comparison sees a difference in any option', () => {
+    const deployed = options('type=image,push=true,oci-mediatypes=true,compression=gzip,force-compression=true');
+    assert.deepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=gzip,force-compression=true'), deployed);
+    assert.notDeepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=zstd,force-compression=true'), deployed);
+    assert.notDeepEqual(options('type=oci,dest=x.tar,oci-mediatypes=true,compression=gzip'), deployed);
   });
 });
 
