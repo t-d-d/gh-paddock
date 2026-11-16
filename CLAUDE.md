@@ -26,7 +26,7 @@ gh-paddock runs self-hosted GitHub Actions runners for private repos on AWS Farg
 
 ## The gate
 
-- `npm run gate` runs everything: the public-repo scan, lint, types, the Node tests, then `gofmt`, `go vet` and the Go tests. CI runs the same command on every push and pull request, and builds the listener's image.
+- `npm run gate` runs everything: the public-repo scan, lint, types, the Node tests, then `gofmt`, `go vet` and the Go tests. CI runs the same command on every pull request, and again on main before the deploy applies. It also builds the listener's image.
 - The gate is offline and holds no secrets.
 
 ## Branches and pull requests

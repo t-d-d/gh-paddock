@@ -9,6 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import yaml from 'js-yaml';
 import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow } from './helpers/workflow.ts';
 
@@ -17,7 +18,7 @@ const CONFIG = '.github/governor.json';
 type Config = {
   $schema?: string;
   workflows?: { ci?: string };
-  prReview?: { merge?: boolean; humanOnly?: Array<{ glob: string; reason: string }> };
+  prReview?: { merge?: boolean; humanOnly?: Array<{ glob: string; reason: string }>; dependabot?: string[] };
   heartbeat?: { issue?: number };
   [section: string]: unknown;
 };
@@ -39,6 +40,25 @@ describe('governor\'s config', () => {
   test('a change to the config file itself waits for a person', () => {
     const globs = (config().prReview?.humanOnly ?? []).map((entry) => entry.glob);
     assert.ok(globs.includes(CONFIG), globs.join(', '));
+  });
+
+  // Dependabot keeps each image's base current, and the runner's must stay
+  // within 30 days of GitHub's latest release (docs/constraints/runner-image.md).
+  // A bump the review does not handle waits for a person.
+  test('the review handles a Dependabot bump of every image base Dependabot watches', () => {
+    const dependabot = yaml.load(readFileSync(resolve(REPO_ROOT, '.github/dependabot.yml'), 'utf-8')) as {
+      updates?: Array<{ 'package-ecosystem'?: string; directory?: string }>;
+    };
+    const dockerfiles = (dependabot.updates ?? [])
+      .filter((update) => update['package-ecosystem'] === 'docker')
+      .map((update) => `${String(update.directory).replace(/^\//, '')}/Dockerfile`);
+    assert.ok(dockerfiles.length > 0, 'Dependabot watches no image base');
+    // Governor reads a glob with a leading slash as the same path without it.
+    const handled = (config().prReview?.dependabot ?? []).map((glob) => glob.replace(/^\//, ''));
+    for (const dockerfile of dockerfiles) {
+      assert.ok(existsSync(resolve(REPO_ROOT, dockerfile)), `${dockerfile} is missing`);
+      assert.ok(handled.includes(dockerfile), `${dockerfile} is not in ${handled.join(', ')}`);
+    }
   });
 });
 
