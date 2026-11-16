@@ -213,11 +213,11 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       </div>
       <div class="card">
         <h3>Warm reuse within a pool</h3>
-        <p>When a task's runner finishes its job, the runner leaves GitHub and the task waits up to 30 seconds with no runner registered. If a job is assigned to the same pool, the listener hands the task a config through the task's own URL, and a new runner takes the job in a few seconds. A task is handed configs only for 30 minutes from its start, so a dev deploy and the E2E gate after it chain on one warm task, but a long chain moves to a fresh one.</p>
+        <p>When a task's runner finishes its job, the runner leaves GitHub and the task waits up to 30 seconds with no runner registered. If a job is assigned to the same pool, the listener hands the task a config through the task's own URL, and a new runner takes the job in a few seconds. A dev deploy and the E2E gate after it chain on one warm task.</p>
       </div>
       <div class="card">
         <h3>Remove, then terminate</h3>
-        <p>A task exits only with no runner registered. A waiting task holds none, and exits by itself when no config comes in 30 seconds, so there is nothing to remove and the listener stops no waiting task. The listener stops only a failed start, and removes the runner record that start made before it stops the task.</p>
+        <p>A task exits only with no runner registered. A waiting task holds none, and exits by itself when no config comes in 30 seconds, so there is nothing to remove and the listener stops no waiting task.</p>
       </div>
       <div class="card">
         <h3>GitHub is the queue</h3>

@@ -117,7 +117,7 @@ describe('the runner lane page', () => {
 
   test('shows a finished task waiting with no runner registered, then taking a config or exiting by itself', () => {
     const text = html.toLowerCase();
-    for (const phrase of ['no runner registered', 'exits by itself', 'own url', '30 minutes'])
+    for (const phrase of ['no runner registered', 'exits by itself', 'own url'])
       assert.ok(text.includes(phrase), `the page mentions ${phrase}`);
   });
 
