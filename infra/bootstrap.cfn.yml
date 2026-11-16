@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  gh-paddock's bootstrap: GitHub's OIDC provider and the role a run on main
-  assumes to deploy. Stack paddock-bootstrap, in the main stack's region.
+  gh-paddock's bootstrap: GitHub's OIDC provider, the role a run on main
+  assumes to deploy, and the registry's scan-on-push rule for paddock's
+  images. Stack paddock-bootstrap, in the main stack's region.
 
 # Applied once by hand as an administrator, since nothing can assume a role
 # that does not exist yet. Every deploy applies it again before the main
@@ -71,6 +72,21 @@ Resources:
       # The trust above, the owner's merges and the gate guard it.
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # The registry holds one scanning configuration per region, and this
+  # replaces whatever was there. AWS deprecates the repository's own
+  # scan-on-push flag in favour of these rules: a repository no rule covers
+  # is scanned only by hand. Every deploy applies this stack before it pushes
+  # the listener's image, so the rule is in force for that push.
+  RegistryScanning:
+    Type: AWS::ECR::RegistryScanningConfiguration
+    Properties:
+      ScanType: BASIC
+      Rules:
+        - ScanFrequency: SCAN_ON_PUSH
+          RepositoryFilters:
+            - Filter: paddock-*
+              FilterType: WILDCARD
 
 Outputs:
   DeployRoleArn:

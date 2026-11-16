@@ -27,7 +27,7 @@ Jobs that need a Docker daemon or KVM, macOS jobs and public repos stay on GitHu
 |---|---|
 | `cmd/listener/` | The listener, in Go, and its Dockerfile |
 | `internal/` | The listener's packages |
-| `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes |
+| `infra/bootstrap.cfn.yml` | The deploy role GitHub's OIDC assumes, and the registry's scan-on-push rule |
 | `infra/paddock.cfn.yml` | The listener's service, what it needs to start runner tasks, its alarms and the alerts topic |
 | `runner/` | The runner's image, built FROM GitHub's runner image |
 | `scripts/` | The deploy's probe and stack guard, and the public-repo scan |
@@ -60,6 +60,7 @@ Until you set the deploy's secret below, a push to `main` runs the gate and skip
 
 1. The account needs a default VPC in us-east-1. The listener and the runners run in its public subnets, with no NAT gateway to pay for. If it has none, run `aws ec2 create-default-vpc`.
 2. It must not have an IAM OIDC provider for `token.actions.githubusercontent.com` yet. The bootstrap stack creates one, and the apply fails if one exists.
+   The bootstrap stack also sets the registry's scanning configuration in us-east-1: basic scanning, with images in the `paddock-` repositories scanned on push. It replaces any scanning rules the registry already has.
 3. Raise the Fargate vCPU quotas. Open Service Quotas, then AWS services, then Amazon Elastic Container Service, and find `Fargate On-Demand vCPU resource count` and `Fargate Spot vCPU resource count`. A new account's quotas can be far below what a pool needs, and a raise can take a day, so ask now. Each needs the sum, over every pool on that capacity, of `maxRunners` times `vcpu`, which is 20 for a pool left at the defaults, plus a quarter of a vCPU of Spot for the listener.
 
 ### Create the GitHub App
