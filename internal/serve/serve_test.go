@@ -21,8 +21,12 @@ import (
 
 type fakeInstallation struct {
 	groupsErr error
-	repos     map[string]github.Repo
-	groups    map[string]int64 // runner group name -> repo it is open to
+	// deleteErr fails each group delete while set; deletedGroups records
+	// those that went.
+	deleteErr     error
+	deletedGroups []string
+	repos         map[string]github.Repo
+	groups        map[string]int64 // runner group name -> repo it is open to
 }
 
 func (i *fakeInstallation) Repo(_ context.Context, owner, name string) (github.Repo, error) {
@@ -47,6 +51,17 @@ func (i *fakeInstallation) RunnerGroups(context.Context, string) ([]string, erro
 		names = append(names, name)
 	}
 	return names, nil
+}
+
+func (i *fakeInstallation) DeleteRunnerGroup(_ context.Context, _, name string) error {
+	if i.deleteErr != nil {
+		return i.deleteErr
+	}
+	if _, ok := i.groups[name]; ok {
+		delete(i.groups, name)
+		i.deletedGroups = append(i.deletedGroups, name)
+	}
+	return nil
 }
 
 func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
