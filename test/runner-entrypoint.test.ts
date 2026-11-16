@@ -166,6 +166,16 @@ describe('the runner image\'s entrypoint', () => {
     assert.ok(r.seconds < 6, `waited ${r.seconds}s`);
   });
 
+  test('polls its URL once after each job, however short its wait', async () => {
+    // Bash counts the wait in whole seconds, so a short wait can run out
+    // before the first poll. A wait of 0 has always run out: the poll must
+    // still come.
+    const r = await runEntrypoint(url, [config('paddock-second'), { status: 404 }], { wait: 0 });
+    assert.equal(r.code, 0);
+    assert.deepEqual(runs(r), ['run jit-first', 'run jit-paddock-second']);
+    assert.equal(url.requests.length, 2, `it polled ${url.requests.length} times after 2 jobs`);
+  });
+
   test('exits at once when its URL is refused', async () => {
     const r = await runEntrypoint(url, [{ status: 403 }], { wait: 30 });
     assert.equal(r.code, 0);
