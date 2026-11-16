@@ -277,7 +277,8 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
   // `soci` and `crane` replaced by stubs. `tags` maps a tag in the registry to its
   // digest; a tag not in it is not found, unless `denied`, when every read
   // is refused. `pushes` maps a tag to the digest it names once docker or
-  // crane pushes to it. Every image found is of the media type `media`, an
+  // crane pushes to it; a tag crane pushes and `pushes` leaves out names the
+  // index crane read from the layout. Every image found is of the media type `media`, an
   // OCI index unless set, and its manifest is `manifest`, an index of both
   // architectures with a SOCI index for each unless set.
   // `converted` is the list soci writes into its OCI layout, a Docker
@@ -309,6 +310,7 @@ case "$1 $2" in
       case "$tag" in
 ${pushTable}
       esac
+      [ -n "$digest" ] || digest=$(cat "$PUSHED/$tag")
     fi
     if [ -z "$digest" ]; then
       case "$tag" in
@@ -336,7 +338,6 @@ echo "skopeo $*" >> "$CALLS"
 dest="\${@: -1}"
 case "$dest" in
   oci:*) mkdir -p "\${dest#oci:}" ;;
-  docker://*) touch "$PUSHED/\${dest##*:}" ;;
 esac
 `, { mode: 0o755 });
       writeFileSync(join(bin, 'crane'), `#!/bin/bash
@@ -347,7 +348,7 @@ if [ "$1" = push ]; then
   cp "$layout/index.json" "$PUSHED_INDEX"
   list=$(jq -r '.manifests[0].digest' "$layout/index.json")
   cp "$layout/blobs/sha256/\${list#sha256:}" "$PUSHED_LIST"
-  touch "$PUSHED/\${3##*:}"
+  echo "$list" > "$PUSHED/\${3##*:}"
 fi
 `, { mode: 0o755 });
       writeFileSync(join(bin, 'soci'), `#!/bin/bash
@@ -385,7 +386,8 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     manifests,
   });
   const built = { 'abc-x64': d('1'), 'abc-arm64': d('2') };
-  const pushes = { 'abc-gzip': d('3'), abc: d('5') };
+  const pushes = { 'abc-gzip': d('3') };
+  const digestOf = (bytes: Buffer | undefined) => `sha256:${createHash('sha256').update(bytes ?? '').digest('hex')}`;
 
   test('joins both architectures\' gzip images under the plan\'s tag with -gzip after it', () => {
     const { status, lines, stderr } = runIndex(built, { pushes });
@@ -398,7 +400,7 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
   // with no containerd. skopeo pulls the joined index to disk, and crane
   // pushes the converted one back as its bytes stand.
   test('converts the joined index with a SOCI index for each architecture, pushes it at the plan\'s tag, and hands on its digest', () => {
-    const { status, lines, out, stderr } = runIndex(built, { pushes });
+    const { status, lines, out, stderr, pushedList } = runIndex(built, { pushes });
     assert.equal(status, 0, stderr);
     const tools = lines.filter((l) => /^(skopeo|soci|crane) /.test(l));
     assert.deepEqual(tools, [
@@ -408,7 +410,15 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
       'crane auth login the-account.dkr.ecr.us-east-1.amazonaws.com --username AWS --password-stdin',
       `crane push $RUNNER_TEMP/soci ${REGISTRY}:abc`,
     ]);
-    assert.equal(out, `digest=${d('5')}\n`);
+    assert.equal(out, `digest=${digestOf(pushedList)}\n`);
+  });
+
+  // skopeo refused to push a manifest it would change. crane writes the
+  // layout's bytes, and the step checks the tag names the index soci wrote.
+  test('refuses, handing on nothing, when the tag names another index than the one in the layout', () => {
+    const { status, out } = runIndex(built, { pushes: { ...pushes, abc: d('5') } });
+    assert.notEqual(status, 0);
+    assert.equal(out, '');
   });
 
   // soci writes the converted index as a Docker manifest list. The step
@@ -444,11 +454,11 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
   });
 
   test('converts a joined index an earlier run left, and joins nothing', () => {
-    const { status, lines, out, stderr } = runIndex({ ...built, 'abc-gzip': d('3') }, { pushes });
+    const { status, lines, out, stderr, pushedList } = runIndex({ ...built, 'abc-gzip': d('3') }, { pushes });
     assert.equal(status, 0, stderr);
     assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
     assert.ok(lines.some((l) => l.startsWith('soci convert')), lines.join('\n'));
-    assert.equal(out, `digest=${d('5')}\n`);
+    assert.equal(out, `digest=${digestOf(pushedList)}\n`);
   });
 
   test('reuses an index already under the tag, and joins and converts nothing', () => {

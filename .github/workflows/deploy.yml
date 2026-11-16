@@ -307,10 +307,11 @@ jobs:
               | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
             skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
             soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
-            # soci writes the converted index as a Docker manifest list. It is
-            # relabelled here as an OCI index, with every entry kept as soci
-            # wrote it, artifactType included, which marks a SOCI index. Only
-            # the list's own digest changes, and nothing names it.
+            # soci writes the converted index as a Docker manifest list, whose
+            # format has no artifactType, the field that marks a SOCI index.
+            # It is relabelled here as an OCI index, with every entry kept as
+            # soci wrote it, artifactType included. Only the list's own digest
+            # changes, and nothing names it.
             LAYOUT="${RUNNER_TEMP}/soci"
             LIST_TYPE=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].mediaType else "" end' "${LAYOUT}/index.json")
             case "$LIST_TYPE" in
@@ -336,7 +337,15 @@ jobs:
             aws ecr get-login-password --region us-east-1 \
               | crane auth login "$REGISTRY" --username AWS --password-stdin
             crane push "$LAYOUT" "${REGISTRY}/${REPO}:${TAG}" > /dev/null
+            # skopeo refused to push a manifest it would rewrite, and crane
+            # has no such check. The tag must name the index in the layout,
+            # whose entries are the images each SOCI index names.
+            WANT=$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")
             DIGEST=$(digest_of "$TAG")
+            if [[ "$DIGEST" != "$WANT" ]]; then
+              echo "::error::${REPO}:${TAG} names ${DIGEST:-nothing}, not the index soci wrote (${WANT})"
+              exit 1
+            fi
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::no index at ${REPO}:${TAG}"
