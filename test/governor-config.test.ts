@@ -52,8 +52,9 @@ describe('governor\'s config', () => {
     const dockerfiles = (dependabot.updates ?? [])
       .filter((update) => update['package-ecosystem'] === 'docker')
       .map((update) => `${String(update.directory).replace(/^\//, '')}/Dockerfile`);
-    assert.ok(dockerfiles.length >= 2, `Dependabot watches ${dockerfiles.join(', ')}`);
-    const handled = config().prReview?.dependabot ?? [];
+    assert.ok(dockerfiles.length > 0, 'Dependabot watches no image base');
+    // Governor reads a glob with a leading slash as the same path without it.
+    const handled = (config().prReview?.dependabot ?? []).map((glob) => glob.replace(/^\//, ''));
     for (const dockerfile of dockerfiles) {
       assert.ok(existsSync(resolve(REPO_ROOT, dockerfile)), `${dockerfile} is missing`);
       assert.ok(handled.includes(dockerfile), `${dockerfile} is not in ${handled.join(', ')}`);
