@@ -88,11 +88,12 @@ jobs:
           cat "$RUNNER_TEMP/run.out"
           grep -q '"msg":"listener started"' "$RUNNER_TEMP/run.out"
 
-  # The runner's image, as the deploy builds it: once for each architecture,
-  # each on a GitHub runner of that architecture, never under emulation. Each
-  # starts the runner far enough to print its version, checks the tools the
-  # image adds are on the path and the image is the architecture asked for,
-  # and starts the entrypoint.
+  # The runner's image, as the deploy builds it: with buildx and the deploy's
+  # output options, once for each architecture, each on a GitHub runner of
+  # that architecture, never under emulation. Each checks the layers the
+  # deploy's options give, starts the runner far enough to print its
+  # version, checks the tools the image adds are on the path and the image
+  # is the architecture asked for, and starts the entrypoint.
   runner-image:
     name: runner-image (${{ matrix.arch }})
     strategy:
@@ -112,10 +113,32 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # With buildx and the output options the deploy's image action pushes
+      # with, so a mistake in them, or a buildx release that refuses one,
+      # fails here and not in the deploy on main. The OCI output is written
+      # to a file and pushed nowhere; the docker output loads the image for
+      # the steps below. test/gate-workflow.test.ts holds the two option
+      # lists equal.
       - name: Build the runner's image
         env:
           PLATFORM: ${{ matrix.platform }}
-        run: docker build --platform "$PLATFORM" --file runner/Dockerfile --tag paddock-runner:gate runner
+        run: |
+          docker buildx build --platform "$PLATFORM" --provenance=false --file runner/Dockerfile \
+            --output "type=oci,dest=$RUNNER_TEMP/runner-image.tar,oci-mediatypes=true,compression=gzip,force-compression=true" \
+            --output type=docker,name=paddock-runner:gate \
+            runner
+      # buildx could take an option and not act on it. The tarball's manifest
+      # shows what the deploy's output would push: OCI media types and gzip
+      # layers, the base's included, which is what soci indexes. Only the
+      # index and the manifest are read, never the layers.
+      - name: Check the OCI output's manifest and layers
+        run: |
+          set -euo pipefail
+          manifest=$(tar --wildcards -xOf "$RUNNER_TEMP/runner-image.tar" '*index.json' | jq -r '.manifests[0].digest | sub("^sha256:"; "")')
+          tar --wildcards -xOf "$RUNNER_TEMP/runner-image.tar" "*blobs/sha256/${manifest}" | tee "$RUNNER_TEMP/manifest.json"
+          echo
+          jq -e '.mediaType == "application/vnd.oci.image.manifest.v1+json" and (.layers | length > 0) and all(.layers[]; .mediaType == "application/vnd.oci.image.layer.v1.tar+gzip")' "$RUNNER_TEMP/manifest.json" > /dev/null
       - name: Start the runner, and check the tools it adds and its architecture
         env:
           MACHINE: ${{ matrix.machine }}
