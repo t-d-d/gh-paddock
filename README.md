@@ -45,6 +45,7 @@ You need:
 
 - an AWS account that will hold gh-paddock and nothing else, and an administrator's credentials for it on your machine, with the AWS CLI and `jq`;
 - a GitHub org that owns the private repos you want to serve. The runners serve private repos in an org, never public repos or repos in a personal account.
+- that org on the GitHub Team plan, or in GitHub Enterprise Cloud. The listener makes a runner group for each pool, and GitHub lets an org make runner groups beyond its default one only on those plans. On GitHub Free the listener cannot make the groups and serves no pool.
 
 Everything in AWS lives in us-east-1. Run each `aws` command below with `--region us-east-1`, or set `AWS_REGION=us-east-1` first.
 
