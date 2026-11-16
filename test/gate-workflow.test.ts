@@ -248,7 +248,7 @@ describe('the gate builds the runner\'s image with the deploy\'s buildx output o
   test('its OCI output carries the same options as the deploy\'s image output for the runner', () => {
     assert.ok(format, 'the image action formats its output from the compression');
     assert.equal(typeof compression, 'string');
-    const deployed = options(format!.replace('{0}', compression));
+    const deployed = options(format!.replace('{0}', String(compression)));
     assert.ok(Object.keys(deployed).length > 0);
     assert.deepEqual(options(oci ?? ''), deployed);
   });
