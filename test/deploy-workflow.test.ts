@@ -250,7 +250,7 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
     assert.equal(image.with?.platform, '${{ matrix.platform }}');
     assert.equal(image.with?.image_tag, '${{ needs.runner-plan.outputs.image_tag }}-${{ matrix.arch }}');
     assert.equal(image.with?.cache_scope, 'runner-${{ matrix.arch }}');
-    assert.equal(image.with?.compression, 'zstd');
+    assert.equal(image.with?.compression, 'gzip');
   });
 
   test('its tag hashes runner/, which holds the Dockerfile and nothing it copies from elsewhere', () => {
@@ -272,32 +272,46 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
     assert.match(runner.run ?? '', /paddock-runner@\$\{DIGEST\}/);
   });
 
-  // Runs the index step as Actions runs it, with `aws` and `docker` replaced
-  // by stubs. `tags` maps a tag in the registry to its digest; a tag not in
-  // it is not found, unless `denied`, when every read is refused. Every
-  // image found is of the media type `media`, an OCI index unless set.
-  const runIndex = (tags: Record<string, string>, opts: { denied?: boolean; created?: string; media?: string } = {}) => {
+  // Runs the index step as Actions runs it, with `aws`, `docker`, `skopeo`
+  // and `soci` replaced by stubs. `tags` maps a tag in the registry to its
+  // digest; a tag not in it is not found, unless `denied`, when every read
+  // is refused. `pushes` maps a tag to the digest it names once docker or
+  // skopeo pushes to it. Every image found is of the media type `media`, an
+  // OCI index unless set, and its manifest is `manifest`, an index of both
+  // architectures with a SOCI index for each unless set.
+  type IndexOpts = { denied?: boolean; pushes?: Record<string, string>; media?: string; manifest?: unknown };
+  const runIndex = (tags: Record<string, string>, opts: IndexOpts = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'deploy-index-'));
     try {
       const calls = join(dir, 'calls');
       const output = join(dir, 'output');
+      const pushed = join(dir, 'pushed');
+      const bin = join(dir, 'bin');
+      spawnSync('mkdir', ['-p', pushed, bin]);
       const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
-      writeFileSync(join(dir, 'aws'), `#!/bin/bash
+      const pushTable = Object.entries(opts.pushes ?? {}).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
+      writeFileSync(join(dir, 'manifest.json'), JSON.stringify(opts.manifest ?? sociIndex()));
+      writeFileSync(join(bin, 'aws'), `#!/bin/bash
 echo "aws $*" >> "$CALLS"
 case "$1 $2" in
-  "ecr describe-images")
+  "ecr describe-images" | "ecr batch-get-image")
     ${opts.denied ? 'echo "An error occurred (AccessDeniedException)" >&2; exit 254' : ''}
     tag=""; media=""
     for a in "$@"; do case "$a" in imageTag=*) tag="\${a#imageTag=}" ;; *imageManifestMediaType*) media=1 ;; esac; done
     digest=""
-    if [ -f "$CREATED" ] && [ "$tag" = "$(cat "$CREATED")" ]; then digest="${opts.created ?? ''}"; fi
+    if [ -f "$PUSHED/$tag" ]; then
+      case "$tag" in
+${pushTable}
+      esac
+    fi
     if [ -z "$digest" ]; then
       case "$tag" in
 ${table}
       esac
     fi
     if [ -n "$digest" ]; then
-      if [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
+      if [ "$2" = batch-get-image ]; then cat "$MANIFEST"
+      elif [ -n "$media" ]; then echo "${opts.media ?? 'application/vnd.oci.image.index.v1+json'}"; else echo "$digest"; fi
       exit 0
     fi
     echo "An error occurred (ImageNotFoundException)" >&2; exit 254 ;;
@@ -305,17 +319,30 @@ ${table}
   "ecr get-login-password") echo token ;;
 esac
 `, { mode: 0o755 });
-      writeFileSync(join(dir, 'docker'), `#!/bin/bash
+      writeFileSync(join(bin, 'docker'), `#!/bin/bash
 echo "docker $*" >> "$CALLS"
-if [ "$1 $2 $3" = "buildx imagetools create" ]; then t="$5"; echo "\${t##*:}" > "$CREATED"; fi
+if [ "$1 $2 $3" = "buildx imagetools create" ]; then t="$5"; touch "$PUSHED/\${t##*:}"; fi
 cat > /dev/null
 `, { mode: 0o755 });
+      writeFileSync(join(bin, 'skopeo'), `#!/bin/bash
+echo "skopeo $*" >> "$CALLS"
+[ "$1" = login ] && { cat > /dev/null; exit 0; }
+dest="\${@: -1}"
+case "$dest" in
+  oci:*) mkdir -p "\${dest#oci:}" ;;
+  docker://*) touch "$PUSHED/\${dest##*:}" ;;
+esac
+`, { mode: 0o755 });
+      writeFileSync(join(bin, 'soci'), `#!/bin/bash
+echo "soci $*" >> "$CALLS"
+mkdir -p "\${@: -1}"
+`, { mode: 0o755 });
       const result = spawnSync('bash', ['-e', '-c', stepById(indexSteps, 'index').run ?? ''], {
-        env: { PATH: `${dir}:${process.env.PATH}`, CALLS: calls, CREATED: join(dir, 'created'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
+        env: { PATH: `${bin}:${process.env.PATH}`, CALLS: calls, PUSHED: pushed, MANIFEST: join(dir, 'manifest.json'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
         stdio: 'pipe',
         input: '',
       });
-      const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n') : [];
+      const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n').map((l) => l.replaceAll(dir, '$RUNNER_TEMP')) : [];
       const out = existsSync(output) ? readFileSync(output, 'utf-8') : '';
       return { status: result.status, lines, out, stderr: result.stderr.toString() };
     } finally {
@@ -323,23 +350,69 @@ cat > /dev/null
     }
   };
   const d = (c: string) => `sha256:${c.repeat(64)}`;
+  const REGISTRY = 'the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner';
+  const SOCI = 'application/vnd.amazon.soci.index.v2+json';
+  const image = (arch: string, c: string) => ({ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: d(c), size: 1, platform: { architecture: arch, os: 'linux' } });
+  const soci = (arch: string, c: string) => ({ ...image(arch, c), artifactType: SOCI });
+  const sociIndex = (manifests = [image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c'), soci('arm64', 'e')]) => ({
+    schemaVersion: 2,
+    mediaType: 'application/vnd.oci.image.index.v1+json',
+    manifests,
+  });
+  const built = { 'abc-x64': d('1'), 'abc-arm64': d('2') };
+  const pushes = { 'abc-gzip': d('3'), abc: d('5') };
 
-  test('joins both architectures\' images under the plan\'s tag, and hands on the index\'s digest', () => {
-    const { status, lines, out, stderr } = runIndex({ 'abc-x64': d('1'), 'abc-arm64': d('2') }, { created: d('3') });
+  test('joins both architectures\' gzip images under the plan\'s tag with -gzip after it', () => {
+    const { status, lines, stderr } = runIndex(built, { pushes });
     assert.equal(status, 0, stderr);
     const create = lines.find((l) => l.startsWith('docker buildx imagetools create'));
-    assert.equal(
-      create,
-      `docker buildx imagetools create --tag the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner:abc the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner@${d('1')} the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner@${d('2')}`,
-    );
-    assert.equal(out, `digest=${d('3')}\n`);
+    assert.equal(create, `docker buildx imagetools create --tag ${REGISTRY}:abc-gzip ${REGISTRY}@${d('1')} ${REGISTRY}@${d('2')}`);
   });
 
-  test('reuses an index already under the tag, and joins nothing', () => {
-    const { status, lines, out, stderr } = runIndex({ abc: d('4'), 'abc-x64': d('1'), 'abc-arm64': d('2') });
+  // soci convert --standalone reads and writes an OCI image layout on disk,
+  // with no containerd; skopeo moves the index to and from the registry.
+  test('converts the joined index with a SOCI index for each architecture, pushes it at the plan\'s tag, and hands on its digest', () => {
+    const { status, lines, out, stderr } = runIndex(built, { pushes });
     assert.equal(status, 0, stderr);
-    assert.ok(!lines.some((l) => l.startsWith('docker')), lines.join('\n'));
+    const tools = lines.filter((l) => /^(skopeo|soci) /.test(l));
+    assert.deepEqual(tools, [
+      'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
+      `skopeo copy --all --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
+      'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
+      `skopeo copy --all --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
+    ]);
+    assert.equal(out, `digest=${d('5')}\n`);
+  });
+
+  test('converts a joined index an earlier run left, and joins nothing', () => {
+    const { status, lines, out, stderr } = runIndex({ ...built, 'abc-gzip': d('3') }, { pushes });
+    assert.equal(status, 0, stderr);
+    assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
+    assert.ok(lines.some((l) => l.startsWith('soci convert')), lines.join('\n'));
+    assert.equal(out, `digest=${d('5')}\n`);
+  });
+
+  test('reuses an index already under the tag, and joins and converts nothing', () => {
+    const { status, lines, out, stderr } = runIndex({ abc: d('4'), ...built });
+    assert.equal(status, 0, stderr);
+    assert.ok(!lines.some((l) => /^(docker|skopeo|soci) /.test(l)), lines.join('\n'));
     assert.equal(out, `digest=${d('4')}\n`);
+  });
+
+  // Fargate starts a task from an index without a SOCI index all the same,
+  // pulling the whole image, so nothing downstream would notice one lost.
+  test('refuses, handing on nothing, an index without a SOCI index for each architecture', () => {
+    const cases = [
+      sociIndex([image('amd64', 'a'), image('arm64', 'b')]),
+      sociIndex([image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c')]),
+      sociIndex([image('amd64', 'a'), soci('amd64', 'c'), soci('arm64', 'e')]),
+      sociIndex([image('amd64', 'a'), image('arm64', 'b'), { ...soci('arm64', 'e'), artifactType: 'application/vnd.amazon.soci.index.v1+json' }, soci('amd64', 'c')]),
+    ];
+    for (const manifest of cases) {
+      const { status, out } = runIndex({ abc: d('4') }, { manifest });
+      assert.notEqual(status, 0, JSON.stringify(manifest));
+      assert.equal(out, '', JSON.stringify(manifest));
+    }
   });
 
   // An earlier deploy pushed a single x64 image at a bare tag. A tree of
@@ -347,7 +420,7 @@ cat > /dev/null
   // if it were the index: an arm64 pool's tasks would pull an x64 image.
   test('refuses, handing on nothing, a tag that holds a single image rather than an index', () => {
     for (const media of ['application/vnd.docker.distribution.manifest.v2+json', 'application/vnd.oci.image.manifest.v1+json']) {
-      const { status, lines, out } = runIndex({ abc: d('4'), 'abc-x64': d('1'), 'abc-arm64': d('2') }, { media });
+      const { status, lines, out } = runIndex({ abc: d('4'), ...built }, { media });
       assert.notEqual(status, 0, media);
       assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
       assert.equal(out, '', media);
@@ -357,10 +430,10 @@ cat > /dev/null
   });
 
   test('fails, handing on nothing, when an architecture\'s image is missing or the registry refuses a read', () => {
-    for (const [tags, opts] of [[{ 'abc-x64': d('1') }, {}], [{ 'abc-arm64': d('2') }, {}], [{ 'abc-x64': d('1'), 'abc-arm64': d('2') }, { denied: true }]] as const) {
+    for (const [tags, opts] of [[{ 'abc-x64': d('1') }, { pushes }], [{ 'abc-arm64': d('2') }, { pushes }], [built, { denied: true, pushes }]] as const) {
       const { status, lines, out } = runIndex(tags, opts);
       assert.notEqual(status, 0, JSON.stringify(tags));
-      assert.ok(!lines.some((l) => l.startsWith('docker buildx')), lines.join('\n'));
+      assert.ok(!lines.some((l) => /^(docker buildx|skopeo copy|soci) /.test(l)), lines.join('\n'));
       assert.equal(out, '');
     }
   });
