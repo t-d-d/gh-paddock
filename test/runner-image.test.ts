@@ -48,7 +48,8 @@ describe('fitness: every pool runs one image, built for x64 and arm64 FROM GitHu
   // The base carries Ubuntu's packages as GitHub last built it. Upgrading in
   // the step that refreshes the package lists brings in every fix Ubuntu has
   // published by the time of the build, on either architecture, without
-  // waiting for the base's next release.
+  // waiting for the base's next release. A plain upgrade holds back an
+  // update that needs a new package, so the upgrade takes new packages too.
   test('installs Ubuntu\'s published updates at build, without a prompt', () => {
     const runs = dockerfile.split(/^RUN\s/m).slice(1);
     const step = runs.find((r) => /apt-get update/.test(r)) ?? '';
@@ -57,8 +58,12 @@ describe('fitness: every pool runs one image, built for x64 and arm64 FROM GitHu
     const install = step.search(/apt-get\b[^;\n]*\sinstall\b/);
     assert.ok(upgrade > update, 'no apt-get upgrade after apt-get update in the same RUN step');
     assert.ok(install < 0 || upgrade < install, 'the upgrade comes after the install');
-    const line = step.slice(upgrade, step.indexOf(';', upgrade));
+    // The upgrade's own command ends at the first separator, so an option of
+    // a later command cannot answer for it.
+    const end = step.slice(upgrade).search(/;|&&|\|\||\n/);
+    const line = end < 0 ? step.slice(upgrade) : step.slice(upgrade, upgrade + end);
     assert.match(line, /\s-y\b|--yes\b|--assume-yes\b/);
+    assert.match(line, /--with-new-pkgs\b|full-upgrade|dist-upgrade/);
     assert.match(step.slice(0, upgrade + line.length), /DEBIAN_FRONTEND=noninteractive/);
     assert.match(line, /--force-confold/);
     assert.match(step, /rm -rf \/var\/lib\/apt\/lists\/\*/);

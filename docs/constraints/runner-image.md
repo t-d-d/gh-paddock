@@ -17,10 +17,11 @@ latest release, so the image must keep up.
   without a setup action: the AWS CLI, jq, zip, Python 3 and the libraries
   Chromium needs.
 - The build installs the updates Ubuntu has published by then, in the step
-  that refreshes the package lists, on both architectures. A fix Ubuntu
-  publishes later reaches the image at its next build, which a change to
-  runner/, such as Dependabot's bump of the base, starts. No build runs on
-  a timer.
+  that refreshes the package lists, on both architectures, taking any new
+  package an update needs. The deploy's layer cache reuses that step until
+  the base or the step itself changes, so a fix Ubuntu publishes later
+  reaches the image with Dependabot's next bump of the base. No build runs
+  on a timer.
 - It copies nothing from the repo and runs as the `runner` user. Its
   entrypoint runs a runner for each config the task is handed: `run.sh`
   reads the config and runs one job. After each job the entrypoint waits up
