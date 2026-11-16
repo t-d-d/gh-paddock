@@ -31,8 +31,9 @@ running stops them all, and nobody watches the deploy as it happens.
   index, converts that into an index with a SOCI index manifest v2 for each
   architecture at the bare tag, and hands the deploy job the converted
   index's digest alone. It refuses an index without a SOCI index for each
-  architecture. The soci CLI it runs is one release by number, checked
-  against a pinned sha256 before it is unpacked.
+  architecture. The soci CLI that converts it, and crane, which pushes it
+  with every manifest's bytes unchanged, are each one release by number,
+  checked against a pinned sha256 before it is unpacked.
   The stack takes it as a second parameter, `RunnerImageUri`, so both
   architectures roll back together as one image.
 - The listener's service stops the old task before it starts the new one

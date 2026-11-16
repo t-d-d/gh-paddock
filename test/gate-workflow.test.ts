@@ -27,7 +27,7 @@ import { REPO_ROOT } from './helpers/cfn.ts';
 import { loadWorkflow, stepById, stepsOf } from './helpers/workflow.ts';
 
 const { raw, workflow } = loadWorkflow('.github/workflows/gate.yml');
-const GATE_CHECKS = ['gate', 'image', 'runner-image'];
+const GATE_CHECKS = ['gate', 'image', 'runner-image', 'soci'];
 
 const workflowFiles = readdirSync(resolve(REPO_ROOT, '.github/workflows')).filter((f) => /\.ya?ml$/.test(f));
 const workflows = workflowFiles.map((file) => ({ file, ...loadWorkflow(`.github/workflows/${file}`) }));
@@ -219,5 +219,38 @@ describe('fitness: this repo\'s workflows run on GitHub\'s runners, never the on
         }
       }
     }
+  });
+});
+
+// The deploy converts the runner's index with a SOCI index for each
+// architecture and pushes it. Two deploys failed at that push after every
+// offline test passed, so the gate runs the deploy's own scripts, with the
+// real soci, skopeo and crane, on every pull request: against a registry
+// started inside the job, never ECR, on an index of two images joined as
+// the deploy joins them.
+describe('the gate\'s soci job runs the deploy\'s convert and push for real', () => {
+  const job = workflow.jobs?.soci;
+  const steps = stepsOf(workflow, 'soci');
+  const runs = steps.map((s) => s.run ?? '').join('\n');
+
+  test('on a GitHub runner, with a registry of its own and no secret', () => {
+    assert.equal(job?.name, 'soci');
+    assert.equal(job?.['runs-on'], 'ubuntu-24.04');
+    assert.match(String(job?.services?.registry?.image), /^registry:2@sha256:[0-9a-f]{64}$/);
+    assert.deepEqual(job?.services?.registry?.ports, ['5000:5000']);
+    assert.doesNotMatch(JSON.stringify(job), /secrets\.|aws-actions/);
+  });
+
+  test('installs the tools and converts, pushes and checks with the deploy\'s scripts', () => {
+    assert.match(runs, /scripts\/soci\/install\.sh /);
+    assert.match(runs, /scripts\/soci\/convert-and-push\.sh /);
+    assert.match(runs, /jq -e -f scripts\/soci\/check-index\.jq/);
+  });
+
+  test('joins two single-platform images with imagetools, as the deploy joins the runner\'s', () => {
+    assert.match(runs, /docker buildx imagetools create --tag /);
+    assert.match(runs, /linux\/amd64/);
+    assert.match(runs, /linux\/arm64/);
+    assert.match(runs, /compression=gzip,force-compression=true/);
   });
 });

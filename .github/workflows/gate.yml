@@ -132,3 +132,57 @@ jobs:
           fi
           cat "$RUNNER_TEMP/entrypoint.out"
           grep -q "the task was given no config" "$RUNNER_TEMP/entrypoint.out"
+
+  # The deploy converts the runner's index into one with a SOCI index for each
+  # architecture, and pushes it. This job runs the deploy's own scripts, with
+  # the real soci, skopeo and crane, against a registry started for the job,
+  # never ECR. The index it converts is two small images, one per
+  # architecture, each FROM scratch with one layer large enough for soci to
+  # index, so neither build runs anything under emulation. They are pushed
+  # with gzip OCI layers and joined with imagetools, as the deploy builds and
+  # joins the runner's.
+  soci:
+    name: soci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # On the host's network, so buildx reaches the registry at localhost.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: network=host
+      - name: Install soci and crane
+        run: |
+          scripts/soci/install.sh "${RUNNER_TEMP}/soci-tools"
+          echo "${RUNNER_TEMP}/soci-tools" >> "$GITHUB_PATH"
+      - name: Build an image for each architecture, and join them under one index
+        id: fixture
+        run: |
+          set -euo pipefail
+          ctx="${RUNNER_TEMP}/fixture"
+          mkdir -p "$ctx"
+          head -c 12582912 /dev/urandom > "${ctx}/layer.bin"
+          printf 'FROM scratch\nCOPY layer.bin /layer.bin\n' > "${ctx}/Dockerfile"
+          digests=()
+          for platform in linux/amd64 linux/arm64; do
+            docker buildx build --platform "$platform" --provenance=false \
+              --output "type=image,name=localhost:5000/fixture:${platform#linux/},push=true,oci-mediatypes=true,compression=gzip,force-compression=true" \
+              "$ctx"
+            digests+=("localhost:5000/fixture@$(crane digest "localhost:5000/fixture:${platform#linux/}")")
+          done
+          docker buildx imagetools create --tag localhost:5000/fixture:gzip "${digests[@]}"
+          echo "digest=$(crane digest localhost:5000/fixture:gzip)" >> "$GITHUB_OUTPUT"
+      - name: Convert, push and check the index as the deploy does
+        env:
+          DIGEST: ${{ steps.fixture.outputs.digest }}
+        run: |
+          set -euo pipefail
+          TLS_VERIFY=false scripts/soci/convert-and-push.sh "localhost:5000/fixture@${DIGEST}" localhost:5000/fixture:soci "$RUNNER_TEMP"
+          crane manifest localhost:5000/fixture:soci | tee "${RUNNER_TEMP}/index.json"
+          echo
+          jq -e -f scripts/soci/check-index.jq "${RUNNER_TEMP}/index.json" > /dev/null

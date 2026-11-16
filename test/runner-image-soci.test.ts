@@ -13,7 +13,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
@@ -78,57 +78,98 @@ describe('the runner\'s image ships with gzip layers and a SOCI index for each a
   });
 });
 
-describe('fitness: the deploy installs one pinned release of the soci CLI, checked before it runs (deploy.md)', () => {
-  const install = stepById(indexSteps, 'soci');
+// soci converts the index, and crane pushes it: crane writes every manifest's
+// bytes as they are on disk, where skopeo re-serializes the index and refuses
+// to push it when that would change it. scripts/soci/install.sh installs both,
+// each one release by number, checked against its sha256 before it is
+// unpacked. The deploy's join job and the gate's soci job both run it.
+const INSTALL = 'scripts/soci/install.sh';
+const installScript = readFileSync(resolve(REPO_ROOT, INSTALL), 'utf-8');
+const TOOLS = [
+  { tool: 'soci', env: 'SOCI', release: 'https://github.com/awslabs/soci-snapshotter/releases/download/v${SOCI_VERSION}/' },
+  { tool: 'crane', env: 'CRANE', release: 'https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/' },
+];
 
-  test('a release by number with its sha256 beside it, installed before the index step', () => {
-    assert.match(String(install.env?.SOCI_VERSION), /^\d+\.\d+\.\d+$/);
-    assert.match(String(install.env?.SOCI_SHA256), /^[0-9a-f]{64}$/);
-    assert.ok(indexSteps.indexOf(install) < indexSteps.indexOf(stepById(indexSteps, 'index')));
-    assert.match(install.run ?? '', /https:\/\/github\.com\/awslabs\/soci-snapshotter\/releases\/download\/v\$\{SOCI_VERSION\}\//);
-  });
-
-  // Runs the step with curl replaced by a stub that writes a local tarball,
-  // and the sha256 the step checks against set to `sha`.
-  const runInstall = (sha: (tarball: Buffer) => string) => {
-    const dir = mkdtempSync(join(tmpdir(), 'soci-install-'));
-    try {
-      const src = join(dir, 'src');
+// Runs the deploy's install step as Actions runs it, with curl replaced by a
+// stub that serves a local tarball holding a stub of each tool, and each
+// tool's sha256 set by `sha`. `added` is what the step put on the path.
+const installStep = indexSteps.find((s) => s.run?.includes(INSTALL));
+const runInstall = (sha: (tool: string, tarball: Buffer) => string) => {
+  const dir = mkdtempSync(join(tmpdir(), 'soci-install-'));
+  try {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const env: Record<string, string> = { PATH: `${bin}:${process.env.PATH}` };
+    const cases: string[] = [];
+    for (const { tool, env: name } of TOOLS) {
+      const src = join(dir, `src-${tool}`);
       mkdirSync(src);
-      writeFileSync(join(src, 'soci'), '#!/bin/sh\necho soci\n', { mode: 0o755 });
+      writeFileSync(join(src, tool), `#!/bin/sh\necho ${tool}\n`, { mode: 0o755 });
       writeFileSync(join(src, 'NOTICE.md'), 'notice\n');
-      const tarball = join(dir, 'fixture.tar.gz');
-      assert.equal(spawnSync('tar', ['-czf', tarball, '-C', src, 'soci', 'NOTICE.md']).status, 0);
-      const bytes = readFileSync(tarball);
-      const bin = join(dir, 'bin');
-      mkdirSync(bin);
-      writeFileSync(join(bin, 'curl'), `#!/bin/bash
-out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
-cp "${tarball}" "$out"
-`, { mode: 0o755 });
-      const runnerTemp = join(dir, 'temp');
-      mkdirSync(runnerTemp);
-      const githubPath = join(dir, 'path');
-      const result = spawnSync('bash', ['-e', '-c', install.run ?? ''], {
-        env: { PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: runnerTemp, GITHUB_PATH: githubPath, SOCI_VERSION: String(install.env?.SOCI_VERSION), SOCI_SHA256: sha(bytes) },
-        stdio: 'pipe',
-      });
-      const added = existsSync(githubPath) ? readFileSync(githubPath, 'utf-8').trim() : '';
-      return { status: result.status, added, installed: added !== '' && existsSync(join(added, 'soci')), stderr: result.stderr.toString() };
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
+      const tarball = join(dir, `${tool}.tar.gz`);
+      assert.equal(spawnSync('tar', ['-czf', tarball, '-C', src, tool, 'NOTICE.md']).status, 0);
+      env[`${name}_SHA256`] = sha(tool, readFileSync(tarball));
+      cases.push(`*${tool === 'soci' ? 'soci-snapshotter' : 'go-containerregistry'}*) cp "${tarball}" "$out" ;;`);
     }
-  };
+    writeFileSync(join(bin, 'curl'), `#!/bin/bash
+out=""; url=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; http*) url="$1" ;; esac; shift; done
+case "$url" in
+${cases.join('\n')}
+  *) exit 22 ;;
+esac
+`, { mode: 0o755 });
+    const runnerTemp = join(dir, 'temp');
+    mkdirSync(runnerTemp);
+    const githubPath = join(dir, 'path');
+    const result = spawnSync('bash', ['-e', '-c', installStep?.run ?? ''], {
+      cwd: REPO_ROOT,
+      env: { ...env, RUNNER_TEMP: runnerTemp, GITHUB_PATH: githubPath },
+      stdio: 'pipe',
+    });
+    const added = existsSync(githubPath) ? readFileSync(githubPath, 'utf-8').trim() : '';
+    const installed = added === '' ? [] : TOOLS.filter(({ tool }) => existsSync(join(added, tool))).map(({ tool }) => tool);
+    return { status: result.status, added, installed, stderr: result.stderr.toString() };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+const matching = (_tool: string, b: Buffer) => createHash('sha256').update(b).digest('hex');
 
-  test('puts soci on the path when the download matches the pinned sha256', () => {
-    const { status, installed, stderr } = runInstall((b) => createHash('sha256').update(b).digest('hex'));
+describe('fitness: the deploy installs one pinned release of soci and of crane, checked before it runs (deploy.md)', () => {
+  for (const { tool, env, release } of TOOLS) {
+    test(`${tool} is a release by number with its sha256 beside it, fetched from its project's releases`, () => {
+      assert.match(installScript, new RegExp(`^: "\\$\\{${env}_VERSION:=\\d+\\.\\d+\\.\\d+\\}"$`, 'm'));
+      assert.match(installScript, new RegExp(`^: "\\$\\{${env}_SHA256:=[0-9a-f]{64}\\}"$`, 'm'));
+      assert.ok(installScript.includes(release), `${tool} comes from ${release}`);
+    });
+  }
+
+  test('the deploy\'s join job installs both before its index step', () => {
+    assert.ok(installStep, 'the join job runs the install script');
+    assert.ok(indexSteps.indexOf(installStep) < indexSteps.indexOf(stepById(indexSteps, 'index')));
+  });
+
+  // install.sh takes its pins from the environment only so the tests can
+  // stand in a tarball of their own. A workflow that set them would replace
+  // the pins with no test failing.
+  test('no workflow sets the pins, so install.sh\'s are the ones that run', () => {
+    const dir = resolve(REPO_ROOT, '.github/workflows');
+    for (const file of readdirSync(dir)) {
+      assert.doesNotMatch(readFileSync(join(dir, file), 'utf-8'), /\b(SOCI|CRANE)_(VERSION|SHA256)\b/, file);
+    }
+  });
+
+  test('puts both on the path when each download matches its pinned sha256', () => {
+    const { status, installed, stderr } = runInstall(matching);
     assert.equal(status, 0, stderr);
-    assert.ok(installed, 'soci is on the path');
+    assert.deepEqual(installed, ['soci', 'crane']);
   });
 
-  test('refuses a download that does not match, and puts nothing on the path', () => {
-    const { status, added } = runInstall(() => 'f'.repeat(64));
-    assert.notEqual(status, 0);
-    assert.equal(added, '');
-  });
+  for (const { tool } of TOOLS) {
+    test(`refuses a ${tool} download that does not match, and puts nothing on the path`, () => {
+      const { status, added } = runInstall((t, b) => (t === tool ? 'f'.repeat(64) : matching(t, b)));
+      assert.notEqual(status, 0);
+      assert.equal(added, '');
+    });
+  }
 });
