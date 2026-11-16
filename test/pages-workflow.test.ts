@@ -115,6 +115,24 @@ describe('the runner lane page', () => {
     ]) assert.ok(html.toLowerCase().includes(part.toLowerCase()), `the page mentions ${part}`);
   });
 
+  test('shows a finished task waiting with no runner registered, then taking a config or exiting by itself', () => {
+    const text = html.toLowerCase();
+    for (const phrase of ['no runner registered', 'exits by itself', 'own url'])
+      assert.ok(text.includes(phrase), `the page mentions ${phrase}`);
+  });
+
+  test('never has the listener remove an idle runner or stop a waiting task', () => {
+    assert.doesNotMatch(html, /idle runner|removing its runner|'idle'|waits warm|starts a fresh runner and waits/i);
+    assert.doesNotMatch(html, /listener (?:asks GitHub to remove|removes an idle)/i);
+    assert.doesNotMatch(html, /listener (?:then )?stops (?:a |the )?(?:waiting|idle) task/i);
+  });
+
+  // A Spot reclaim stops a task under a running job, so the page claims only
+  // what the rule holds: a task exits by itself only with no runner.
+  test('never claims no task ends with a runner registered, which a Spot reclaim does', () => {
+    assert.doesNotMatch(html, /task ends only with no runner|no job is ever lost/i);
+  });
+
   test('the site root leads to the page', () => {
     assert.match(read(`${PAGES_DIR}/index.html`), new RegExp(`href="${PAGE}"`));
   });

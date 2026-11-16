@@ -103,9 +103,9 @@ code { font: 0.9em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .task .state { font-size: 0.7rem; color: var(--muted); }
 .task.busy { border-color: var(--job); background: var(--job-soft); }
 .task.busy .state::before { content: ""; display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--job); margin-right: 5px; animation: pulse 1s ease-in-out infinite; }
-.task.idle { border-style: dashed; }
-.task.starting { border-color: var(--warn); background: var(--warn-soft); }
-.task.removing { border-color: var(--warn); }
+.task.waiting { border-style: dashed; }
+.task.starting, .task.handover { border-color: var(--warn); background: var(--warn-soft); }
+.task.exited { opacity: 0.45; }
 .task.stopped { opacity: 0.45; text-decoration: line-through; }
 .task.failed, .task.reclaim { border-color: var(--bad); background: var(--bad-soft); }
 .caption { margin-top: 14px; min-height: 3.2em; font-size: 1rem; }
@@ -213,11 +213,11 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       </div>
       <div class="card">
         <h3>Warm reuse within a pool</h3>
-        <p>A task whose runner finished starts a fresh runner and waits 30 seconds for the next job from the same pool. A dev deploy and the E2E gate after it chain on one warm task.</p>
+        <p>When a task's runner finishes its job, the runner leaves GitHub and the task waits up to 30 seconds with no runner registered. If a job is assigned to the same pool, the listener hands the task a config through the task's own URL, and a new runner takes the job in a few seconds. A dev deploy and the E2E gate after it chain on one warm task.</p>
       </div>
       <div class="card">
         <h3>Remove, then terminate</h3>
-        <p>The listener removes an idle runner through the API before it stops the task. GitHub refuses the removal while the runner holds a job, so a job handed over at that moment is kept and finishes.</p>
+        <p>A task exits only with no runner registered. A waiting task holds none, and exits by itself when no config comes in 30 seconds, so there is nothing to remove and the listener stops no waiting task.</p>
       </div>
       <div class="card">
         <h3>GitHub is the queue</h3>
@@ -273,62 +273,65 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
 
 <script>
 (function () {
-  // A task: [id, state, label]. State is one of starting, busy, idle,
-  // removing, stopped, failed, reclaim.
+  // A task: [id, state, label]. State is one of starting, busy, waiting,
+  // handover, exited, stopped, failed, reclaim.
   var t = function (id, state, label) { return { id: id, state: state, label: label || '' }; };
   var STATES = {
-    starting: 'starting', busy: 'running a job', idle: 'idle, waiting 30 s',
-    removing: 'removing its runner', stopped: 'stopped', failed: 'never registered',
-    reclaim: 'Spot reclaim'
+    starting: 'starting', busy: 'running a job', waiting: 'waiting up to 30 s, no runner registered',
+    handover: 'config from its URL, runner starting', exited: 'exited by itself',
+    stopped: 'stopped', failed: 'never registered', reclaim: 'Spot reclaim'
   };
 
   var SCENES = [
     { name: 'A push', steps: [
       { caption: 'A push queues three CI jobs on the repo\'s test scale set. GitHub holds them: there is no queue of our own.',
         queue: ['lint', 'unit', 'build'], listener: 'polling', note: 'polls each scale set' },
-      { caption: 'The listener\'s poll says three jobs are assigned and no runner is idle, so it starts three runner tasks, each with a just-in-time config.',
-        queue: ['lint', 'unit', 'build'], listener: 'polling', note: '3 jobs, 0 idle: start 3',
+      { caption: 'The listener\'s poll says three jobs are assigned and no task is waiting, so it starts three runner tasks, each with a just-in-time config.',
+        queue: ['lint', 'unit', 'build'], listener: 'polling', note: '3 jobs, 0 waiting: start 3',
         test: [t('a', 'starting'), t('b', 'starting'), t('c', 'starting')] },
       { caption: 'Each runner registers and takes one job. A single-use runner never takes a second.',
         queue: [], listener: 'polling', note: '3 busy',
         test: [t('a', 'busy', 'lint'), t('b', 'busy', 'unit'), t('c', 'busy', 'build')] },
-      { caption: 'Jobs finish and their runners deregister. Each task starts a fresh runner and waits 30 seconds for another job from its pool.',
-        queue: [], done: ['lint', 'unit', 'build'], listener: 'polling', note: '3 idle',
-        test: [t('a', 'idle'), t('b', 'idle'), t('c', 'idle')] }
+      { caption: 'Jobs finish and their runners leave GitHub. Each task waits up to 30 seconds, with no runner registered, for a config for another job from its pool.',
+        queue: [], done: ['lint', 'unit', 'build'], listener: 'polling', note: '3 waiting',
+        test: [t('a', 'waiting'), t('b', 'waiting'), t('c', 'waiting')] }
     ] },
     { name: 'Warm reuse', steps: [
       { caption: 'CI passed, so the dev deploy queues on the dev scale set. Its pool runs on on-demand capacity.',
-        queue: ['deploy dev'], listener: 'polling', note: '1 job, 0 idle: start 1',
+        queue: ['deploy dev'], listener: 'polling', note: '1 job, 0 waiting: start 1',
         dev: [t('d', 'starting')] },
       { caption: 'The dev task takes the deploy.',
         queue: [], listener: 'polling', note: '1 busy',
         dev: [t('d', 'busy', 'deploy dev')] },
-      { caption: 'The deploy finishes. The task starts a new runner and waits warm.',
-        queue: [], done: ['deploy dev'], listener: 'polling', note: '1 idle',
-        dev: [t('d', 'idle')] },
-      { caption: 'The E2E gate queues inside the 30 seconds, and the warm task takes it at once, with no new task to start.',
+      { caption: 'The deploy finishes and its runner leaves GitHub. The task waits, with no runner registered.',
+        queue: [], done: ['deploy dev'], listener: 'polling', note: '1 waiting',
+        dev: [t('d', 'waiting')] },
+      { caption: 'The E2E gate is assigned to the dev pool inside the 30 seconds. The listener writes its config for the waiting task, which reads it through the task\'s own URL. No new task starts.',
+        queue: ['e2e gate'], done: ['deploy dev'], listener: 'polling', note: 'config to task d',
+        dev: [t('d', 'handover', 'e2e gate')] },
+      { caption: 'A new runner registers from that config and takes the gate a few seconds later. A cold start takes about a minute.',
         queue: [], done: ['deploy dev'], listener: 'polling', note: '1 busy, nothing to start',
         dev: [t('d', 'busy', 'e2e gate')] },
       { caption: 'Warm reuse never crosses pools: a test job never lands on the dev task, and no task serves two repos.',
-        queue: [], done: ['deploy dev', 'e2e gate'], listener: 'polling', note: '1 idle',
-        dev: [t('d', 'idle')] }
+        queue: [], done: ['deploy dev', 'e2e gate'], listener: 'polling', note: '1 waiting',
+        dev: [t('d', 'waiting')] }
     ] },
     { name: 'Remove, then terminate', steps: [
-      { caption: 'Thirty seconds pass with no job. The listener asks GitHub to remove the idle runner.',
-        queue: [], listener: 'polling', note: 'remove runner a',
-        test: [t('a', 'removing'), t('b', 'idle')] },
-      { caption: 'GitHub removes it. Only now does the listener stop the task: no task stops while its runner is registered.',
-        queue: [], listener: 'polling', note: 'removed: stop task a',
-        test: [t('a', 'stopped'), t('b', 'idle')] },
-      { caption: 'The race: a job arrives for runner b just as the listener tries to remove it.',
-        queue: ['retry flaky'], listener: 'polling', note: 'remove runner b',
-        test: [t('b', 'removing')] },
-      { caption: 'GitHub refuses the removal, since the runner holds a job. The listener leaves the task running, and the job keeps its runner.',
-        queue: [], listener: 'polling', note: 'refused: leave task b',
-        test: [t('b', 'busy', 'retry flaky')] },
-      { caption: 'The job finishes. After its next idle 30 seconds the removal succeeds and the task stops.',
-        queue: [], done: ['retry flaky'], listener: 'polling', note: 'removed: stop task b',
-        test: [t('b', 'stopped')] }
+      { caption: 'Two test tasks wait after their jobs. Neither has a runner registered, so no job can reach them except through a config.',
+        queue: [], listener: 'polling', note: '2 waiting',
+        test: [t('a', 'waiting'), t('b', 'waiting')] },
+      { caption: 'A job is assigned to the test pool. The listener writes its config for task b, which reads it through its URL.',
+        queue: ['retry flaky'], listener: 'polling', note: 'config to task b',
+        test: [t('a', 'waiting'), t('b', 'handover', 'retry flaky')] },
+      { caption: 'Thirty seconds pass with no config for task a, and it exits by itself. It had no runner to remove, and the listener stops nothing.',
+        queue: [], listener: 'polling', note: 'stops nothing',
+        test: [t('a', 'exited'), t('b', 'busy', 'retry flaky')] },
+      { caption: 'Task b\'s job finishes and its runner leaves GitHub. The task waits again, with no runner registered.',
+        queue: [], done: ['retry flaky'], listener: 'polling', note: '1 waiting',
+        test: [t('b', 'waiting')] },
+      { caption: 'No job comes, so task b exits by itself too. A task exits only with no runner registered, so no job is lost to its exit.',
+        queue: [], done: ['retry flaky'], listener: 'polling', note: 'stops nothing',
+        test: [t('b', 'exited')] }
     ] },
     { name: 'Listener interrupted', steps: [
       { caption: 'Two runners are busy when the listener\'s task is interrupted.',
