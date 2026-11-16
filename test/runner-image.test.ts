@@ -45,6 +45,25 @@ describe('fitness: every pool runs one image, built for x64 and arm64 FROM GitHu
     assert.equal(entry?.cooldown?.['default-days'], 7);
   });
 
+  // The base carries Ubuntu's packages as GitHub last built it. Upgrading in
+  // the step that refreshes the package lists brings in every fix Ubuntu has
+  // published by the time of the build, on either architecture, without
+  // waiting for the base's next release.
+  test('installs Ubuntu\'s published updates at build, without a prompt', () => {
+    const runs = dockerfile.split(/^RUN\s/m).slice(1);
+    const step = runs.find((r) => /apt-get update/.test(r)) ?? '';
+    const update = step.indexOf('apt-get update');
+    const upgrade = step.search(/apt-get\b[^;\n]*\s(?:upgrade|full-upgrade|dist-upgrade)\b/);
+    const install = step.search(/apt-get\b[^;\n]*\sinstall\b/);
+    assert.ok(upgrade > update, 'no apt-get upgrade after apt-get update in the same RUN step');
+    assert.ok(install < 0 || upgrade < install, 'the upgrade comes after the install');
+    const line = step.slice(upgrade, step.indexOf(';', upgrade));
+    assert.match(line, /\s-y\b|--yes\b|--assume-yes\b/);
+    assert.match(step.slice(0, upgrade + line.length), /DEBIAN_FRONTEND=noninteractive/);
+    assert.match(line, /--force-confold/);
+    assert.match(step, /rm -rf \/var\/lib\/apt\/lists\/\*/);
+  });
+
   test('carries the AWS CLI, jq, zip, Python 3 and the libraries Chromium needs', () => {
     for (const want of ['awscli', 'jq', 'zip', 'python3', 'libnss3', 'libgbm1', 'libasound2']) {
       assert.ok(dockerfile.includes(want), want);
