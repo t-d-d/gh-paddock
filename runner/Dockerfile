@@ -89,11 +89,13 @@ wipe() {
 
 # Polls the URL for a config with a runner not yet run. A missing object is
 # no config yet, and so is a server error or a network failure; any other
-# refusal ends the wait.
+# refusal ends the wait. Bash counts SECONDS in whole seconds, so a short
+# wait can run out before its first check: the URL is polled once before the
+# deadline is checked, however short the wait.
 next_config() {
   local deadline=$((SECONDS + wait_for)) body code name next
   body=$(mktemp)
-  while ((SECONDS < deadline)); do
+  while true; do
     code=$(curl -sS -o "$body" -w '%{http_code}' --max-time 5 "$url" 2>/dev/null) || code=000
     case $code in
       200)
@@ -116,6 +118,7 @@ next_config() {
         return 1
         ;;
     esac
+    ((SECONDS < deadline)) || break
     sleep 1
   done
   rm -f "$body"
