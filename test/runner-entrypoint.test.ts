@@ -45,7 +45,7 @@ echo "end" >> "$FAKE_LOG"
 exit "\${FAKE_EXIT:-0}"
 `;
 
-type Reply = { status: number; body?: unknown };
+type Reply = { status: number; body?: unknown; delay?: number };
 
 /** A config URL that answers with `replies` in turn, then the last forever. */
 class ConfigURL {
@@ -59,7 +59,7 @@ class ConfigURL {
       if (this.log) appendFileSync(this.log, 'poll\n');
       const reply = this.replies.length > 1 ? this.replies.shift()! : this.replies[0] ?? { status: 404 };
       res.statusCode = reply.status;
-      res.end(reply.body === undefined ? '' : JSON.stringify(reply.body));
+      setTimeout(() => res.end(reply.body === undefined ? '' : JSON.stringify(reply.body)), reply.delay ?? 0);
     });
   }
   get host() {
@@ -140,10 +140,15 @@ describe('the runner image\'s entrypoint', () => {
   });
 
   test('runs the first config, then a new one that comes while it waits, then exits when none comes', async () => {
-    const r = await runEntrypoint(url, [{ status: 404 }, config('paddock-second'), { status: 404 }]);
+    // The entrypoint counts its wait in whole seconds, so a wait of 5 can
+    // end just over 4 seconds in. The second config comes on the second
+    // poll, a slow reply and a second's sleep after the first, so a runner
+    // could stall for 2 more seconds before the wait ends too soon. The
+    // first reply is slow, as a loaded runner makes it.
+    const r = await runEntrypoint(url, [{ status: 404, delay: 1000 }, config('paddock-second'), { status: 404 }], { wait: 5 });
     assert.equal(r.code, 0);
     assert.deepEqual(runs(r), ['run jit-first', 'run jit-paddock-second']);
-    assert.ok(r.seconds >= 2, 'it did not wait for a config after the last job');
+    assert.ok(r.seconds >= 4, 'it did not wait for a config after the last job');
   });
 
   test('exits once no config comes in its wait', async () => {
