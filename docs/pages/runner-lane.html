@@ -354,7 +354,7 @@ footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
       { caption: 'The task never registers its runner.',
         queue: ['unit'], listener: 'polling', note: 'no runner from task a',
         test: [t('a', 'failed')] },
-      { caption: 'Three minutes after its config, the listener removes the runner record that config made, then stops the task and starts a replacement. The job waits in GitHub meanwhile.',
+      { caption: 'The listener stops it and starts a replacement. The job waits in GitHub meanwhile.',
         queue: ['unit'], listener: 'polling', note: 'replace task a',
         test: [t('a', 'stopped'), t('g', 'starting')] },
       { caption: 'The replacement registers and takes the job.',
