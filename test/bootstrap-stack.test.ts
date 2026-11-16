@@ -86,9 +86,9 @@ describe('the registry\'s scanning configuration', () => {
 
   test('the bootstrap stack sets basic scanning, with one scan-on-push rule for the paddock- repositories', () => {
     assert.equal(configs.length, 1);
-    const [[, config]] = configs;
-    assert.equal(config.Properties?.ScanType, 'BASIC');
-    assert.deepEqual(config.Properties?.Rules, [
+    const config = configs[0]?.[1];
+    assert.equal(config?.Properties?.ScanType, 'BASIC');
+    assert.deepEqual(config?.Properties?.Rules, [
       { ScanFrequency: 'SCAN_ON_PUSH', RepositoryFilters: [{ Filter: 'paddock-*', FilterType: 'WILDCARD' }] },
     ]);
   });
