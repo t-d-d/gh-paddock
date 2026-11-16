@@ -53,9 +53,11 @@ class ConfigURL {
   replies: Reply[] = [];
   log = '';
   requests: string[] = [];
+  polled: number[] = [];
   constructor() {
     this.server = createServer((req, res) => {
       this.requests.push(req.url ?? '');
+      this.polled.push(Date.now());
       if (this.log) appendFileSync(this.log, 'poll\n');
       const reply = this.replies.length > 1 ? this.replies.shift()! : this.replies[0] ?? { status: 404 };
       res.statusCode = reply.status;
@@ -71,7 +73,7 @@ class ConfigURL {
   }
 }
 
-type Run = { code: number | null; log: string[]; seconds: number; root: string };
+type Run = { code: number | null; log: string[]; seconds: number; ended: number; root: string };
 
 async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: number; exit?: number; term?: 'job' | 'wait'; hold?: number; idle?: number } = {}): Promise<Run> {
   const root = mkdtempSync(join(tmpdir(), 'paddock-entrypoint-'));
@@ -86,6 +88,7 @@ async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: nu
   url.replies = replies;
   url.log = log;
   url.requests = [];
+  url.polled = [];
   const started = Date.now();
   const code = await new Promise<number | null>((done) => {
     const child = spawn('bash', [script], {
@@ -120,7 +123,8 @@ async function runEntrypoint(url: ConfigURL, replies: Reply[], opts: { wait?: nu
       child.on('exit', () => clearInterval(poll));
     }
   });
-  const result = { code, log: readFileSync(log, 'utf-8').split('\n').filter(Boolean), seconds: (Date.now() - started) / 1000, root };
+  const ended = Date.now();
+  const result = { code, log: readFileSync(log, 'utf-8').split('\n').filter(Boolean), seconds: (ended - started) / 1000, ended, root };
   rmSync(root, { recursive: true, force: true });
   return result;
 }
@@ -144,11 +148,15 @@ describe('the runner image\'s entrypoint', () => {
     // end just over 4 seconds in. The second config comes on the second
     // poll, a slow reply and a second's sleep after the first, so a runner
     // could stall for 2 more seconds before the wait ends too soon. The
-    // first reply is slow, as a loaded runner makes it.
+    // first reply is held a second, so a second poll that comes late must
+    // still land inside the wait.
     const r = await runEntrypoint(url, [{ status: 404, delay: 1000 }, config('paddock-second'), { status: 404 }], { wait: 5 });
     assert.equal(r.code, 0);
     assert.deepEqual(runs(r), ['run jit-first', 'run jit-paddock-second']);
-    assert.ok(r.seconds >= 4, 'it did not wait for a config after the last job');
+    // Time the wait after the last job alone: from the poll that brought
+    // the second config to the exit.
+    const lastWait = (r.ended - (url.polled[1] ?? r.ended)) / 1000;
+    assert.ok(lastWait >= 4, `it waited ${lastWait}s for a config after the last job`);
   });
 
   test('exits once no config comes in its wait', async () => {
