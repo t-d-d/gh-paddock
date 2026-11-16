@@ -175,7 +175,7 @@ jobs:
           cache_scope: runner-${{ matrix.arch }}
           # Fargate lazy loads an image with a SOCI index, and reads one only
           # over gzip layers. Every layer is pushed as an OCI gzip layer, the
-          # base's included, so the index soci converts is all OCI.
+          # base's included, so every image soci converts is OCI.
           compression: gzip
 
   # Both architectures' images joined under one image index, at the plan's
@@ -287,6 +287,32 @@ jobs:
               | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
             skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
             soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
+            # soci writes the converted index as a Docker manifest list, which
+            # skopeo will push only as an OCI index. skopeo's own conversion
+            # drops each entry's artifactType, which marks a SOCI index, so
+            # the list is relabelled here with every entry kept as soci wrote
+            # it. Only the list's own digest changes, and nothing names it.
+            LAYOUT="${RUNNER_TEMP}/soci"
+            LIST_TYPE=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].mediaType else "" end' "${LAYOUT}/index.json")
+            case "$LIST_TYPE" in
+              application/vnd.oci.image.index.v1+json) ;;
+              application/vnd.docker.distribution.manifest.list.v2+json)
+                LIST=$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")
+                jq -c '.mediaType = "application/vnd.oci.image.index.v1+json"' \
+                  "${LAYOUT}/blobs/sha256/${LIST#sha256:}" > "${RUNNER_TEMP}/list.json"
+                SUM=$(sha256sum "${RUNNER_TEMP}/list.json" | cut -d' ' -f1)
+                SIZE=$(stat -c %s "${RUNNER_TEMP}/list.json")
+                mv "${RUNNER_TEMP}/list.json" "${LAYOUT}/blobs/sha256/${SUM}"
+                jq --arg digest "sha256:${SUM}" --argjson size "$SIZE" \
+                  '.manifests[0] |= (.mediaType = "application/vnd.oci.image.index.v1+json" | .digest = $digest | .size = $size)' \
+                  "${LAYOUT}/index.json" > "${RUNNER_TEMP}/layout-index.json"
+                mv "${RUNNER_TEMP}/layout-index.json" "${LAYOUT}/index.json"
+                ;;
+              *)
+                echo "::error::soci convert wrote no single index for ${REPO}:${TAG}-gzip (${LIST_TYPE:-none})"
+                exit 1
+                ;;
+            esac
             skopeo copy --all --preserve-digests --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
             DIGEST=$(digest_of "$TAG")
           fi
