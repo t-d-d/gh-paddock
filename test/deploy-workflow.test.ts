@@ -7,7 +7,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
@@ -287,7 +287,8 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
       const output = join(dir, 'output');
       const pushed = join(dir, 'pushed');
       const bin = join(dir, 'bin');
-      spawnSync('mkdir', ['-p', pushed, bin]);
+      mkdirSync(pushed);
+      mkdirSync(bin);
       const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       const pushTable = Object.entries(opts.pushes ?? {}).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       writeFileSync(join(dir, 'manifest.json'), JSON.stringify(opts.manifest ?? sociIndex()));
@@ -354,7 +355,8 @@ mkdir -p "\${@: -1}"
   const SOCI = 'application/vnd.amazon.soci.index.v2+json';
   const image = (arch: string, c: string) => ({ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: d(c), size: 1, platform: { architecture: arch, os: 'linux' } });
   const soci = (arch: string, c: string) => ({ ...image(arch, c), artifactType: SOCI });
-  const sociIndex = (manifests = [image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c'), soci('arm64', 'e')]) => ({
+  const unplaced = (c: string) => ({ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: d(c), size: 1, artifactType: SOCI });
+  const sociIndex = (manifests: object[] = [image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c'), soci('arm64', 'e')]) => ({
     schemaVersion: 2,
     mediaType: 'application/vnd.oci.image.index.v1+json',
     manifests,
@@ -377,9 +379,9 @@ mkdir -p "\${@: -1}"
     const tools = lines.filter((l) => /^(skopeo|soci) /.test(l));
     assert.deepEqual(tools, [
       'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
-      `skopeo copy --all --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
+      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
       'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
-      `skopeo copy --all --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
+      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
     ]);
     assert.equal(out, `digest=${d('5')}\n`);
   });
@@ -407,12 +409,24 @@ mkdir -p "\${@: -1}"
       sociIndex([image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c')]),
       sociIndex([image('amd64', 'a'), soci('amd64', 'c'), soci('arm64', 'e')]),
       sociIndex([image('amd64', 'a'), image('arm64', 'b'), { ...soci('arm64', 'e'), artifactType: 'application/vnd.amazon.soci.index.v1+json' }, soci('amd64', 'c')]),
+      sociIndex([image('amd64', 'a'), image('arm64', 'b'), soci('amd64', 'c'), soci('amd64', 'e')]),
+      sociIndex([image('amd64', 'a'), image('arm64', 'b'), unplaced('c')]),
     ];
     for (const manifest of cases) {
       const { status, out } = runIndex({ abc: d('4') }, { manifest });
       assert.notEqual(status, 0, JSON.stringify(manifest));
       assert.equal(out, '', JSON.stringify(manifest));
     }
+  });
+
+  // Nothing published says whether soci convert names a platform on each
+  // SOCI index's entry. Where every entry names one, each architecture needs
+  // its own; where none does, one per image is the most the index shows.
+  test('takes SOCI indexes that name no platform, one for each image', () => {
+    const manifest = sociIndex([image('amd64', 'a'), image('arm64', 'b'), unplaced('c'), unplaced('e')]);
+    const { status, out, stderr } = runIndex({ abc: d('4') }, { manifest });
+    assert.equal(status, 0, stderr);
+    assert.equal(out, `digest=${d('4')}\n`);
   });
 
   // An earlier deploy pushed a single x64 image at a bare tag. A tree of

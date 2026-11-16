@@ -13,7 +13,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { REPO_ROOT } from './helpers/cfn.ts';
@@ -78,7 +78,7 @@ describe('the runner\'s image ships with gzip layers and a SOCI index for each a
   });
 });
 
-describe('the deploy installs one pinned release of the soci CLI, checked before it runs', () => {
+describe('fitness: the deploy installs one pinned release of the soci CLI, checked before it runs (deploy.md)', () => {
   const install = stepById(indexSteps, 'soci');
 
   test('a release by number with its sha256 beside it, installed before the index step', () => {
@@ -94,20 +94,20 @@ describe('the deploy installs one pinned release of the soci CLI, checked before
     const dir = mkdtempSync(join(tmpdir(), 'soci-install-'));
     try {
       const src = join(dir, 'src');
-      spawnSync('mkdir', ['-p', src]);
+      mkdirSync(src);
       writeFileSync(join(src, 'soci'), '#!/bin/sh\necho soci\n', { mode: 0o755 });
       writeFileSync(join(src, 'NOTICE.md'), 'notice\n');
       const tarball = join(dir, 'fixture.tar.gz');
       assert.equal(spawnSync('tar', ['-czf', tarball, '-C', src, 'soci', 'NOTICE.md']).status, 0);
       const bytes = readFileSync(tarball);
       const bin = join(dir, 'bin');
-      spawnSync('mkdir', ['-p', bin]);
+      mkdirSync(bin);
       writeFileSync(join(bin, 'curl'), `#!/bin/bash
 out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; esac; shift; done
 cp "${tarball}" "$out"
 `, { mode: 0o755 });
       const runnerTemp = join(dir, 'temp');
-      spawnSync('mkdir', ['-p', runnerTemp]);
+      mkdirSync(runnerTemp);
       const githubPath = join(dir, 'path');
       const result = spawnSync('bash', ['-e', '-c', install.run ?? ''], {
         env: { PATH: `${bin}:${process.env.PATH}`, RUNNER_TEMP: runnerTemp, GITHUB_PATH: githubPath, SOCI_VERSION: String(install.env?.SOCI_VERSION), SOCI_SHA256: sha(bytes) },

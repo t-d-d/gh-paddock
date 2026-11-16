@@ -279,13 +279,15 @@ jobs:
             fi
             # soci convert --standalone reads and writes an OCI image layout
             # on disk and needs no containerd. skopeo moves the index and
-            # every image in it between the registry and the disk.
+            # every image in it between the registry and the disk, and fails
+            # rather than rewrite a manifest: each SOCI index names its
+            # image's digest, so a rewritten image would lose its index.
             AUTH="${RUNNER_TEMP}/auth.json"
             aws ecr get-login-password --region us-east-1 \
               | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
-            skopeo copy --all --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
+            skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
             soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
-            skopeo copy --all --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
+            skopeo copy --all --preserve-digests --authfile "$AUTH" "oci:${RUNNER_TEMP}/soci" "docker://${REGISTRY}/${REPO}:${TAG}"
             DIGEST=$(digest_of "$TAG")
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -307,7 +309,7 @@ jobs:
           # Fargate starts a task from an index with no SOCI index all the
           # same, pulling the whole image first, so nothing later would
           # notice one missing. Each architecture's image must be there with
-          # a SOCI index manifest v2 beside it.
+          # a SOCI index manifest v2 of the same architecture beside it.
           aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$TAG" \
             --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.docker.distribution.manifest.list.v2+json \
             --query 'images[0].imageManifest' --output text > "${RUNNER_TEMP}/index.json"
@@ -316,6 +318,9 @@ jobs:
               | [.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] as $soci
               | ($images | index("amd64")) != null and ($images | index("arm64")) != null
                 and ($soci | length) >= ($images | length)
+                and (if all($soci[]; .platform.architecture != null)
+                     then all($images[]; . as $arch | ([$soci[].platform.architecture] | index($arch)) != null)
+                     else true end)
             ' "${RUNNER_TEMP}/index.json" > /dev/null; then
             echo "::error::${REPO}:${TAG} has no SOCI index manifest v2 for each architecture"
             exit 1
