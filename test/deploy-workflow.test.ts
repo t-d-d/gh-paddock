@@ -343,6 +343,14 @@ esac
       writeFileSync(join(bin, 'crane'), `#!/bin/bash
 echo "crane $*" >> "$CALLS"
 [ "$1 $2" = "auth login" ] && { cat > /dev/null; exit 0; }
+if [ "$1" = digest ]; then
+  tag="\${2##*:}"; digest=""
+  case "$tag" in
+${pushTable}
+  esac
+  [ -n "$digest" ] || digest=$(cat "$PUSHED/$tag")
+  echo "$digest"
+fi
 if [ "$1" = push ]; then
   layout="$2"
   cp "$layout/index.json" "$PUSHED_INDEX"
@@ -360,6 +368,7 @@ cp "$CONVERTED" "$out/blobs/sha256/$sum"
 printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","size":%s}]}' "$CONVERTED_TYPE" "$sum" "$(stat -c %s "$CONVERTED")" > "$out/index.json"
 `, { mode: 0o755 });
       const result = spawnSync('bash', ['-e', '-c', stepById(indexSteps, 'index').run ?? ''], {
+        cwd: REPO_ROOT,
         env: { PATH: `${bin}:${process.env.PATH}`, CALLS: calls, PUSHED: pushed, MANIFEST: join(dir, 'manifest.json'), CONVERTED: join(dir, 'converted.json'), CONVERTED_TYPE: opts.convertedType ?? DOCKER_LIST, PUSHED_INDEX: join(dir, 'pushed-index.json'), PUSHED_LIST: join(dir, 'pushed-list.json'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
         stdio: 'pipe',
         input: '',
@@ -396,19 +405,22 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     assert.equal(create, `docker buildx imagetools create --tag ${REGISTRY}:abc-gzip ${REGISTRY}@${d('1')} ${REGISTRY}@${d('2')}`);
   });
 
-  // soci convert --standalone reads and writes an OCI image layout on disk,
-  // with no containerd. skopeo pulls the joined index to disk, and crane
-  // pushes the converted one back as its bytes stand.
+  // scripts/soci/convert-and-push.sh, which the gate's soci job also runs
+  // against a registry of its own: soci convert --standalone reads and writes
+  // an OCI image layout on disk, with no containerd. skopeo pulls the joined
+  // index to disk, and crane pushes the converted one back as its bytes
+  // stand.
   test('converts the joined index with a SOCI index for each architecture, pushes it at the plan\'s tag, and hands on its digest', () => {
     const { status, lines, out, stderr, pushedList } = runIndex(built, { pushes });
     assert.equal(status, 0, stderr);
     const tools = lines.filter((l) => /^(skopeo|soci|crane) /.test(l));
     assert.deepEqual(tools, [
       'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
-      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
-      'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
       'crane auth login the-account.dkr.ecr.us-east-1.amazonaws.com --username AWS --password-stdin',
+      `skopeo copy --all --preserve-digests --src-tls-verify=true docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
+      'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
       `crane push $RUNNER_TEMP/soci ${REGISTRY}:abc`,
+      `crane digest ${REGISTRY}:abc`,
     ]);
     assert.equal(out, `digest=${digestOf(pushedList)}\n`);
   });
@@ -451,6 +463,15 @@ printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","
     assert.notEqual(status, 0);
     assert.ok(!lines.some((l) => l.startsWith('crane push')), lines.join('\n'));
     assert.equal(out, '');
+  });
+
+  // The gate's soci job runs the same two files against a registry of its
+  // own, so what it proves on a pull request is what the deploy runs.
+  test('converts, pushes and checks the index with the scripts the gate\'s soci job runs', () => {
+    const run = stepById(indexSteps, 'index').run ?? '';
+    assert.match(run, /scripts\/soci\/convert-and-push\.sh "docker:\/\/|scripts\/soci\/convert-and-push\.sh "\$\{REGISTRY\}/);
+    assert.match(run, /jq -e -f scripts\/soci\/check-index\.jq /);
+    assert.ok(stepsOf(workflow, 'runner-image')[0]?.uses?.startsWith('actions/checkout@'), 'the join job checks out the scripts first');
   });
 
   test('converts a joined index an earlier run left, and joins nothing', () => {

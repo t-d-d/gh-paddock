@@ -203,6 +203,9 @@ jobs:
     outputs:
       digest: ${{ steps.index.outputs.digest }}
     steps:
+      # scripts/soci/, which the gate's soci job runs too.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -213,43 +216,14 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      # One release of the soci CLI by number, for this job's x64 runner,
-      # checked against the sha256 the release publishes before it is
-      # unpacked. The job holds the deploy role, so an unchecked binary would
-      # run with it.
-      - name: Install the soci CLI
-        id: soci
-        env:
-          SOCI_VERSION: 0.16.1
-          SOCI_SHA256: 2be9f26ad853455515da69885f8906e6aecc65684cc302f8689c25cad8417bc8
+      # soci converts the index and crane pushes it, each one release by
+      # number checked against its sha256 before it is unpacked
+      # (scripts/soci/install.sh). The job holds the deploy role, so an
+      # unchecked binary would run with it.
+      - name: Install soci and crane
         run: |
-          set -euo pipefail
-          tarball="soci-snapshotter-${SOCI_VERSION}-linux-amd64.tar.gz"
-          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
-            "https://github.com/awslabs/soci-snapshotter/releases/download/v${SOCI_VERSION}/${tarball}"
-          echo "${SOCI_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
-          mkdir -p "${RUNNER_TEMP}/soci-bin"
-          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/soci-bin" soci
-          echo "${RUNNER_TEMP}/soci-bin" >> "$GITHUB_PATH"
-
-      # crane pushes the converted index. It writes each manifest's bytes as
-      # they stand on disk, where skopeo re-serializes the index and, told to
-      # keep every digest, refuses the push. One release by number, checked
-      # like soci's before it is unpacked.
-      - name: Install crane
-        id: crane
-        env:
-          CRANE_VERSION: 0.22.1
-          CRANE_SHA256: 0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
-        run: |
-          set -euo pipefail
-          tarball="go-containerregistry_Linux_x86_64.tar.gz"
-          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${tarball}" \
-            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/${tarball}"
-          echo "${CRANE_SHA256}  ${RUNNER_TEMP}/${tarball}" | sha256sum -c -
-          mkdir -p "${RUNNER_TEMP}/crane-bin"
-          tar -xzf "${RUNNER_TEMP}/${tarball}" -C "${RUNNER_TEMP}/crane-bin" crane
-          echo "${RUNNER_TEMP}/crane-bin" >> "$GITHUB_PATH"
+          scripts/soci/install.sh "${RUNNER_TEMP}/soci-tools"
+          echo "${RUNNER_TEMP}/soci-tools" >> "$GITHUB_PATH"
 
       # The registry's tags are immutable, so an index already at a tag is
       # the one an earlier run pushed there, and is reused.
@@ -296,56 +270,15 @@ jobs:
               echo "::error::no index at ${REPO}:${TAG}-gzip"
               exit 1
             fi
-            # soci convert --standalone reads and writes an OCI image layout
-            # on disk and needs no containerd. skopeo pulls the joined index
-            # and every image in it to disk, and fails rather than rewrite a
-            # manifest: each SOCI index names its image's digest, so a
-            # rewritten image would lose its index. crane pushes the
-            # converted index back with every manifest's bytes unchanged.
-            AUTH="${RUNNER_TEMP}/auth.json"
+            # The same script the gate's soci job runs on every pull request,
+            # against a registry of its own.
+            export REGISTRY_AUTH_FILE="${RUNNER_TEMP}/auth.json"
             aws ecr get-login-password --region us-east-1 \
-              | skopeo login --authfile "$AUTH" --username AWS --password-stdin "$REGISTRY"
-            skopeo copy --all --preserve-digests --authfile "$AUTH" "docker://${REGISTRY}/${REPO}@${GZIP}" "oci:${RUNNER_TEMP}/gzip"
-            soci convert --standalone --all-platforms --format oci-dir "${RUNNER_TEMP}/gzip" "${RUNNER_TEMP}/soci"
-            # soci writes the converted index as a Docker manifest list, whose
-            # format has no artifactType, the field that marks a SOCI index.
-            # It is relabelled here as an OCI index, with every entry kept as
-            # soci wrote it, artifactType included. Only the list's own digest
-            # changes, and nothing names it.
-            LAYOUT="${RUNNER_TEMP}/soci"
-            LIST_TYPE=$(jq -r 'if (.manifests | length) == 1 then .manifests[0].mediaType else "" end' "${LAYOUT}/index.json")
-            case "$LIST_TYPE" in
-              application/vnd.oci.image.index.v1+json) ;;
-              application/vnd.docker.distribution.manifest.list.v2+json)
-                LIST=$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")
-                jq -c '.mediaType = "application/vnd.oci.image.index.v1+json"' \
-                  "${LAYOUT}/blobs/sha256/${LIST#sha256:}" > "${RUNNER_TEMP}/list.json"
-                SUM=$(sha256sum "${RUNNER_TEMP}/list.json" | cut -d' ' -f1)
-                SIZE=$(stat -c %s "${RUNNER_TEMP}/list.json")
-                mv "${RUNNER_TEMP}/list.json" "${LAYOUT}/blobs/sha256/${SUM}"
-                jq --arg digest "sha256:${SUM}" --argjson size "$SIZE" \
-                  '.manifests[0] |= (.mediaType = "application/vnd.oci.image.index.v1+json" | .digest = $digest | .size = $size)' \
-                  "${LAYOUT}/index.json" > "${RUNNER_TEMP}/layout-index.json"
-                mv "${RUNNER_TEMP}/layout-index.json" "${LAYOUT}/index.json"
-                ;;
-              *)
-                echo "::error::soci convert wrote no single index for ${REPO}:${TAG}-gzip (${LIST_TYPE:-none})"
-                exit 1
-                ;;
-            esac
-            # crane prints the pushed reference, which carries the account id.
+              | skopeo login --authfile "$REGISTRY_AUTH_FILE" --username AWS --password-stdin "$REGISTRY"
             aws ecr get-login-password --region us-east-1 \
               | crane auth login "$REGISTRY" --username AWS --password-stdin
-            crane push "$LAYOUT" "${REGISTRY}/${REPO}:${TAG}" > /dev/null
-            # skopeo refused to push a manifest it would rewrite, and crane
-            # has no such check. The tag must name the index in the layout,
-            # whose entries are the images each SOCI index names.
-            WANT=$(jq -r '.manifests[0].digest' "${LAYOUT}/index.json")
+            scripts/soci/convert-and-push.sh "${REGISTRY}/${REPO}@${GZIP}" "${REGISTRY}/${REPO}:${TAG}" "$RUNNER_TEMP"
             DIGEST=$(digest_of "$TAG")
-            if [[ "$DIGEST" != "$WANT" ]]; then
-              echo "::error::${REPO}:${TAG} names ${DIGEST:-nothing}, not the index soci wrote (${WANT})"
-              exit 1
-            fi
           fi
           if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::no index at ${REPO}:${TAG}"
@@ -370,15 +303,7 @@ jobs:
           aws ecr batch-get-image --repository-name "$REPO" --image-ids imageTag="$TAG" \
             --accepted-media-types application/vnd.oci.image.index.v1+json application/vnd.docker.distribution.manifest.list.v2+json \
             --query 'images[0].imageManifest' --output text > "${RUNNER_TEMP}/index.json"
-          if ! jq -e '
-              [.manifests[] | select(.artifactType == null) | .platform.architecture] as $images
-              | [.manifests[] | select(.artifactType == "application/vnd.amazon.soci.index.v2+json")] as $soci
-              | ($images | index("amd64")) != null and ($images | index("arm64")) != null
-                and ($soci | length) >= ($images | length)
-                and (if all($soci[]; .platform.architecture != null)
-                     then all($images[]; . as $arch | ([$soci[].platform.architecture] | index($arch)) != null)
-                     else true end)
-            ' "${RUNNER_TEMP}/index.json" > /dev/null; then
+          if ! jq -e -f scripts/soci/check-index.jq "${RUNNER_TEMP}/index.json" > /dev/null; then
             echo "::error::${REPO}:${TAG} has no SOCI index manifest v2 for each architecture"
             exit 1
           fi
