@@ -202,7 +202,7 @@ Before any real repo moves, prove the runners work on a repo nothing depends on.
 
 An entry that is not valid, such as a pool with capacity `spto`, is logged as `repo list entry not valid` and skipped, and the rest of the list is served. Its repo stays as the last good list had it, so a typo never reads as a removal. A list that cannot be read or is not JSON leaves the last good list in force, or nothing at the listener's start, and changes nothing. Both raise `paddock-repo-list-unreadable` until the list reads clean. A missing or empty list serves nothing.
 
-A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops, then its runner group. Do not delete the group by hand: the listener finds the scale set by its group, so the scale set would be left behind. A group that still holds a runner is left in place, since GitHub would move the runner to the org's default group.
+A changed pool setting applies to the next task the pool starts. A repo or pool taken off the list takes no new jobs, its waiting tasks exit, and its scale set is deleted once its last task stops, then its runner group. Do not delete the group by hand: the listener finds the scale set by its group, so the scale set would be left behind. A group that still holds a runner is left in place, since GitHub would move the runner to the org's default group, and the listener logs `could not delete a removed pool's runner group` on each read until the runner is gone.
 
 #### The runner-label variables
 

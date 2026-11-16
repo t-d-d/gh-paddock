@@ -279,9 +279,14 @@ func (i *Installation) DeleteRunnerGroup(ctx context.Context, org, name string) 
 		return err
 	}
 	if runners.Total > 0 {
-		return fmt.Errorf("the runner group still holds %d runners", runners.Total)
+		return fmt.Errorf("the runner group %s still holds runners: %d", name, runners.Total)
 	}
-	return i.do(ctx, http.MethodDelete, path, nil, nil, http.StatusNoContent)
+	err = i.do(ctx, http.MethodDelete, path, nil, nil, http.StatusNoContent)
+	var status *StatusError
+	if errors.As(err, &status) && status.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 // RunnerGroups names every runner group of org.

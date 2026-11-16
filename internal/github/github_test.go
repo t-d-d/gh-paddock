@@ -89,10 +89,13 @@ type fakeGitHub struct {
 	groupRepo map[int][]int
 	// runners registered in each group, by group id
 	groupRunners map[int]int
-	nextGroup    int
-	repos        map[string]map[string]any
-	installs     map[string]int64
-	tokens       int
+	// vanish names a group someone else deletes just before the App's
+	// delete reaches GitHub
+	vanish    string
+	nextGroup int
+	repos     map[string]map[string]any
+	installs  map[string]int64
+	tokens    int
 	// jobs of run 5's attempts, and the jobs re-run
 	jobs   map[string][]map[string]any
 	reruns []string
@@ -197,6 +200,7 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(200, map[string]any{"total_count": f.groupRunners[id], "runners": runners})
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/"):
+		delete(f.groups, f.vanish)
 		for name, g := range f.groups {
 			if fmt.Sprint(g["id"]) == strings.TrimPrefix(r.URL.Path, "/orgs/acme/actions/runner-groups/") {
 				delete(f.groups, name)
@@ -403,5 +407,21 @@ func TestARunnerGroupIsDeletedByNameOnlyWhenItHoldsNoRunner(t *testing.T) {
 	}
 	if _, ok := f.groups["paddock-busy-test"]; !ok || len(f.groups) != 2 {
 		t.Fatalf("groups %v", f.groups)
+	}
+}
+
+// A group someone else deletes between the App finding it and deleting it
+// is already gone, which is no error.
+func TestARunnerGroupGoneBeforeItsDeleteIsNoError(t *testing.T) {
+	f, app := newFake(t)
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.groups["paddock-gone-dev"] = map[string]any{"id": 3, "name": "paddock-gone-dev"}
+	f.vanish = "paddock-gone-dev"
+	if err := inst.DeleteRunnerGroup(ctx, "acme", "paddock-gone-dev"); err != nil {
+		t.Fatalf("a group gone before its delete: %v", err)
 	}
 }

@@ -27,9 +27,9 @@ const scaleSetPrefix = "paddock-"
 // gone from the list stops polling at once, so GitHub assigns it nothing
 // more and its waiting tasks get no further config and exit by themselves
 // (docs/constraints/remove-then-terminate.md). Its scale set is deleted
-// once ECS shows none of its tasks left, and then its runner group, so the
-// two stay a pair (docs/constraints/pool-per-repo.md). A repo whose entry
-// the list skipped is held as it was.
+// once ECS shows none of its tasks left, and then its runner group, so no
+// later read finds the group and looks for its scale set again. A repo
+// whose entry the list skipped is held as it was.
 //
 // It keeps nothing a restart would lose: a removed pool's scale set is
 // found again by its runner group, in each org it knows, and its tasks are
@@ -283,7 +283,8 @@ func (m *Manager) drain(ctx context.Context, o *org, name string) {
 }
 
 // deleteGroup deletes a removed pool's runner group, whose scale set has
-// gone. One it cannot delete is tried again on the next read.
+// gone. One it cannot delete, such as one that still holds a runner
+// someone registered by hand, is logged and tried again on each read.
 func (m *Manager) deleteGroup(ctx context.Context, o *org, name string, log *slog.Logger) {
 	if err := o.inst.DeleteRunnerGroup(ctx, o.name, name); err != nil {
 		log.Warn("could not delete a removed pool's runner group", "error", err.Error())
