@@ -7,6 +7,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -279,7 +280,10 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
   // skopeo pushes to it. Every image found is of the media type `media`, an
   // OCI index unless set, and its manifest is `manifest`, an index of both
   // architectures with a SOCI index for each unless set.
-  type IndexOpts = { denied?: boolean; pushes?: Record<string, string>; media?: string; manifest?: unknown };
+  // `converted` is the list soci writes into its OCI layout, a Docker
+  // manifest list of both architectures with a SOCI index for each unless
+  // set, and `convertedType` the media type index.json names it by.
+  type IndexOpts = { denied?: boolean; pushes?: Record<string, string>; media?: string; manifest?: unknown; converted?: unknown; convertedType?: string };
   const runIndex = (tags: Record<string, string>, opts: IndexOpts = {}) => {
     const dir = mkdtempSync(join(tmpdir(), 'deploy-index-'));
     try {
@@ -292,6 +296,7 @@ describe('fitness: the runner\'s image is built for x64 and arm64, each on a run
       const table = Object.entries(tags).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       const pushTable = Object.entries(opts.pushes ?? {}).map(([tag, digest]) => `"${tag}") digest="${digest}" ;;`).join('\n');
       writeFileSync(join(dir, 'manifest.json'), JSON.stringify(opts.manifest ?? sociIndex()));
+      writeFileSync(join(dir, 'converted.json'), JSON.stringify(opts.converted ?? { ...sociIndex(), mediaType: DOCKER_LIST }));
       writeFileSync(join(bin, 'aws'), `#!/bin/bash
 echo "aws $*" >> "$CALLS"
 case "$1 $2" in
@@ -329,6 +334,14 @@ cat > /dev/null
 echo "skopeo $*" >> "$CALLS"
 [ "$1" = login ] && { cat > /dev/null; exit 0; }
 dest="\${@: -1}"
+src="\${@: -2:1}"
+case "$src" in
+  oci:*)
+    layout="\${src#oci:}"
+    cp "$layout/index.json" "$PUSHED_INDEX"
+    list=$(jq -r '.manifests[0].digest' "$layout/index.json")
+    cp "$layout/blobs/sha256/\${list#sha256:}" "$PUSHED_LIST" ;;
+esac
 case "$dest" in
   oci:*) mkdir -p "\${dest#oci:}" ;;
   docker://*) touch "$PUSHED/\${dest##*:}" ;;
@@ -336,16 +349,21 @@ esac
 `, { mode: 0o755 });
       writeFileSync(join(bin, 'soci'), `#!/bin/bash
 echo "soci $*" >> "$CALLS"
-mkdir -p "\${@: -1}"
+out="\${@: -1}"
+mkdir -p "$out/blobs/sha256"
+sum=$(sha256sum "$CONVERTED" | cut -d' ' -f1)
+cp "$CONVERTED" "$out/blobs/sha256/$sum"
+printf '{"schemaVersion":2,"manifests":[{"mediaType":"%s","digest":"sha256:%s","size":%s}]}' "$CONVERTED_TYPE" "$sum" "$(stat -c %s "$CONVERTED")" > "$out/index.json"
 `, { mode: 0o755 });
       const result = spawnSync('bash', ['-e', '-c', stepById(indexSteps, 'index').run ?? ''], {
-        env: { PATH: `${bin}:${process.env.PATH}`, CALLS: calls, PUSHED: pushed, MANIFEST: join(dir, 'manifest.json'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
+        env: { PATH: `${bin}:${process.env.PATH}`, CALLS: calls, PUSHED: pushed, MANIFEST: join(dir, 'manifest.json'), CONVERTED: join(dir, 'converted.json'), CONVERTED_TYPE: opts.convertedType ?? DOCKER_LIST, PUSHED_INDEX: join(dir, 'pushed-index.json'), PUSHED_LIST: join(dir, 'pushed-list.json'), GITHUB_OUTPUT: output, RUNNER_TEMP: dir, TAG: 'abc' },
         stdio: 'pipe',
         input: '',
       });
       const lines = existsSync(calls) ? readFileSync(calls, 'utf-8').trim().split('\n').map((l) => l.replaceAll(dir, '$RUNNER_TEMP')) : [];
       const out = existsSync(output) ? readFileSync(output, 'utf-8') : '';
-      return { status: result.status, lines, out, stderr: result.stderr.toString() };
+      const read = (name: string) => (existsSync(join(dir, name)) ? readFileSync(join(dir, name)) : undefined);
+      return { status: result.status, lines, out, stderr: result.stderr.toString(), pushedIndex: read('pushed-index.json'), pushedList: read('pushed-list.json') };
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -353,6 +371,8 @@ mkdir -p "\${@: -1}"
   const d = (c: string) => `sha256:${c.repeat(64)}`;
   const REGISTRY = 'the-account.dkr.ecr.us-east-1.amazonaws.com/paddock-runner';
   const SOCI = 'application/vnd.amazon.soci.index.v2+json';
+  const DOCKER_LIST = 'application/vnd.docker.distribution.manifest.list.v2+json';
+  const OCI_INDEX = 'application/vnd.oci.image.index.v1+json';
   const image = (arch: string, c: string) => ({ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: d(c), size: 1, platform: { architecture: arch, os: 'linux' } });
   const soci = (arch: string, c: string) => ({ ...image(arch, c), artifactType: SOCI });
   const unplaced = (c: string) => ({ mediaType: 'application/vnd.oci.image.manifest.v1+json', digest: d(c), size: 1, artifactType: SOCI });
@@ -381,9 +401,43 @@ mkdir -p "\${@: -1}"
       'skopeo login --authfile $RUNNER_TEMP/auth.json --username AWS --password-stdin the-account.dkr.ecr.us-east-1.amazonaws.com',
       `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json docker://${REGISTRY}@${d('3')} oci:$RUNNER_TEMP/gzip`,
       'soci convert --standalone --all-platforms --format oci-dir $RUNNER_TEMP/gzip $RUNNER_TEMP/soci',
-      `skopeo copy --all --format oci --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
+      `skopeo copy --all --preserve-digests --authfile $RUNNER_TEMP/auth.json oci:$RUNNER_TEMP/soci docker://${REGISTRY}:abc`,
     ]);
     assert.equal(out, `digest=${d('5')}\n`);
+  });
+
+  // soci writes the converted index as a Docker manifest list, which skopeo
+  // will push only as an OCI index. skopeo's own conversion keeps none of an
+  // entry's artifactType, which marks each SOCI index. The step relabels the
+  // list itself, keeping every entry as soci wrote it, and the push keeps
+  // every digest.
+  test('pushes soci\'s Docker manifest list as an OCI index, every entry as soci wrote it', () => {
+    const converted = { ...sociIndex(), mediaType: DOCKER_LIST };
+    const { status, pushedIndex, pushedList, stderr } = runIndex(built, { pushes, converted });
+    assert.equal(status, 0, stderr);
+    assert.ok(pushedIndex && pushedList, 'the push read a layout');
+    const list = JSON.parse(pushedList.toString());
+    assert.equal(list.mediaType, OCI_INDEX);
+    assert.deepEqual(list.manifests, converted.manifests);
+    const [descriptor] = JSON.parse(pushedIndex.toString()).manifests;
+    assert.equal(descriptor.mediaType, OCI_INDEX);
+    assert.equal(descriptor.digest, `sha256:${createHash('sha256').update(pushedList).digest('hex')}`);
+    assert.equal(descriptor.size, pushedList.length);
+  });
+
+  test('pushes an OCI index from soci as soci wrote it', () => {
+    const converted = sociIndex();
+    const { status, pushedList, stderr } = runIndex(built, { pushes, converted, convertedType: OCI_INDEX });
+    assert.equal(status, 0, stderr);
+    assert.equal(pushedList?.toString(), JSON.stringify(converted));
+  });
+
+  test('refuses, pushing nothing, a converted layout that holds no index', () => {
+    const converted = image('amd64', 'a');
+    const { status, lines, out } = runIndex(built, { pushes, converted, convertedType: 'application/vnd.oci.image.manifest.v1+json' });
+    assert.notEqual(status, 0);
+    assert.ok(!lines.some((l) => l.includes('oci:$RUNNER_TEMP/soci')), lines.join('\n'));
+    assert.equal(out, '');
   });
 
   test('converts a joined index an earlier run left, and joins nothing', () => {
