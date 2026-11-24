@@ -9,8 +9,9 @@
 //
 // A workflow is given by its name or its file name. The baseline is the 28
 // days that end at <baseline-end>; the week is the 7 days from <week-start>.
-// Both dates are ISO 8601 times. It reads the runs through `gh api`, so it
-// needs a session or a login that can read the repo's Actions.
+// Both dates are ISO 8601 times with a time zone. The week must start after
+// the baseline ends, and be over before the script runs. It reads the runs
+// through `gh api`, so it needs a login that can read the repo's Actions.
 //
 // The served repo is an argument, never a value in a file, and the report
 // names neither the repo nor a run (docs/constraints/public-repo.md): it is
@@ -42,6 +43,8 @@ const LIMIT = 0.1;
 const PER_PAGE = 100;
 /** The Actions API serves no more than 1000 results to one query. */
 const MAX_PAGES = 10;
+/** A bound on the pages of workflows read. */
+const MAX_WORKFLOW_PAGES = 10;
 
 /** @param {Run} run */
 export const durationSeconds = (run) => (Date.parse(run.updated_at) - Date.parse(run.run_started_at)) / 1000;
@@ -63,8 +66,13 @@ export const median = (values) => {
  */
 export const change = (before, after) => Math.round(((after - before) / before) * 10000) / 10000;
 
-/** @param {Date} d */
-const iso = (d) => d.toISOString().replace(/\.000Z$/, 'Z');
+/**
+ * A time in whole seconds. GitHub's `created` filter takes no fraction, and
+ * a run's `created_at` has none, so flooring loses no run.
+ *
+ * @param {Date} d
+ */
+const iso = (d) => `${d.toISOString().slice(0, 19)}Z`;
 
 /**
  * The window as GitHub `created` ranges of a day each, the last cut short.
@@ -90,11 +98,19 @@ export const dayRanges = (start, end) => {
  * @returns {Promise<number>}
  */
 export async function resolveWorkflow(get, repo, nameOrFile) {
-  /** @type {{ workflows: Workflow[] }} */
-  const { workflows } = await get(`repos/${repo}/actions/workflows?per_page=${PER_PAGE}`);
-  const found = workflows.find((w) => w.name === nameOrFile || w.path.split('/').at(-1) === nameOrFile);
-  if (!found) throw new Error(`the repo has no workflow named ${nameOrFile}`);
-  return found.id;
+  /** @type {Workflow[]} */
+  const workflows = [];
+  for (let page = 1; page <= MAX_WORKFLOW_PAGES; page++) {
+    /** @type {{ total_count: number, workflows: Workflow[] }} */
+    const body = await get(`repos/${repo}/actions/workflows?per_page=${PER_PAGE}&page=${page}`);
+    workflows.push(...body.workflows);
+    if (body.workflows.length < PER_PAGE || page * PER_PAGE >= body.total_count) break;
+  }
+  const found = workflows.filter((w) => w.name === nameOrFile || w.path.split('/').at(-1) === nameOrFile);
+  if (found.length === 0) throw new Error(`the repo has no workflow named ${nameOrFile}`);
+  // Two workflows can share a name; picking one would time the wrong runs.
+  if (found.length > 1) throw new Error(`the repo has more than one workflow named ${nameOrFile}; give its file name`);
+  return /** @type {Workflow} */ (found[0]).id;
 }
 
 /**
@@ -116,6 +132,9 @@ export async function readRuns(get, repo, workflowId, start, end) {
       const body = await get(`repos/${repo}/actions/workflows/${workflowId}/runs?status=success&per_page=${PER_PAGE}&created=${range}&page=${page}`);
       for (const run of body.workflow_runs) runs.set(run.id, run);
       if (body.workflow_runs.length < PER_PAGE || page * PER_PAGE >= body.total_count) break;
+      // The API stops at the last page it serves; the runs past it would be
+      // missing from the median without a word.
+      if (page === MAX_PAGES) throw new Error(`a day has more than ${MAX_PAGES * PER_PAGE} runs, more than the API serves to one query`);
     }
   }
   // GitHub's range includes both ends; the window does not include its end.
@@ -159,7 +178,8 @@ const minutes = (seconds) => {
 };
 
 /** @param {number} fraction */
-const percent = (fraction) => `${fraction >= 0 ? '+' : ''}${(fraction * 100).toFixed(1)}%`;
+// Two places, as `change` keeps: a change just over the limit never shows as 10.0%.
+const percent = (fraction) => `${fraction >= 0 ? '+' : ''}${(fraction * 100).toFixed(2)}%`;
 
 /**
  * The medians and the changes, as Markdown for the PRD. No repo, no run.
@@ -181,16 +201,25 @@ export const formatReport = (result) => {
   ].join('\n');
 };
 
+/** An ISO 8601 time that names its zone, so it is never read as local time. */
+const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
 /**
  * @param {string[]} args
+ * @param {Date} [now]
  * @returns {{ repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date } | undefined}
  */
-export const parseArgs = (args) => {
+export const parseArgs = (args, now = new Date()) => {
   const [repo, ci, delivery, end, start] = args;
   if (!repo || !ci || !delivery || !end || !start || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return undefined;
+  if (!ZONED_TIME.test(end) || !ZONED_TIME.test(start)) return undefined;
   const baselineEnd = new Date(end);
   const weekStart = new Date(start);
   if (Number.isNaN(baselineEnd.getTime()) || Number.isNaN(weekStart.getTime())) return undefined;
+  // Overlapping windows would count the same runs on both sides.
+  if (weekStart.getTime() < baselineEnd.getTime()) return undefined;
+  // A week still under way would be reported as a whole one.
+  if (weekStart.getTime() + WEEK_DAYS * DAY > now.getTime()) return undefined;
   return { repo, ci, delivery, baselineEnd, weekStart };
 };
 
@@ -205,6 +234,7 @@ if (isCliEntry(import.meta.url, process.argv[1])) {
   const args = parseArgs(process.argv.slice(2));
   if (!args) {
     console.error('usage: speed-checkpoint.mjs <owner/repo> <ci-workflow> <delivery-workflow> <baseline-end> <week-start>');
+    console.error('The dates are ISO 8601 times with a zone. The week starts after the baseline ends and must be over.');
     process.exit(2);
   }
   const result = await checkpoint({ get: ghApi, ...args });

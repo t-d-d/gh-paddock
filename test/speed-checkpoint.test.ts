@@ -71,6 +71,12 @@ describe('the days queried', () => {
       '2026-11-17T15:32:48Z..2026-11-18T12:00:00Z',
     ]);
   });
+
+  test('are given in whole seconds, as GitHub reads them', () => {
+    assert.deepEqual(dayRanges(new Date('2026-11-16T15:32:48.250Z'), new Date('2026-11-17T12:00:00.750Z')), [
+      '2026-11-16T15:32:48Z..2026-11-17T12:00:00Z',
+    ]);
+  });
 });
 
 describe('finding a workflow', () => {
@@ -82,7 +88,7 @@ describe('finding a workflow', () => {
     ],
   };
   const get: Get = async (path) => {
-    assert.equal(path, `repos/${REPO}/actions/workflows?per_page=100`);
+    assert.equal(path, `repos/${REPO}/actions/workflows?per_page=100&page=1`);
     return workflows;
   };
 
@@ -96,6 +102,26 @@ describe('finding a workflow', () => {
 
   test('refuses a name the repo has no workflow by', async () => {
     await assert.rejects(resolveWorkflow(get, REPO, 'Release'), /no workflow named Release/);
+  });
+
+  test('follows the pages of a repo with more than a hundred workflows', async () => {
+    const many = Array.from({ length: 100 }, (_, i) => ({ id: i + 100, name: `Job ${i}`, path: `.github/workflows/job-${i}.yml` }));
+    const paged: Get = async (path) =>
+      path.endsWith('&page=1')
+        ? { total_count: 101, workflows: many }
+        : { total_count: 101, workflows: [{ id: 33, name: 'Release', path: '.github/workflows/release.yml' }] };
+    assert.equal(await resolveWorkflow(paged, REPO, 'Release'), 33);
+  });
+
+  test('refuses a name two workflows share', async () => {
+    const twins: Get = async () => ({
+      total_count: 2,
+      workflows: [
+        { id: 11, name: 'CI', path: '.github/workflows/ci.yml' },
+        { id: 12, name: 'CI', path: '.github/workflows/ci-nightly.yml' },
+      ],
+    });
+    await assert.rejects(resolveWorkflow(twins, REPO, 'CI'), /more than one workflow named CI/);
   });
 });
 
@@ -130,6 +156,15 @@ describe('reading a workflow\'s runs', () => {
     const runs = await readRuns(get, REPO, 22, start, end);
     assert.deepEqual(runs.map((r) => r.id), [1]);
   });
+
+  test('refuses a day with more runs than the API serves, rather than drop some', async () => {
+    let next = 0;
+    const get: Get = async () => ({
+      total_count: 1001,
+      workflow_runs: Array.from({ length: 100 }, () => run(++next, '2026-11-16T01:00:00Z', 60)),
+    });
+    await assert.rejects(readRuns(get, REPO, 22, start, end), /more than 1000 runs/);
+  });
 });
 
 describe('the checkpoint', () => {
@@ -138,7 +173,7 @@ describe('the checkpoint', () => {
 
   /** A fake API: CI's and Deliver's runs, in the baseline and in the week. */
   const fakeApi = (runs: Record<number, Run[]>): Get => async (path) => {
-    if (path.endsWith('/actions/workflows?per_page=100')) {
+    if (path.endsWith('/actions/workflows?per_page=100&page=1')) {
       return { total_count: 2, workflows: [{ id: 11, name: 'CI', path: '.github/workflows/ci.yml' }, { id: 22, name: 'Deliver', path: '.github/workflows/deliver.yml' }] };
     }
     const id = Number(/workflows\/(\d+)\/runs/.exec(path)?.[1]);
@@ -209,13 +244,27 @@ describe('the checkpoint', () => {
         '',
         '| Workflow | Baseline median | Week median | Change |',
         '| --- | --- | --- | --- |',
-        '| CI | 6m 00s | 6m 00s | +0.0% |',
-        '| Delivery | 10m 00s | 12m 00s | +20.0% |',
+        '| CI | 6m 00s | 6m 00s | +0.00% |',
+        '| Delivery | 10m 00s | 12m 00s | +20.00% |',
         '',
         'Delivery is more than 10% slower.',
       ].join('\n'),
     );
     assert.doesNotMatch(text, /example/);
+  });
+
+  test('shows a change just over the limit as over it', async () => {
+    const result = await checkpoint({
+      get: fakeApi({ 11: [run(1, '2026-11-01T10:00:00Z', 1000), run(2, '2026-11-17T10:00:00Z', 1001)], 22: [run(3, '2026-11-01T10:00:00Z', 10000), run(4, '2026-11-17T10:00:00Z', 11004)] }),
+      repo: REPO,
+      ci: 'CI',
+      delivery: 'Deliver',
+      baselineEnd,
+      weekStart,
+    });
+    const text = formatReport(result);
+    assert.match(text, /\| Delivery \| 166m 40s \| 183m 24s \| \+10\.04% \|/);
+    assert.match(text, /Delivery is more than 10% slower\./);
   });
 });
 
@@ -234,5 +283,21 @@ describe('the arguments', () => {
     assert.equal(parseArgs(['example-app', 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z']), undefined);
     assert.equal(parseArgs([REPO, 'CI', 'Deliver', 'mid-November', '2026-11-16T15:32:48Z']), undefined);
     assert.equal(parseArgs([REPO, 'CI']), undefined);
+  });
+
+  test('refuse a date without its time zone, which would be read as local time', () => {
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00', '2026-11-16T15:32:48Z']), undefined);
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16']), undefined);
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T01:00:00+01:00', '2026-11-16T15:32:48Z'])?.baselineEnd.toISOString(), '2026-11-15T00:00:00.000Z');
+  });
+
+  test('refuse a week that starts before the baseline ends', () => {
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-17T00:00:00Z', '2026-11-16T15:32:48Z']), undefined);
+  });
+
+  test('refuse a week that has not ended, which would be reported as a whole one', () => {
+    const now = new Date('2026-11-20T00:00:00Z');
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z'], now), undefined);
+    assert.ok(parseArgs([REPO, 'CI', 'Deliver', '2026-11-08T00:00:00Z', '2026-11-12T00:00:00Z'], now));
   });
 });
