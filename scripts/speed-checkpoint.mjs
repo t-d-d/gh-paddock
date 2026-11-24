@@ -5,7 +5,7 @@
 // Compares the median time from start to finish of a served repo's CI and
 // delivery runs in the week after a move with the four weeks before it:
 //
-//   node scripts/speed-checkpoint.mjs <owner/repo> <ci-workflow> <delivery-workflow> <baseline-end> <week-start>
+//   node scripts/speed-checkpoint.mjs <owner/repo> <ci-workflow> <delivery-workflow> <baseline-end> <week-start> [<changes-job>]
 //
 // A workflow is given by its name or its file name. The baseline is the 28
 // days that end at <baseline-end>; the week is the 7 days from <week-start>.
@@ -21,6 +21,12 @@
 // would pull the median down by however many runs broke that week. A run's
 // time is from its start to its last update, which for a completed run is
 // when it finished. A re-run counts from its latest attempt's start.
+//
+// <changes-job> names CI's change-detection job. When it is given, a CI run
+// in which no other job ran is left out: it finishes in seconds whatever the
+// runners, so how many of them a window holds would move the median more
+// than the runners do. The report says how many were left out. Delivery's
+// runs are all counted.
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -29,10 +35,11 @@ import { isCliEntry } from './lib/cli-entry.mjs';
 /**
  * @typedef {{ id: number, created_at: string, run_started_at: string, updated_at: string }} Run
  * @typedef {{ id: number, name: string, path: string }} Workflow
+ * @typedef {{ name: string, conclusion: string | null }} Job
  * @typedef {(path: string) => Promise<any>} Get
- * @typedef {{ median: number, runs: number }} Window
+ * @typedef {{ median: number, runs: number, left?: number }} Window
  * @typedef {{ label: string, baseline: Window, week: Window, change: number }} Compared
- * @typedef {{ baselineStart: Date, baselineEnd: Date, weekStart: Date, weekEnd: Date, workflows: Compared[], slower: boolean }} Result
+ * @typedef {{ baselineStart: Date, baselineEnd: Date, weekStart: Date, weekEnd: Date, workflows: Compared[], slower: boolean, filtered: boolean }} Result
  */
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -145,27 +152,100 @@ export async function readRuns(get, repo, workflowId, start, end) {
 }
 
 /**
+ * Whether the named job was the only one of a run's jobs that ran. A job
+ * that did not run is listed as skipped.
+ *
+ * @param {Job[]} jobs
+ * @param {string} name
+ */
+export const ranOnly = (jobs, name) => {
+  const ran = jobs.filter((j) => j.conclusion !== 'skipped');
+  return ran.length > 0 && ran.every((j) => j.name === name);
+};
+
+/**
+ * A run's jobs, of its latest attempt, every page.
+ *
+ * @param {Get} get
+ * @param {string} repo
+ * @param {number} runId
+ * @returns {Promise<Job[]>}
+ */
+async function readJobs(get, repo, runId) {
+  /** @type {Job[]} */
+  const jobs = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    /** @type {{ total_count: number, jobs: Job[] }} */
+    const body = await get(`repos/${repo}/actions/runs/${runId}/jobs?per_page=${PER_PAGE}&page=${page}`);
+    jobs.push(...body.jobs);
+    if (body.jobs.length < PER_PAGE || page * PER_PAGE >= body.total_count) break;
+  }
+  return jobs;
+}
+
+/**
+ * The runs, less those in which only the named job ran. Reads each run's
+ * jobs, of its latest attempt, as the run's time is. A name that ran in none
+ * of the runs is refused: it is a typo, and would filter nothing.
+ *
+ * @param {Get} get
+ * @param {string} repo
+ * @param {Run[]} runs
+ * @param {string} name
+ * @returns {Promise<{ kept: Run[], left: number }>}
+ */
+async function dropRanOnly(get, repo, runs, name) {
+  /** @type {Run[]} */
+  const kept = [];
+  let seen = false;
+  for (const run of runs) {
+    const jobs = await readJobs(get, repo, run.id);
+    if (jobs.some((j) => j.name === name && j.conclusion !== 'skipped')) seen = true;
+    if (!ranOnly(jobs, name)) kept.push(run);
+  }
+  if (runs.length > 0 && !seen) throw new Error(`no run in the window ran a job named ${name}`);
+  return { kept, left: runs.length - kept.length };
+}
+
+/**
  * @param {Run[]} runs
  * @returns {Window}
  */
 const summarise = (runs) => ({ median: median(runs.map(durationSeconds)), runs: runs.length });
 
 /**
- * @param {{ get: Get, repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date }} input
+ * One window's runs, summarised, with those that ran only the change-detection
+ * job left out when it is named.
+ *
+ * @param {Get} get
+ * @param {string} repo
+ * @param {Run[]} runs
+ * @param {string | undefined} changesJob
+ * @returns {Promise<Window>}
+ */
+async function windowOf(get, repo, runs, changesJob) {
+  if (changesJob === undefined) return summarise(runs);
+  const { kept, left } = await dropRanOnly(get, repo, runs, changesJob);
+  return { ...summarise(kept), left };
+}
+
+/**
+ * @param {{ get: Get, repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date, changesJob?: string }} input
  * @returns {Promise<Result>}
  */
-export async function checkpoint({ get, repo, ci, delivery, baselineEnd, weekStart }) {
+export async function checkpoint({ get, repo, ci, delivery, baselineEnd, weekStart, changesJob }) {
   const baselineStart = new Date(baselineEnd.getTime() - BASELINE_DAYS * DAY);
   const weekEnd = new Date(weekStart.getTime() + WEEK_DAYS * DAY);
   /** @type {Compared[]} */
   const workflows = [];
   for (const [label, name] of /** @type {const} */ ([['CI', ci], ['Delivery', delivery]])) {
     const id = await resolveWorkflow(get, repo, name);
-    const baseline = summarise(await readRuns(get, repo, id, baselineStart, baselineEnd));
-    const week = summarise(await readRuns(get, repo, id, weekStart, weekEnd));
+    const filter = label === 'CI' ? changesJob : undefined;
+    const baseline = await windowOf(get, repo, await readRuns(get, repo, id, baselineStart, baselineEnd), filter);
+    const week = await windowOf(get, repo, await readRuns(get, repo, id, weekStart, weekEnd), filter);
     workflows.push({ label, baseline, week, change: change(baseline.median, week.median) });
   }
-  return { baselineStart, baselineEnd, weekStart, weekEnd, workflows, slower: workflows.some((w) => w.change > LIMIT) };
+  return { baselineStart, baselineEnd, weekStart, weekEnd, workflows, slower: workflows.some((w) => w.change > LIMIT), filtered: changesJob !== undefined };
 }
 
 /** @param {Date} d */
@@ -189,6 +269,10 @@ const percent = (fraction) => `${fraction >= 0 ? '+' : ''}${(fraction * 100).toF
  */
 export const formatReport = (result) => {
   const slow = result.workflows.filter((w) => w.change > LIMIT).map((w) => w.label);
+  const ci = result.workflows.find((w) => w.label === 'CI');
+  const left = result.filtered && ci
+    ? ['', `CI runs that ran only the change-detection job are left out: ${ci.baseline.left ?? 0} in the baseline and ${ci.week.left ?? 0} in the week.`]
+    : [];
   return [
     `Baseline: the four weeks from ${when(result.baselineStart)} to ${when(result.baselineEnd)}.`,
     `Week: ${when(result.weekStart)} to ${when(result.weekEnd)}.`,
@@ -198,6 +282,7 @@ export const formatReport = (result) => {
     ...result.workflows.map((w) => `| ${w.label} | ${minutes(w.baseline.median)} | ${minutes(w.week.median)} | ${percent(w.change)} |`),
     '',
     slow.length === 0 ? 'Both are within 10%.' : `${slow.join(' and ')} ${slow.length === 1 ? 'is' : 'are'} more than 10% slower.`,
+    ...left,
   ].join('\n');
 };
 
@@ -207,10 +292,11 @@ const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:
 /**
  * @param {string[]} args
  * @param {Date} [now]
- * @returns {{ repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date } | undefined}
+ * @returns {{ repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date, changesJob?: string } | undefined}
  */
 export const parseArgs = (args, now = new Date()) => {
-  const [repo, ci, delivery, end, start] = args;
+  if (args.length > 6) return undefined;
+  const [repo, ci, delivery, end, start, changesJob] = args;
   if (!repo || !ci || !delivery || !end || !start || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return undefined;
   if (!ZONED_TIME.test(end) || !ZONED_TIME.test(start)) return undefined;
   const baselineEnd = new Date(end);
@@ -220,7 +306,7 @@ export const parseArgs = (args, now = new Date()) => {
   if (weekStart.getTime() < baselineEnd.getTime()) return undefined;
   // A week still under way would be reported as a whole one.
   if (weekStart.getTime() + WEEK_DAYS * DAY > now.getTime()) return undefined;
-  return { repo, ci, delivery, baselineEnd, weekStart };
+  return changesJob ? { repo, ci, delivery, baselineEnd, weekStart, changesJob } : { repo, ci, delivery, baselineEnd, weekStart };
 };
 
 /** @type {Get} */
@@ -233,7 +319,7 @@ const ghApi = async (path) => {
 if (isCliEntry(import.meta.url, process.argv[1])) {
   const args = parseArgs(process.argv.slice(2));
   if (!args) {
-    console.error('usage: speed-checkpoint.mjs <owner/repo> <ci-workflow> <delivery-workflow> <baseline-end> <week-start>');
+    console.error('usage: speed-checkpoint.mjs <owner/repo> <ci-workflow> <delivery-workflow> <baseline-end> <week-start> [<changes-job>]');
     console.error('The dates are ISO 8601 times with a zone. The week starts after the baseline ends and must be over.');
     process.exit(2);
   }
