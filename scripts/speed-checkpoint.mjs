@@ -22,10 +22,11 @@
 // time is from its start to its last update, which for a completed run is
 // when it finished. A re-run counts from its latest attempt's start.
 //
-// <changes-job> names CI's change-detection job. When it is given, a run in
-// which no other job ran is left out: it finishes in seconds whatever the
+// <changes-job> names CI's change-detection job. When it is given, a CI run
+// in which no other job ran is left out: it finishes in seconds whatever the
 // runners, so how many of them a window holds would move the median more
-// than the runners do. The report says how many were left out.
+// than the runners do. The report says how many were left out. Delivery's
+// runs are all counted.
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -163,8 +164,29 @@ export const ranOnly = (jobs, name) => {
 };
 
 /**
+ * A run's jobs, of its latest attempt, every page.
+ *
+ * @param {Get} get
+ * @param {string} repo
+ * @param {number} runId
+ * @returns {Promise<Job[]>}
+ */
+async function readJobs(get, repo, runId) {
+  /** @type {Job[]} */
+  const jobs = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    /** @type {{ total_count: number, jobs: Job[] }} */
+    const body = await get(`repos/${repo}/actions/runs/${runId}/jobs?per_page=${PER_PAGE}&page=${page}`);
+    jobs.push(...body.jobs);
+    if (body.jobs.length < PER_PAGE || page * PER_PAGE >= body.total_count) break;
+  }
+  return jobs;
+}
+
+/**
  * The runs, less those in which only the named job ran. Reads each run's
- * jobs, of its latest attempt, as the run's time is.
+ * jobs, of its latest attempt, as the run's time is. A name that ran in none
+ * of the runs is refused: it is a typo, and would filter nothing.
  *
  * @param {Get} get
  * @param {string} repo
@@ -175,11 +197,13 @@ export const ranOnly = (jobs, name) => {
 async function dropRanOnly(get, repo, runs, name) {
   /** @type {Run[]} */
   const kept = [];
+  let seen = false;
   for (const run of runs) {
-    /** @type {{ jobs: Job[] }} */
-    const { jobs } = await get(`repos/${repo}/actions/runs/${run.id}/jobs?per_page=${PER_PAGE}`);
+    const jobs = await readJobs(get, repo, run.id);
+    if (jobs.some((j) => j.name === name && j.conclusion !== 'skipped')) seen = true;
     if (!ranOnly(jobs, name)) kept.push(run);
   }
+  if (runs.length > 0 && !seen) throw new Error(`no run in the window ran a job named ${name}`);
   return { kept, left: runs.length - kept.length };
 }
 
@@ -216,8 +240,9 @@ export async function checkpoint({ get, repo, ci, delivery, baselineEnd, weekSta
   const workflows = [];
   for (const [label, name] of /** @type {const} */ ([['CI', ci], ['Delivery', delivery]])) {
     const id = await resolveWorkflow(get, repo, name);
-    const baseline = await windowOf(get, repo, await readRuns(get, repo, id, baselineStart, baselineEnd), changesJob);
-    const week = await windowOf(get, repo, await readRuns(get, repo, id, weekStart, weekEnd), changesJob);
+    const filter = label === 'CI' ? changesJob : undefined;
+    const baseline = await windowOf(get, repo, await readRuns(get, repo, id, baselineStart, baselineEnd), filter);
+    const week = await windowOf(get, repo, await readRuns(get, repo, id, weekStart, weekEnd), filter);
     workflows.push({ label, baseline, week, change: change(baseline.median, week.median) });
   }
   return { baselineStart, baselineEnd, weekStart, weekEnd, workflows, slower: workflows.some((w) => w.change > LIMIT), filtered: changesJob !== undefined };
@@ -244,9 +269,9 @@ const percent = (fraction) => `${fraction >= 0 ? '+' : ''}${(fraction * 100).toF
  */
 export const formatReport = (result) => {
   const slow = result.workflows.filter((w) => w.change > LIMIT).map((w) => w.label);
-  const [first, second] = result.workflows;
-  const left = result.filtered && first && second
-    ? ['', `Runs that ran only the change-detection job are left out: ${first.baseline.left ?? 0} in the baseline and ${first.week.left ?? 0} in the week for ${first.label}, ${second.baseline.left ?? 0} and ${second.week.left ?? 0} for ${second.label}.`]
+  const ci = result.workflows.find((w) => w.label === 'CI');
+  const left = result.filtered && ci
+    ? ['', `CI runs that ran only the change-detection job are left out: ${ci.baseline.left ?? 0} in the baseline and ${ci.week.left ?? 0} in the week.`]
     : [];
   return [
     `Baseline: the four weeks from ${when(result.baselineStart)} to ${when(result.baselineEnd)}.`,
@@ -270,6 +295,7 @@ const ZONED_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:
  * @returns {{ repo: string, ci: string, delivery: string, baselineEnd: Date, weekStart: Date, changesJob?: string } | undefined}
  */
 export const parseArgs = (args, now = new Date()) => {
+  if (args.length > 6) return undefined;
   const [repo, ci, delivery, end, start, changesJob] = args;
   if (!repo || !ci || !delivery || !end || !start || !/^[^/\s]+\/[^/\s]+$/.test(repo)) return undefined;
   if (!ZONED_TIME.test(end) || !ZONED_TIME.test(start)) return undefined;

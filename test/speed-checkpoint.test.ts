@@ -311,7 +311,7 @@ describe('the checkpoint with a change-detection job named', () => {
     if (path.endsWith('/actions/workflows?per_page=100&page=1')) {
       return { total_count: 2, workflows: [{ id: 11, name: 'CI', path: '.github/workflows/ci.yml' }, { id: 22, name: 'Deliver', path: '.github/workflows/deliver.yml' }] };
     }
-    const jobs = /actions\/runs\/(\d+)\/jobs\?per_page=100$/.exec(path);
+    const jobs = /actions\/runs\/(\d+)\/jobs\?per_page=100&page=1$/.exec(path);
     if (jobs) {
       const id = Number(jobs[1]);
       const rest = onlyChanges.has(id) ? 'skipped' : 'success';
@@ -328,12 +328,26 @@ describe('the checkpoint with a change-detection job named', () => {
     const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'changes' });
     assert.deepEqual(result.workflows[0]!.baseline, { median: 330, runs: 3, left: 2 });
     assert.deepEqual(result.workflows[0]!.week, { median: 300, runs: 1, left: 0 });
-    assert.ok(calls.includes(`repos/${REPO}/actions/runs/1/jobs?per_page=100`));
+    assert.ok(calls.includes(`repos/${REPO}/actions/runs/1/jobs?per_page=100&page=1`));
+  });
+
+  test('counts every Delivery run, and reads none of their jobs', async () => {
+    calls.length = 0;
+    const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'changes' });
+    assert.deepEqual(result.workflows[1]!.baseline, { median: 600, runs: 1 });
+    assert.equal(calls.some((c) => c.includes('/runs/7/jobs') || c.includes('/runs/8/jobs')), false);
+  });
+
+  test('refuses a job name no run ran, which would filter nothing', async () => {
+    await assert.rejects(
+      checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'change' }),
+      /no run in the window ran a job named change/,
+    );
   });
 
   test('says in the report that those runs are left out', async () => {
     const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'changes' });
-    assert.match(formatReport(result), /Runs that ran only the change-detection job are left out: 2 in the baseline and 0 in the week for CI, 0 and 0 for Delivery\./);
+    assert.match(formatReport(result), /CI runs that ran only the change-detection job are left out: 2 in the baseline and 0 in the week\./);
   });
 
   test('reads no jobs when no job is named', async () => {
@@ -349,6 +363,10 @@ describe('the arguments', () => {
   test('may name the change-detection job last', () => {
     assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z', 'changes'])?.changesJob, 'changes');
     assert.equal('changesJob' in parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z'])!, false);
+  });
+
+  test('refuse more than six, as an unquoted job name split in two would give', () => {
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z', 'detect', 'changes']), undefined);
   });
 
   test('are the repo, the two workflows and the two dates', () => {
