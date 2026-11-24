@@ -13,12 +13,14 @@ import {
   checkpoint,
   dayRanges,
   durationSeconds,
+  ranOnly,
   formatReport,
   median,
   parseArgs,
   readRuns,
   resolveWorkflow,
   type Get,
+  type Job,
   type Run,
 } from '../scripts/speed-checkpoint.mjs';
 
@@ -268,7 +270,87 @@ describe('the checkpoint', () => {
   });
 });
 
+describe('a run that ran only the change-detection job', () => {
+  // A CI run whose change detection finds nothing to test skips every other
+  // job and finishes in seconds. Counted, those runs move the median by how
+  // many of them a window happens to hold, not by how fast the runners are.
+  const job = (name: string, conclusion: string): Job => ({ name, conclusion });
+
+  test('is one where every other job was skipped', () => {
+    assert.equal(ranOnly([job('changes', 'success'), job('test', 'skipped'), job('e2e', 'skipped')], 'changes'), true);
+  });
+
+  test('is not one where another job ran too, whatever its outcome', () => {
+    assert.equal(ranOnly([job('changes', 'success'), job('test', 'success'), job('e2e', 'skipped')], 'changes'), false);
+    assert.equal(ranOnly([job('changes', 'success'), job('test', 'failure')], 'changes'), false);
+  });
+
+  test('is not one where that job did not run at all', () => {
+    assert.equal(ranOnly([job('build', 'success')], 'changes'), false);
+  });
+});
+
+describe('the checkpoint with a change-detection job named', () => {
+  const baselineEnd = new Date('2026-11-15T00:00:00Z');
+  const weekStart = new Date('2026-11-16T15:32:48Z');
+  const runs: Record<number, Run[]> = {
+    11: [
+      run(1, '2026-11-01T10:00:00Z', 20), // ran only change detection
+      run(2, '2026-11-02T10:00:00Z', 20), // ran only change detection
+      run(3, '2026-11-03T10:00:00Z', 300),
+      run(4, '2026-11-04T10:00:00Z', 330),
+      run(5, '2026-11-05T10:00:00Z', 360),
+      run(6, '2026-11-17T10:00:00Z', 300),
+    ],
+    22: [run(7, '2026-11-01T10:00:00Z', 600), run(8, '2026-11-17T10:00:00Z', 600)],
+  };
+  const onlyChanges = new Set([1, 2]);
+  const calls: string[] = [];
+  const get: Get = async (path) => {
+    calls.push(path);
+    if (path.endsWith('/actions/workflows?per_page=100&page=1')) {
+      return { total_count: 2, workflows: [{ id: 11, name: 'CI', path: '.github/workflows/ci.yml' }, { id: 22, name: 'Deliver', path: '.github/workflows/deliver.yml' }] };
+    }
+    const jobs = /actions\/runs\/(\d+)\/jobs\?per_page=100$/.exec(path);
+    if (jobs) {
+      const id = Number(jobs[1]);
+      const rest = onlyChanges.has(id) ? 'skipped' : 'success';
+      return { total_count: 2, jobs: [{ name: 'changes', conclusion: 'success' }, { name: 'test', conclusion: rest }] };
+    }
+    const id = Number(/workflows\/(\d+)\/runs/.exec(path)?.[1]);
+    const range = /created=([^&]+)\.\.([^&]+)&page=(\d+)/.exec(path)!;
+    if (range[3] !== '1') return { total_count: 0, workflow_runs: [] };
+    const inRange = (runs[id] ?? []).filter((r) => new Date(r.created_at) >= new Date(range[1]!) && new Date(r.created_at) <= new Date(range[2]!));
+    return { total_count: inRange.length, workflow_runs: inRange };
+  };
+
+  test('leaves out the runs that ran only that job, and counts them', async () => {
+    const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'changes' });
+    assert.deepEqual(result.workflows[0]!.baseline, { median: 330, runs: 3, left: 2 });
+    assert.deepEqual(result.workflows[0]!.week, { median: 300, runs: 1, left: 0 });
+    assert.ok(calls.includes(`repos/${REPO}/actions/runs/1/jobs?per_page=100`));
+  });
+
+  test('says in the report that those runs are left out', async () => {
+    const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart, changesJob: 'changes' });
+    assert.match(formatReport(result), /Runs that ran only the change-detection job are left out: 2 in the baseline and 0 in the week for CI, 0 and 0 for Delivery\./);
+  });
+
+  test('reads no jobs when no job is named', async () => {
+    calls.length = 0;
+    const result = await checkpoint({ get, repo: REPO, ci: 'CI', delivery: 'Deliver', baselineEnd, weekStart });
+    assert.equal(calls.some((c) => c.includes('/jobs')), false);
+    assert.equal(result.workflows[0]!.baseline.median, 300);
+    assert.doesNotMatch(formatReport(result), /left out/);
+  });
+});
+
 describe('the arguments', () => {
+  test('may name the change-detection job last', () => {
+    assert.equal(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z', 'changes'])?.changesJob, 'changes');
+    assert.equal('changesJob' in parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z'])!, false);
+  });
+
   test('are the repo, the two workflows and the two dates', () => {
     assert.deepEqual(parseArgs([REPO, 'CI', 'Deliver', '2026-11-15T00:00:00Z', '2026-11-16T15:32:48Z']), {
       repo: REPO,
