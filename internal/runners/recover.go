@@ -116,6 +116,17 @@ type owedRun struct {
 	stoppingAt time.Time // when Spot's warning began
 	stoppedAt  time.Time // when the task stopped, at the warning's end or sooner
 	killed     bool      // logged as killed, so counted once
+	// sought is how many searches have not found the job's run, while
+	// runID is zero.
+	sought int
+}
+
+// lastRunner is the runner a task was last handed, from its tags, and when.
+func lastRunner(lt ecstypes.Task) (string, time.Time) {
+	if runner, at, ok := splitTag(tagOf(lt, tagHanded)); ok {
+		return runner, time.Unix(at, 0)
+	}
+	return tagOf(lt, "paddock:runner"), time.Time{}
 }
 
 // readTask is what a live task's tags say of it.
@@ -126,8 +137,8 @@ func (s *Scaler) readTask(lt ecstypes.Task) *task {
 		created = *lt.CreatedAt
 	}
 	t := &task{arn: aws.ToString(lt.TaskArn), key: s.objectKey(first), runner: first, created: created, handed: created}
-	if runner, at, ok := splitTag(tagOf(lt, tagHanded)); ok {
-		t.runner, t.handed = runner, time.Unix(at, 0)
+	if runner, at := lastRunner(lt); !at.IsZero() {
+		t.runner, t.handed = runner, at
 	}
 	if runner, _, ok := splitTag(tagOf(lt, tagJob)); ok && runner == t.runner {
 		t.started = true
@@ -304,10 +315,10 @@ func (s *Scaler) watchWaits(now time.Time) {
 }
 
 // seekRuns finds the run of each job a runner took with no message heard,
-// once a minute while one is unknown, among the repo's runs in progress. It
-// tags the task with the run, as track does a job it hears start, so a
-// reclaim that kills the job gets it re-run. A run not found in
-// seekRunsTries searches is logged and sought no more.
+// once a minute while one is unknown. It tags the task with the run, as
+// track does a job it hears start, so a reclaim that kills the job gets it
+// re-run, even after a restart. A run not found in seekRunsTries searches
+// is logged and sought no more.
 func (s *Scaler) seekRuns(ctx context.Context, now time.Time) {
 	if s.Actions == nil || (!s.runsSought.IsZero() && now.Sub(s.runsSought) < seekRunsEvery) {
 		return
@@ -322,40 +333,61 @@ func (s *Scaler) seekRuns(ctx context.Context, now time.Time) {
 		return
 	}
 	s.runsSought = now
-	runs, err := s.Actions.RunsInProgress(ctx, s.Repo.Owner, s.Repo.Name)
+	names := map[string]bool{}
+	for runner := range unknown {
+		names[runner] = true
+	}
+	found, err := s.findRuns(ctx, names)
 	if err != nil {
 		s.Log.Warn("could not read the runs in progress", "error", err.Error())
 		return
 	}
+	for runner, t := range unknown {
+		if runID, ok := found[runner]; ok {
+			s.tag(ctx, t, tagJob, runner+"@"+strconv.FormatInt(runID, 10))
+			t.runUnknown = false
+			continue
+		}
+		t.sought++
+		if t.sought >= seekRunsTries {
+			t.runUnknown = false
+			s.Log.Warn("could not find the run of a job no message named", "runner", runner, "searches", t.sought)
+		}
+	}
+}
+
+// findRuns finds, among the repo's runs in progress, the run of each named
+// runner's job. A runner with no job in progress is left out.
+func (s *Scaler) findRuns(ctx context.Context, runners map[string]bool) (map[string]int64, error) {
+	runs, err := s.Actions.RunsInProgress(ctx, s.Repo.Owner, s.Repo.Name)
+	if err != nil {
+		return nil, err
+	}
+	found := map[string]int64{}
 	for _, run := range runs {
+		if len(found) == len(runners) {
+			break
+		}
 		jobs, err := s.Actions.RunJobs(ctx, s.Repo.Owner, s.Repo.Name, run.ID, run.Attempt)
 		if err != nil {
 			s.Log.Warn("could not read a run in progress", "run", run.ID, "error", err.Error())
 			continue
 		}
 		for _, j := range jobs {
-			if t, ok := unknown[j.RunnerName]; ok {
-				s.tag(ctx, t, tagJob, t.runner+"@"+strconv.FormatInt(run.ID, 10))
-				t.runUnknown = false
-				delete(unknown, j.RunnerName)
-				s.Log.Info("found the run of a job no message named", "runner", t.runner, "run", run.ID, "job", j.ID)
+			if runners[j.RunnerName] {
+				found[j.RunnerName] = run.ID
+				s.Log.Info("found the run of a job no message named", "runner", j.RunnerName, "run", run.ID, "job", j.ID)
 			}
 		}
-		if len(unknown) == 0 {
-			return
-		}
 	}
-	for _, t := range unknown {
-		t.sought++
-		if t.sought >= seekRunsTries {
-			t.runUnknown = false
-			s.Log.Warn("could not find the run of a job no message named", "runner", t.runner, "searches", t.sought)
-		}
-	}
+	return found, nil
 }
 
 // checkReclaims reads the pool's stopped tasks from ECS, once a minute, and
-// owes a re-run for the job each Spot-reclaimed task's runner was running.
+// owes a re-run for the job each Spot-reclaimed task's last runner was
+// running. Where the task's tag names no job of that runner, as when no
+// message said it started, the job is sought among the runs in progress:
+// its run is still in progress when its task has just stopped.
 // Each owed job is settled once its run completes. A listener that restarts
 // reads the reclaims back from ECS, which lists a stopped task for about an
 // hour, and from the run's attempts, so it owes nothing twice.
@@ -377,11 +409,21 @@ func (s *Scaler) checkReclaims(ctx context.Context, now time.Time) {
 				continue
 			}
 			s.seenStopped[aws.ToString(t.TaskArn)] = true
-			runner, runID, ok := splitTag(tagOf(t, tagJob))
-			if t.StopCode != ecstypes.TaskStopCodeSpotInterruption || !ok || t.StoppingAt == nil {
+			if t.StopCode != ecstypes.TaskStopCodeSpotInterruption || t.StoppingAt == nil {
 				continue
 			}
-			s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
+			// The job tag is kept even when it names another runner: the
+			// handed tag is written after the config and can fail, so the
+			// tag may name the later runner. A job that ended before the
+			// reclaim settles with no re-run.
+			last, _ := lastRunner(t)
+			runner, runID, ok := splitTag(tagOf(t, tagJob))
+			if ok {
+				s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
+			}
+			if !ok || runner != last {
+				s.owed[last] = &owedRun{runner: last, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
+			}
 		}
 		for arn := range s.seenStopped {
 			if !listed[arn] {
@@ -389,9 +431,45 @@ func (s *Scaler) checkReclaims(ctx context.Context, now time.Time) {
 			}
 		}
 	}
+	s.seekOwedRuns(ctx)
 	for runner, o := range s.owed {
+		if o.runID == 0 {
+			continue
+		}
 		if s.settle(ctx, o) {
 			delete(s.owed, runner)
+		}
+	}
+}
+
+// seekOwedRuns finds the run of each owed job whose run is unknown. A
+// reclaimed task whose last runner had no job in progress in seekRunsTries
+// searches owes nothing.
+func (s *Scaler) seekOwedRuns(ctx context.Context) {
+	names := map[string]bool{}
+	for runner, o := range s.owed {
+		if o.runID == 0 {
+			names[runner] = true
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	found, err := s.findRuns(ctx, names)
+	if err != nil {
+		s.Log.Warn("could not read the runs in progress", "error", err.Error())
+		return
+	}
+	for runner := range names {
+		o := s.owed[runner]
+		if runID, ok := found[runner]; ok {
+			o.runID = runID
+			continue
+		}
+		o.sought++
+		if o.sought >= seekRunsTries {
+			delete(s.owed, runner)
+			s.Log.Info("a reclaimed task's last runner had no job in progress", "runner", runner, "searches", o.sought)
 		}
 	}
 }
