@@ -27,11 +27,27 @@ set -eu
 echo "run $ACTIONS_RUNNER_INPUT_JITCONFIG" >> "$FAKE_LOG"
 # FAKE_HOLD plays a job that runs that long, in a process named as the
 # runner's job process is; FAKE_IDLE a runner registered with no job yet.
-trap 'echo "term" >> "$FAKE_LOG"; exit 143' TERM
+# GitHub's image sets RUNNER_MANUALLY_TRAP_SIG, so its run.sh starts the
+# runner as a job of its own and answers a TERM by sending SIGINT to the
+# runner's process group, then waits for the runner to leave. The fake
+# does the same, and its runner, sleep, keeps the SIGINT handling it
+# inherits: a runner started with SIGINT ignored never leaves.
+set -m
+stopped=""
+pid=""
+trap 'stopped=1; echo "term" >> "$FAKE_LOG"; [ -z "$pid" ] || kill -INT -- "-$pid" 2>/dev/null || true' TERM
 if [ -n "\${FAKE_HOLD:-}" ]; then
-  (exec -a Runner.Worker sleep "$FAKE_HOLD") & wait $!
+  (exec -a Runner.Worker sleep "$FAKE_HOLD") & pid=$!
 elif [ -n "\${FAKE_IDLE:-}" ]; then
-  sleep "$FAKE_IDLE" & wait $!
+  sleep "$FAKE_IDLE" & pid=$!
+fi
+if [ -n "$pid" ]; then
+  wait "$pid" || true
+  if [ -n "$stopped" ]; then
+    wait "$pid" 2>/dev/null || true
+    echo "left" >> "$FAKE_LOG"
+    exit 143
+  fi
 fi
 for f in _work/widgets/widgets/checkout.txt _work/_temp/temp.txt _work/_actions/a/action.yml tmp/job.txt \\
          _work/_tool/node/cached .npm/cached go/pkg/mod/cached .runner; do
@@ -261,6 +277,7 @@ describe('fitness: a task exits only with no runner registered (remove-then-term
     const decoy = spawn('sleep', ['30'], { argv0: 'Runner.Worker', stdio: 'ignore' });
     const r = await runEntrypoint(url, [config('paddock-second')], { term: 'job', idle: 30 }).finally(() => decoy.kill());
     assert.ok(r.log.includes('term'), `the idle runner was not told to stop: ${r.log.join(' | ')}`);
+    assert.ok(r.log.includes('left'), `the idle runner did not leave: ${r.log.join(' | ')}`);
     assert.equal(r.code, 143);
     assert.ok(r.seconds < 10, `took ${r.seconds}s to stop`);
     assert.equal(url.requests.length, 0);

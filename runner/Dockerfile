@@ -184,7 +184,10 @@ while :; do
   echo "paddock: starting runner $runner"
   # run.sh registers the runner, runs one job, and leaves GitHub before it
   # returns, so the task never waits or exits with a runner registered.
-  ACTIONS_RUNNER_INPUT_JITCONFIG=$jit "$HOME/run.sh" &
+  # Bash starts a background command with SIGINT and SIGQUIT ignored, and
+  # run.sh stops its runner with SIGINT, so env puts both back first:
+  # a runner that ignored SIGINT would stay registered and take a job.
+  ACTIONS_RUNNER_INPUT_JITCONFIG=$jit env --default-signal=INT,QUIT "$HOME/run.sh" &
   child=$!
   code=0
   wait "$child" || code=$?
