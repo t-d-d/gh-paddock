@@ -193,6 +193,9 @@ func (c *fakeCloud) RemoveRunner(context.Context, int64) error { return nil }
 func (c *fakeCloud) Run(context.Context, string, string, int64) (github.Run, error) {
 	return github.Run{}, nil
 }
+func (c *fakeCloud) RunsInProgress(context.Context, string, string) ([]github.Run, error) {
+	return nil, nil
+}
 func (c *fakeCloud) RunJobs(context.Context, string, string, int64, int) ([]github.Job, error) {
 	return nil, nil
 }

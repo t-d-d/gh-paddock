@@ -62,15 +62,18 @@ const (
 
 const (
 	checkReclaimsEvery = time.Minute
+	seekRunsEvery      = time.Minute
 	checkRateEvery     = time.Hour
 	logEvery           = time.Minute
 	defaultMaxJob      = 2 * time.Hour
 	spotKillWindow     = 30 * 24 * time.Hour
 )
 
-// Actions is the part of GitHub's Actions API that re-runs a killed job.
+// Actions is the part of GitHub's Actions API that re-runs a killed job,
+// and finds the run of a job no message named.
 type Actions interface {
 	Run(ctx context.Context, owner, name string, runID int64) (github.Run, error)
+	RunsInProgress(ctx context.Context, owner, name string) ([]github.Run, error)
 	RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]github.Job, error)
 	RerunJob(ctx context.Context, owner, name string, jobID int64) error
 }
@@ -91,6 +94,7 @@ type recovery struct {
 	// seenStopped are the stopped tasks already read, while ECS lists them.
 	seenStopped     map[string]bool
 	reclaimsChecked time.Time
+	runsSought      time.Time
 	rateChecked     time.Time
 	// waiting are the jobs assigned or offered and not yet started, by
 	// runner request, from when they were queued.
@@ -172,7 +176,8 @@ func (s *Scaler) replaceFailedStarts(ctx context.Context, live []ecstypes.Task) 
 			if err := s.JIT.RemoveRunner(ctx, int64(ref.ID)); err != nil {
 				if errors.Is(err, scaleset.JobStillRunningError) {
 					// The runner took its job, though no message said so.
-					t.started = true
+					// The job's run is found, so a reclaim can re-run it.
+					t.started, t.runUnknown = true, true
 					s.Log.Info("a runner thought never to have taken its job is running one; its task is left", "runner", t.runner)
 					continue
 				}
@@ -230,6 +235,7 @@ func (s *Scaler) watch(ctx context.Context) {
 		}
 	}
 	s.watchWaits(now)
+	s.seekRuns(ctx, now)
 	s.checkReclaims(ctx, now)
 	s.checkSpotRate(ctx, now)
 }
@@ -290,6 +296,49 @@ func (s *Scaler) watchWaits(now time.Time) {
 	if long > 0 && now.Sub(s.waitLogged) >= logEvery {
 		s.waitLogged = now
 		s.Log.Warn(logJobWaiting, "jobs", long)
+	}
+}
+
+// seekRuns finds the run of each job a runner took with no message heard,
+// once a minute while one is unknown, among the repo's runs in progress. It
+// tags the task with the run, as track does a job it hears start, so a
+// reclaim that kills the job gets it re-run.
+func (s *Scaler) seekRuns(ctx context.Context, now time.Time) {
+	if s.Actions == nil || (!s.runsSought.IsZero() && now.Sub(s.runsSought) < seekRunsEvery) {
+		return
+	}
+	unknown := map[string]*task{}
+	for _, t := range s.tasks {
+		if t.runUnknown && t.done.IsZero() {
+			unknown[t.runner] = t
+		}
+	}
+	if len(unknown) == 0 {
+		return
+	}
+	s.runsSought = now
+	runs, err := s.Actions.RunsInProgress(ctx, s.Repo.Owner, s.Repo.Name)
+	if err != nil {
+		s.Log.Warn("could not read the runs in progress", "error", err.Error())
+		return
+	}
+	for _, run := range runs {
+		jobs, err := s.Actions.RunJobs(ctx, s.Repo.Owner, s.Repo.Name, run.ID, run.Attempt)
+		if err != nil {
+			s.Log.Warn("could not read a run in progress", "run", run.ID, "error", err.Error())
+			continue
+		}
+		for _, j := range jobs {
+			if t, ok := unknown[j.RunnerName]; ok {
+				s.tag(ctx, t, tagJob, t.runner+"@"+strconv.FormatInt(run.ID, 10))
+				t.runUnknown = false
+				delete(unknown, j.RunnerName)
+				s.Log.Info("found the run of a job no message named", "runner", t.runner, "run", run.ID, "job", j.ID)
+			}
+		}
+		if len(unknown) == 0 {
+			return
+		}
 	}
 }
 

@@ -67,6 +67,9 @@ func (i *fakeInstallation) DeleteRunnerGroup(_ context.Context, _, name string) 
 func (i *fakeInstallation) Run(context.Context, string, string, int64) (github.Run, error) {
 	return github.Run{}, nil
 }
+func (i *fakeInstallation) RunsInProgress(context.Context, string, string) ([]github.Run, error) {
+	return nil, nil
+}
 func (i *fakeInstallation) RunJobs(context.Context, string, string, int64, int) ([]github.Job, error) {
 	return nil, nil
 }

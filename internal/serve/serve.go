@@ -28,6 +28,7 @@ type Installation interface {
 	EnsureRunnerGroup(ctx context.Context, org, name string, repoID int64) error
 	DeleteRunnerGroup(ctx context.Context, org, name string) error
 	Run(ctx context.Context, owner, name string, runID int64) (github.Run, error)
+	RunsInProgress(ctx context.Context, owner, name string) ([]github.Run, error)
 	RunJobs(ctx context.Context, owner, name string, runID int64, attempt int) ([]github.Job, error)
 	RerunJob(ctx context.Context, owner, name string, jobID int64) error
 }
