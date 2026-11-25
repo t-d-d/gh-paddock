@@ -99,6 +99,8 @@ type fakeGitHub struct {
 	// jobs of run 5's attempts, and the jobs re-run
 	jobs   map[string][]map[string]any
 	reruns []string
+	// runs lists acme/widgets's workflow runs, of every status
+	runs []map[string]any
 }
 
 func newFake(t *testing.T) (*fakeGitHub, *App) {
@@ -156,6 +158,18 @@ func (f *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "POST" && r.URL.Path == "/app/installations/99/access_tokens":
 		f.tokens++
 		reply(201, map[string]any{"token": "installation-token", "expires_at": time.Now().Add(time.Hour).Format(time.RFC3339)})
+	case r.Method == "GET" && r.URL.Path == "/repos/acme/widgets/actions/runs":
+		var all []map[string]any
+		for _, run := range f.runs {
+			if status := r.URL.Query().Get("status"); status == "" || run["status"] == status {
+				all = append(all, run)
+			}
+		}
+		var page int
+		fmt.Sscanf(r.URL.Query().Get("page"), "%d", &page)
+		per := 2
+		from, to := min((page-1)*per, len(all)), min(page*per, len(all))
+		reply(200, map[string]any{"total_count": len(all), "workflow_runs": all[from:to]})
 	case r.Method == "GET" && r.URL.Path == "/repos/acme/widgets/actions/runs/5":
 		reply(200, map[string]any{"id": 5, "status": "completed", "run_attempt": 2})
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/actions/runs/5/attempts/"):
@@ -354,6 +368,31 @@ func TestAKilledJobIsFoundInItsRunsAttemptAndReRun(t *testing.T) {
 	}
 	if len(f.reruns) != 1 || f.reruns[0] != "72" {
 		t.Fatalf("re-ran %v", f.reruns)
+	}
+}
+
+// A runner whose job no message named is found among the runs in
+// progress, so every page of them is read, with each run's latest attempt.
+func TestTheRunsInProgressAreListedWithTheirLatestAttempts(t *testing.T) {
+	f, app := newFake(t)
+	f.runs = []map[string]any{
+		{"id": 11, "status": "in_progress", "run_attempt": 1},
+		{"id": 12, "status": "completed", "run_attempt": 1},
+		{"id": 13, "status": "in_progress", "run_attempt": 2},
+		{"id": 14, "status": "in_progress", "run_attempt": 1},
+	}
+	ctx := context.Background()
+	inst, err := app.Installation(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, err := inst.RunsInProgress(ctx, "acme", "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Run{{ID: 11, Status: "in_progress", Attempt: 1}, {ID: 13, Status: "in_progress", Attempt: 2}, {ID: 14, Status: "in_progress", Attempt: 1}}
+	if !slices.Equal(runs, want) {
+		t.Fatalf("runs %+v, want %+v", runs, want)
 	}
 }
 

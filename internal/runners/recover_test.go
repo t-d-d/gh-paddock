@@ -48,6 +48,8 @@ type fakeActions struct {
 	// gone are runs deleted from GitHub, which it answers 404.
 	gone  map[int64]bool
 	reads int
+	// listed counts the reads of the runs in progress.
+	listed int
 }
 
 type fakeRun struct {
@@ -65,6 +67,20 @@ func (a *fakeActions) Run(_ context.Context, owner, name string, id int64) (gith
 		return github.Run{}, fmt.Errorf("no run %s/%s %d", owner, name, id)
 	}
 	return github.Run{Status: r.status, Attempt: len(r.attempts)}, nil
+}
+
+func (a *fakeActions) RunsInProgress(_ context.Context, owner, name string) ([]github.Run, error) {
+	a.listed++
+	if owner != "acme" || name != "widgets" {
+		return nil, fmt.Errorf("listed the runs of %s/%s", owner, name)
+	}
+	var out []github.Run
+	for id, r := range a.runs {
+		if r.status == "in_progress" {
+			out = append(out, github.Run{ID: id, Status: r.status, Attempt: len(r.attempts)})
+		}
+	}
+	return out, nil
 }
 
 func (a *fakeActions) RunJobs(_ context.Context, _, _ string, id int64, attempt int) ([]github.Job, error) {
@@ -251,6 +267,157 @@ func TestARestartedListenerStopsNoTaskWhoseRunnerTookItsJob(t *testing.T) {
 	mustScale(t, next, nil)
 	if len(f.stopped) != 1 || !strings.HasSuffix(f.stopped[0], aws.ToString(f.tasks[1].TaskArn)) {
 		t.Fatalf("stopped %v, want the second task alone", f.stopped)
+	}
+}
+
+// reclaim has Spot reclaim the live task i now: ECS marks it stopping, and
+// it stops at the end of the two minutes' warning.
+func reclaim(f *fakeAWS, i int, at time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tasks[i].DesiredStatus = aws.String("STOPPED")
+	f.tasks[i].LastStatus = aws.String("STOPPED")
+	f.tasks[i].StopCode = ecstypes.TaskStopCodeSpotInterruption
+	f.tasks[i].StoppingAt = aws.Time(at)
+	f.tasks[i].StoppedAt = aws.Time(at.Add(2 * time.Minute))
+}
+
+// A runner can take its job with no message heard, as when the listener's
+// session keeps ending. GitHub's refusal to remove the runner says it took
+// one, so the listener finds the job's run and tags the task with it, and a
+// Spot reclaim that kills the job gets it re-run once.
+func TestAReclaimedJobWhoseStartWasNotHeardIsReRunOnce(t *testing.T) {
+	f, s, jit, c, l := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	runner := jit.calls[0]
+	actions.runs[9] = &fakeRun{status: "in_progress", attempts: [][]github.Job{{
+		{ID: 90, RunnerName: "paddock-other"},
+		{ID: 91, RunnerName: runner},
+	}}}
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	if got := tagOf(f.tasks[0], "paddock:job"); got != runner+"@9" {
+		t.Fatalf("job tag %q, want %q", got, runner+"@9")
+	}
+	if len(l.lines("found the run of a job no message named")) != 1 {
+		t.Fatalf("log %s", l.buf.String())
+	}
+
+	at := c.now()
+	reclaim(f, 0, at)
+	actions.runs[9].status = "completed"
+	actions.runs[9].attempts[0][1] = github.Job{ID: 91, RunnerName: runner, Conclusion: "failure", CompletedAt: at.Add(5 * time.Minute)}
+	for range 3 {
+		c.add(3 * time.Minute)
+		mustScale(t, s, nil)
+	}
+	if len(actions.reruns) != 1 || actions.reruns[0] != 91 {
+		t.Fatalf("re-ran %v, want job 91 once", actions.reruns)
+	}
+}
+
+// A task's tag can name an earlier runner's job. A later runner found
+// running a job no message named takes the tag over, once its run shows in
+// GitHub's list, which is read again a minute on.
+func TestALaterRunnersUnheardJobReplacesTheTaskTagOnceItsRunIsFound(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	first := jit.calls[0]
+	mustScale(t, s, startedRun(1, first, 5))
+	c.add(10 * time.Minute)
+	mustScale(t, s, finished(1, first))
+	second := jit.calls[1]
+	jit.jobRunning = true
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	if got := tagOf(f.tasks[0], "paddock:job"); got != first+"@5" {
+		t.Fatalf("job tag %q before the run shows", got)
+	}
+	actions.runs[9] = &fakeRun{status: "in_progress", attempts: [][]github.Job{{{ID: 91, RunnerName: second}}}}
+	mustScale(t, s, nil)
+	if actions.listed != 1 {
+		t.Fatalf("listed the runs %d times inside a minute", actions.listed)
+	}
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if got := tagOf(f.tasks[0], "paddock:job"); got != second+"@9" {
+		t.Fatalf("job tag %q, want %q", got, second+"@9")
+	}
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if actions.listed != 2 {
+		t.Fatalf("listed the runs %d times, after the run was found", actions.listed)
+	}
+}
+
+// A runner whose unheard job's run was never found can finish, heard, and
+// its task be handed a new runner. Nothing says the new runner runs a job
+// yet, so the runs in progress are not read for it.
+func TestATaskHandedANewRunnerSeeksNoRunForTheLastOne(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	first := jit.calls[0]
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	jit.jobRunning = false
+	mustScale(t, s, finished(1, first))
+	if len(jit.calls) != 2 {
+		t.Fatalf("handed %d runners, want a second", len(jit.calls))
+	}
+	listed := actions.listed
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if actions.listed != listed {
+		t.Fatalf("listed the runs in progress %d more times for a runner with no job", actions.listed-listed)
+	}
+}
+
+// The job runs when the search begins, so its run is in progress then. A
+// run not found in five searches is logged and sought no more, which bounds
+// what the search costs.
+func TestARunNotFoundInFiveSearchesIsLoggedAndSoughtNoMore(t *testing.T) {
+	f, s, jit, c, l := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	c.add(FailedStartAfter + time.Second)
+	for range 8 {
+		mustScale(t, s, nil)
+		c.add(time.Minute)
+	}
+	if actions.listed != 5 {
+		t.Fatalf("listed the runs in progress %d times, want 5", actions.listed)
+	}
+	if got := l.lines("could not find the run of a job no message named"); len(got) != 1 || got[0]["runner"] != jit.calls[0] {
+		t.Fatalf("logged %v", got)
+	}
+}
+
+// A start message that comes late still names the run.
+func TestALateStartMessageTagsAJobWhoseRunWasNotFound(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	s.Actions = &fakeActions{runs: map[int64]*fakeRun{}}
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	mustScale(t, s, startedRun(1, jit.calls[0], 9))
+	if got := tagOf(f.tasks[0], "paddock:job"); got != jit.calls[0]+"@9" {
+		t.Fatalf("job tag %q", got)
 	}
 }
 

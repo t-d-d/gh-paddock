@@ -1,8 +1,9 @@
 // Package github is the listener's GitHub App: the REST calls the scale-set
 // client does not make. It checks the App's key, finds the App's
 // installation on an org, reads a repo, and keeps each pool's runner group
-// open to its one repo with public repos off. It re-runs a job a Spot
-// reclaim killed, once the job's workflow run completes.
+// open to its one repo with public repos off. It finds the run of a job a
+// runner took with no message heard, and re-runs a job a Spot reclaim
+// killed, once the job's workflow run completes.
 //
 // It holds the App key, which only the listener does
 // (docs/constraints/runner-isolation.md), and never prints it.
@@ -324,6 +325,7 @@ func (i *Installation) eachRunnerGroup(ctx context.Context, base string, more fu
 // Run is what the listener needs of a workflow run: whether it has
 // completed, and its latest attempt.
 type Run struct {
+	ID      int64  `json:"id"`
 	Status  string `json:"status"`
 	Attempt int    `json:"run_attempt"`
 }
@@ -334,6 +336,27 @@ func (i *Installation) Run(ctx context.Context, owner, name string, runID int64)
 	path := fmt.Sprintf("/repos/%s/%s/actions/runs/%d", url.PathEscape(owner), url.PathEscape(name), runID)
 	err := i.do(ctx, http.MethodGet, path, nil, &out, http.StatusOK)
 	return out, err
+}
+
+// RunsInProgress reads every workflow run of owner/name that is in
+// progress, where a job a runner has taken is found when no message named
+// its run.
+func (i *Installation) RunsInProgress(ctx context.Context, owner, name string) ([]Run, error) {
+	base := fmt.Sprintf("/repos/%s/%s/actions/runs?status=in_progress", url.PathEscape(owner), url.PathEscape(name))
+	var runs []Run
+	for page := 1; ; page++ {
+		var out struct {
+			Total int   `json:"total_count"`
+			Runs  []Run `json:"workflow_runs"`
+		}
+		if err := i.do(ctx, http.MethodGet, fmt.Sprintf("%s&per_page=100&page=%d", base, page), nil, &out, http.StatusOK); err != nil {
+			return nil, err
+		}
+		runs = append(runs, out.Runs...)
+		if len(out.Runs) == 0 || len(runs) >= out.Total {
+			return runs, nil
+		}
+	}
 }
 
 // Job is one job of a workflow run's attempt.
