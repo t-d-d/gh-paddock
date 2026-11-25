@@ -42,12 +42,16 @@ elif [ -n "\${FAKE_IDLE:-}" ]; then
   sleep "$FAKE_IDLE" & pid=$!
 fi
 if [ -n "$pid" ]; then
+  # A TERM that came before pid was set found no runner to stop: stop it now.
+  [ -z "$stopped" ] || kill -INT -- "-$pid" 2>/dev/null || true
   wait "$pid" || true
   if [ -n "$stopped" ]; then
     wait "$pid" 2>/dev/null || true
     echo "left" >> "$FAKE_LOG"
     exit 143
   fi
+elif [ -n "$stopped" ]; then
+  exit 143
 fi
 for f in _work/widgets/widgets/checkout.txt _work/_temp/temp.txt _work/_actions/a/action.yml tmp/job.txt \\
          _work/_tool/node/cached .npm/cached go/pkg/mod/cached .runner; do
