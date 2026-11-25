@@ -74,8 +74,8 @@ const handWithin = 25 * time.Second
 const logTaskTimes = "runner task start times"
 
 // logStartRefused is the line for a runner task ECS would not start, such
-// as one past the account's Fargate quota. The scale goes on, and a later
-// one tries again.
+// as one past the account's Fargate quota. The scale stops there, the
+// session goes on, and a later scale tries again.
 const logStartRefused = "runner task refused"
 
 // heardFor is how long the scaler keeps what a message said of a runner, for
@@ -299,8 +299,9 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 	return nil
 }
 
-// refused is ECS declining to start a runner task, such as at the account's
-// Fargate quota or with no Spot capacity. It ends a scale, not the session.
+// refused is ECS declining to start a runner task, with a failure in its
+// answer, such as at the account's Fargate quota or with no Spot capacity.
+// It ends a scale, not the session.
 type refused struct{ reason string }
 
 func (r refused) Error() string { return "ECS started no runner task: " + r.reason }
@@ -700,10 +701,10 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 		Tags: tags,
 	})
 	if err != nil {
-		if ctx.Err() != nil {
-			return err
-		}
-		return refused{err.Error()}
+		// An error from the call itself, such as a denied role or a bad
+		// subnet, is not one a later scale gets past, so it ends the
+		// session. ECS reports a quota or capacity refusal as a failure.
+		return fmt.Errorf("start a runner task: %w", err)
 	}
 	if len(out.Tasks) == 0 {
 		reason := "no reason given"
