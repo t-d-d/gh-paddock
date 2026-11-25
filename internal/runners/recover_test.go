@@ -474,6 +474,32 @@ func TestAReclaimedTaskTaggedWithAnEarlierRunnersJobGetsItsLastRunnersJobReRun(t
 	}
 }
 
+// The tag that names a task's last runner is written after its config, and
+// can fail. A reclaimed task whose job tag names a later runner than its
+// handed tag still gets that job re-run.
+func TestAReclaimedTaskWhoseHandedTagWasNotWrittenStillGetsItsTaggedJobReRun(t *testing.T) {
+	f, s, _, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{5: {status: "in_progress", attempts: [][]github.Job{{}}}}}
+	s.Actions = actions
+	at := c.now().Add(-time.Minute)
+	spotKilled(f, "paddock-killed", at)
+	f.mu.Lock()
+	var tags []ecstypes.Tag
+	for _, tg := range f.tasks[len(f.tasks)-1].Tags {
+		if aws.ToString(tg.Key) != "paddock:handed" {
+			tags = append(tags, tg)
+		}
+	}
+	f.tasks[len(f.tasks)-1].Tags = tags
+	f.mu.Unlock()
+	actions.runs[5].attempts[0] = []github.Job{{ID: 72, RunnerName: "paddock-killed", Conclusion: "failure", CompletedAt: at.Add(3 * time.Minute)}}
+	actions.runs[5].status = "completed"
+	mustScale(t, s, assigned(0))
+	if len(actions.reruns) != 1 || actions.reruns[0] != 72 {
+		t.Fatalf("re-ran %v, want job 72 once", actions.reruns)
+	}
+}
+
 // A task reclaimed while its last runner had no job owes nothing: the runs
 // in progress are read a few times, then no more.
 func TestAReclaimedTaskWhoseLastRunnerHadNoJobIsSoughtFiveTimes(t *testing.T) {

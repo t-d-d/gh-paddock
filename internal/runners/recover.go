@@ -412,12 +412,18 @@ func (s *Scaler) checkReclaims(ctx context.Context, now time.Time) {
 			if t.StopCode != ecstypes.TaskStopCodeSpotInterruption || t.StoppingAt == nil {
 				continue
 			}
+			// The job tag is kept even when it names another runner: the
+			// handed tag is written after the config and can fail, so the
+			// tag may name the later runner. A job that ended before the
+			// reclaim settles with no re-run.
 			last, _ := lastRunner(t)
 			runner, runID, ok := splitTag(tagOf(t, tagJob))
-			if !ok || runner != last {
-				runner, runID = last, 0
+			if ok {
+				s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
 			}
-			s.owed[runner] = &owedRun{runner: runner, runID: runID, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
+			if !ok || runner != last {
+				s.owed[last] = &owedRun{runner: last, stoppingAt: *t.StoppingAt, stoppedAt: *t.StoppedAt}
+			}
 		}
 		for arn := range s.seenStopped {
 			if !listed[arn] {
