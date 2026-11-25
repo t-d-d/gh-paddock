@@ -50,6 +50,8 @@ type fakeActions struct {
 	reads int
 	// listed counts the reads of the runs in progress.
 	listed int
+	// listFails is how many reads of the runs in progress fail first.
+	listFails int
 }
 
 type fakeRun struct {
@@ -71,6 +73,10 @@ func (a *fakeActions) Run(_ context.Context, owner, name string, id int64) (gith
 
 func (a *fakeActions) RunsInProgress(_ context.Context, owner, name string) ([]github.Run, error) {
 	a.listed++
+	if a.listFails > 0 {
+		a.listFails--
+		return nil, errors.New("GitHub answered 502")
+	}
 	if owner != "acme" || name != "widgets" {
 		return nil, fmt.Errorf("listed the runs of %s/%s", owner, name)
 	}
@@ -440,6 +446,38 @@ func TestAJobReclaimedBeforeItsStartIsKnownIsReRunOnce(t *testing.T) {
 	}
 	if len(l.lines("found the run of a job no message named")) != 1 {
 		t.Fatalf("log %s", l.buf.String())
+	}
+}
+
+// A runner found busy with an unheard job, whose first search for its run
+// fails, can be reclaimed before the next search. The reclaim check finds
+// the run instead, and the job is re-run once.
+func TestAJobReclaimedAfterAFailedFirstSearchIsReRunOnce(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}, listFails: 1}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	runner := jit.calls[0]
+	actions.runs[9] = &fakeRun{status: "in_progress", attempts: [][]github.Job{{{ID: 91, RunnerName: runner}}}}
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	if got := tagOf(f.tasks[0], "paddock:job"); got != "" {
+		t.Fatalf("job tag %q after a failed search", got)
+	}
+	at := c.now().Add(10 * time.Second)
+	reclaim(f, 0, at)
+	c.add(3 * time.Minute)
+	mustScale(t, s, nil)
+	actions.runs[9].status = "completed"
+	actions.runs[9].attempts[0][0] = github.Job{ID: 91, RunnerName: runner, Conclusion: "failure", CompletedAt: at.Add(6 * time.Minute)}
+	for range 3 {
+		c.add(time.Minute)
+		mustScale(t, s, nil)
+	}
+	if len(actions.reruns) != 1 || actions.reruns[0] != 91 {
+		t.Fatalf("re-ran %v, want job 91 once", actions.reruns)
 	}
 }
 
