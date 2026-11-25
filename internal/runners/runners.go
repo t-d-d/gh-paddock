@@ -73,6 +73,11 @@ const handWithin = 25 * time.Second
 // task: to place it, to pull its image, and to start its container.
 const logTaskTimes = "runner task start times"
 
+// logStartRefused is the line for a runner task ECS would not start, such
+// as one past the account's Fargate quota. The scale goes on, and a later
+// one tries again.
+const logStartRefused = "runner task refused"
+
 // heardFor is how long the scaler keeps what a message said of a runner, for
 // a task that ListTasks has yet to show.
 const heardFor = 2 * time.Minute
@@ -229,6 +234,8 @@ func (s *Scaler) objectKey(firstRunner string) string {
 // missing. A poll that carried no message means GitHub's counts have not
 // changed, so it scales on the last counts: that replaces a task that
 // stopped before it took its job, or exited before it read its config.
+// When ECS refuses a start, Scale logs it and returns, so the session goes
+// on reading messages and a later scale tries again.
 func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage) error {
 	if s.Settings != nil {
 		s.Pool = s.Settings.Get()
@@ -276,13 +283,27 @@ func (s *Scaler) Scale(ctx context.Context, msg *scaleset.RunnerScaleSetMessage)
 		need--
 	}
 	for have := len(live); need > 0 && have < s.Pool.MaxRunners; have++ {
-		if err := s.start(ctx); err != nil {
+		err := s.start(ctx)
+		var r refused
+		if errors.As(err, &r) {
+			// The next start would likely be refused too. The jobs still
+			// count as assigned, so a later scale starts their tasks.
+			s.Log.Warn(logStartRefused, "reason", r.reason, "missing", need)
+			return nil
+		}
+		if err != nil {
 			return err
 		}
 		need--
 	}
 	return nil
 }
+
+// refused is ECS declining to start a runner task, such as at the account's
+// Fargate quota or with no Spot capacity. It ends a scale, not the session.
+type refused struct{ reason string }
+
+func (r refused) Error() string { return "ECS started no runner task: " + r.reason }
 
 // jobNote is what a message said of a job a runner took: when it was heard,
 // and the job's workflow run.
@@ -679,14 +700,17 @@ func (s *Scaler) start(ctx context.Context) (err error) {
 		Tags: tags,
 	})
 	if err != nil {
-		return fmt.Errorf("start a runner task: %w", err)
+		if ctx.Err() != nil {
+			return err
+		}
+		return refused{err.Error()}
 	}
 	if len(out.Tasks) == 0 {
 		reason := "no reason given"
 		if len(out.Failures) > 0 {
 			reason = aws.ToString(out.Failures[0].Reason)
 		}
-		return fmt.Errorf("ECS started no runner task: %s", reason)
+		return refused{reason}
 	}
 	started = true
 	arn := aws.ToString(out.Tasks[0].TaskArn)

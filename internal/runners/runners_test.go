@@ -39,6 +39,8 @@ type fakeAWS struct {
 	params    map[string]ssmtypes.Parameter
 	paramPuts []*ssm.PutParameterInput
 	failRun   bool
+	// runErr, if set, is the error RunTask returns.
+	runErr error
 	// events is what was done to runners and tasks, in order: "remove
 	// <runner>" and "stop <first runner>".
 	events  []string
@@ -160,6 +162,9 @@ func (f *fakeAWS) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ec
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.runs = append(f.runs, in)
+	if f.runErr != nil {
+		return nil, f.runErr
+	}
 	if f.failRun {
 		return &ecs.RunTaskOutput{Failures: []ecstypes.Failure{{Reason: aws.String("RESOURCE:FARGATE")}}}, nil
 	}
@@ -603,18 +608,52 @@ func TestAnEmptyPollReplacesATaskThatDiedOnTheLastCounts(t *testing.T) {
 	}
 }
 
-func TestAFailedStartIsAnErrorAndLeavesNoConfigBehind(t *testing.T) {
-	f := newFakeAWS()
-	f.failRun = true
-	s, _ := newScaler(f, spotTest)
-	if err := s.Scale(context.Background(), assigned(1)); err == nil {
-		t.Fatal("a refused RunTask was not an error")
-	}
-	if len(f.params) != 0 {
-		t.Fatalf("left %d configs behind", len(f.params))
-	}
-	if len(f.deleted) != 1 {
-		t.Fatal("left the one-off task definition behind")
+// A refused start must not end the message session: a pool at its Fargate
+// quota would otherwise reopen its session every few seconds and read no
+// messages until the quota frees. The start is logged, and tried again on a
+// later scale.
+func TestARefusedStartIsLoggedAndRetriedAndKeepsTheSession(t *testing.T) {
+	for _, refusal := range []struct {
+		name   string
+		refuse func(*fakeAWS)
+		reason string
+	}{
+		{"failures", func(f *fakeAWS) { f.failRun = true }, "RESOURCE:FARGATE"},
+		{"error", func(f *fakeAWS) {
+			f.runErr = errors.New("You've reached the limit on the number of vCPUs you can run as spot tasks concurrently")
+		}, "limit on the number of vCPUs"},
+	} {
+		t.Run(refusal.name, func(t *testing.T) {
+			f := newFakeAWS()
+			refusal.refuse(f)
+			s, _ := newScaler(f, spotTest)
+			l := withLogs(s)
+			ctx := context.Background()
+			if err := s.Scale(ctx, assigned(3)); err != nil {
+				t.Fatalf("a refused start ended the session: %v", err)
+			}
+			if len(f.runs) != 1 {
+				t.Fatalf("asked ECS %d times after it refused; once a scale is enough", len(f.runs))
+			}
+			refused := l.lines(logStartRefused)
+			if len(refused) != 1 || !strings.Contains(fmt.Sprint(refused[0]["reason"]), refusal.reason) {
+				t.Fatalf("the refusal was not logged with its reason: %v", refused)
+			}
+			if len(f.params) != 0 {
+				t.Fatalf("left %d configs behind", len(f.params))
+			}
+			if len(f.deleted) != 1 {
+				t.Fatal("left the one-off task definition behind")
+			}
+
+			f.failRun, f.runErr = false, nil
+			if err := s.Scale(ctx, nil); err != nil {
+				t.Fatal(err)
+			}
+			if len(f.tasks) != 3 {
+				t.Fatalf("the next scale started %d of the 3 tasks refused", len(f.tasks))
+			}
+		})
 	}
 }
 
