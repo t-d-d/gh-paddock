@@ -406,6 +406,94 @@ func TestARunNotFoundInFiveSearchesIsLoggedAndSoughtNoMore(t *testing.T) {
 	}
 }
 
+// A task Spot reclaims inside the three minutes after its runner's config is
+// handed over leaves the live list before GitHub is asked whether its runner
+// is busy. With no start message heard, the reclaim check finds the runner's
+// job among the runs in progress, and re-runs it once.
+func TestAJobReclaimedBeforeItsStartIsKnownIsReRunOnce(t *testing.T) {
+	f, s, jit, c, l := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	runner := jit.calls[0]
+	actions.runs[9] = &fakeRun{status: "in_progress", attempts: [][]github.Job{{
+		{ID: 90, RunnerName: "paddock-other"},
+		{ID: 91, RunnerName: runner},
+	}}}
+	c.add(2 * time.Minute)
+	at := c.now()
+	reclaim(f, 0, at)
+	c.add(3 * time.Minute)
+	mustScale(t, s, assigned(0))
+	if len(jit.removed) != 0 || len(f.stopped) != 0 {
+		t.Fatalf("removed %v, stopped %v", jit.removed, f.stopped)
+	}
+	actions.runs[9].status = "completed"
+	actions.runs[9].attempts[0][1] = github.Job{ID: 91, RunnerName: runner, Conclusion: "failure", CompletedAt: at.Add(6 * time.Minute)}
+	for range 3 {
+		c.add(time.Minute)
+		mustScale(t, s, nil)
+	}
+	if len(actions.reruns) != 1 || actions.reruns[0] != 91 {
+		t.Fatalf("re-ran %v, want job 91 once", actions.reruns)
+	}
+	if len(l.lines("found the run of a job no message named")) != 1 {
+		t.Fatalf("log %s", l.buf.String())
+	}
+}
+
+// A task's tag can name an earlier runner's job when Spot reclaims it under
+// a later one. The job sought is the later runner's.
+func TestAReclaimedTaskTaggedWithAnEarlierRunnersJobGetsItsLastRunnersJobReRun(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	first := jit.calls[0]
+	mustScale(t, s, startedRun(1, first, 5))
+	c.add(10 * time.Minute)
+	mustScale(t, s, finished(1, first))
+	second := jit.calls[1]
+	actions.runs[5] = &fakeRun{status: "completed", attempts: [][]github.Job{{{ID: 51, RunnerName: first, Conclusion: "success", CompletedAt: c.now()}}}}
+	actions.runs[9] = &fakeRun{status: "in_progress", attempts: [][]github.Job{{{ID: 91, RunnerName: second}}}}
+	c.add(time.Minute)
+	at := c.now()
+	reclaim(f, 0, at)
+	c.add(3 * time.Minute)
+	mustScale(t, s, nil)
+	actions.runs[9].status = "completed"
+	actions.runs[9].attempts[0][0] = github.Job{ID: 91, RunnerName: second, Conclusion: "failure", CompletedAt: at.Add(6 * time.Minute)}
+	for range 3 {
+		c.add(time.Minute)
+		mustScale(t, s, nil)
+	}
+	if len(actions.reruns) != 1 || actions.reruns[0] != 91 {
+		t.Fatalf("re-ran %v, want job 91 once", actions.reruns)
+	}
+}
+
+// A task reclaimed while its last runner had no job owes nothing: the runs
+// in progress are read a few times, then no more.
+func TestAReclaimedTaskWhoseLastRunnerHadNoJobIsSoughtFiveTimes(t *testing.T) {
+	f, s, _, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	c.add(time.Minute)
+	reclaim(f, 0, c.now())
+	c.add(3 * time.Minute)
+	for range 8 {
+		mustScale(t, s, nil)
+		c.add(time.Minute)
+	}
+	if actions.listed != 5 || len(actions.reruns) != 0 {
+		t.Fatalf("listed the runs %d times, re-ran %v", actions.listed, actions.reruns)
+	}
+}
+
 // A start message that comes late still names the run.
 func TestALateStartMessageTagsAJobWhoseRunWasNotFound(t *testing.T) {
 	f, s, jit, c, _ := recovering(t)
@@ -438,6 +526,7 @@ func spotKilled(f *fakeAWS, runner string, at time.Time) {
 		CreatedAt:     aws.Time(at.Add(-time.Hour)),
 		Tags: []ecstypes.Tag{
 			{Key: aws.String("paddock:runner"), Value: aws.String("paddock-first")},
+			{Key: aws.String("paddock:handed"), Value: aws.String(fmt.Sprintf("%s@%d", runner, at.Add(-30*time.Minute).Unix()))},
 			{Key: aws.String("paddock:job"), Value: aws.String(runner + "@5")},
 		},
 	})
