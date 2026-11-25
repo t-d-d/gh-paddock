@@ -63,10 +63,14 @@ const (
 const (
 	checkReclaimsEvery = time.Minute
 	seekRunsEvery      = time.Minute
-	checkRateEvery     = time.Hour
-	logEvery           = time.Minute
-	defaultMaxJob      = 2 * time.Hour
-	spotKillWindow     = 30 * 24 * time.Hour
+	// seekRunsTries is how many searches a run gets before it is logged and
+	// sought no more. Its job runs when the search begins, so its run is in
+	// progress then; the later tries cover a list that lags.
+	seekRunsTries  = 5
+	checkRateEvery = time.Hour
+	logEvery       = time.Minute
+	defaultMaxJob  = 2 * time.Hour
+	spotKillWindow = 30 * 24 * time.Hour
 )
 
 // Actions is the part of GitHub's Actions API that re-runs a killed job,
@@ -302,7 +306,8 @@ func (s *Scaler) watchWaits(now time.Time) {
 // seekRuns finds the run of each job a runner took with no message heard,
 // once a minute while one is unknown, among the repo's runs in progress. It
 // tags the task with the run, as track does a job it hears start, so a
-// reclaim that kills the job gets it re-run.
+// reclaim that kills the job gets it re-run. A run not found in
+// seekRunsTries searches is logged and sought no more.
 func (s *Scaler) seekRuns(ctx context.Context, now time.Time) {
 	if s.Actions == nil || (!s.runsSought.IsZero() && now.Sub(s.runsSought) < seekRunsEvery) {
 		return
@@ -338,6 +343,13 @@ func (s *Scaler) seekRuns(ctx context.Context, now time.Time) {
 		}
 		if len(unknown) == 0 {
 			return
+		}
+	}
+	for _, t := range unknown {
+		t.sought++
+		if t.sought >= seekRunsTries {
+			t.runUnknown = false
+			s.Log.Warn("could not find the run of a job no message named", "runner", t.runner, "searches", t.sought)
 		}
 	}
 }

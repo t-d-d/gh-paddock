@@ -357,6 +357,55 @@ func TestALaterRunnersUnheardJobReplacesTheTaskTagOnceItsRunIsFound(t *testing.T
 	}
 }
 
+// A runner whose unheard job's run was never found can finish, heard, and
+// its task be handed a new runner. Nothing says the new runner runs a job
+// yet, so the runs in progress are not read for it.
+func TestATaskHandedANewRunnerSeeksNoRunForTheLastOne(t *testing.T) {
+	f, s, jit, c, _ := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	first := jit.calls[0]
+	c.add(FailedStartAfter + time.Second)
+	mustScale(t, s, nil)
+	jit.jobRunning = false
+	mustScale(t, s, finished(1, first))
+	if len(jit.calls) != 2 {
+		t.Fatalf("handed %d runners, want a second", len(jit.calls))
+	}
+	listed := actions.listed
+	c.add(time.Minute)
+	mustScale(t, s, nil)
+	if actions.listed != listed {
+		t.Fatalf("listed the runs in progress %d more times for a runner with no job", actions.listed-listed)
+	}
+}
+
+// The job runs when the search begins, so its run is in progress then. A
+// run not found in five searches is logged and sought no more, which bounds
+// what the search costs.
+func TestARunNotFoundInFiveSearchesIsLoggedAndSoughtNoMore(t *testing.T) {
+	f, s, jit, c, l := recovering(t)
+	actions := &fakeActions{runs: map[int64]*fakeRun{}}
+	s.Actions = actions
+	jit.jobRunning = true
+	mustScale(t, s, assigned(1))
+	f.setLastStatus("RUNNING")
+	c.add(FailedStartAfter + time.Second)
+	for range 8 {
+		mustScale(t, s, nil)
+		c.add(time.Minute)
+	}
+	if actions.listed != 5 {
+		t.Fatalf("listed the runs in progress %d times, want 5", actions.listed)
+	}
+	if got := l.lines("could not find the run of a job no message named"); len(got) != 1 || got[0]["runner"] != jit.calls[0] {
+		t.Fatalf("logged %v", got)
+	}
+}
+
 // A start message that comes late still names the run.
 func TestALateStartMessageTagsAJobWhoseRunWasNotFound(t *testing.T) {
 	f, s, jit, c, _ := recovering(t)

@@ -191,6 +191,8 @@ type task struct {
 	// runUnknown is true while its runner is known to run a job whose run
 	// no message named, and none has been found.
 	runUnknown bool
+	// sought is how many searches have not found that run.
+	sought int
 	// warned is when it was last logged as past its pool's job time.
 	warned time.Time
 	// maxJob is its pool's maximum job time when it started; zero for a
@@ -466,7 +468,7 @@ func (s *Scaler) hand(ctx context.Context, t *task) error {
 		return fmt.Errorf("hand a waiting task its config: %w", err)
 	}
 	t.runner, t.pending, t.done = runner, true, time.Time{}
-	t.handed, t.started = s.now(), false
+	t.handed, t.started, t.runUnknown, t.sought = s.now(), false, false, 0
 	s.tag(ctx, t, tagHanded, runner+"@"+strconv.FormatInt(t.handed.Unix(), 10))
 	s.Log.Info("config handed to a waiting task", "runner", runner, "task", t.key[strings.LastIndex(t.key, "/")+1:])
 	return nil
